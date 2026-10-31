@@ -303,14 +303,15 @@ fn pre_tool_use(ctx: &Ctx, task: &Task, cwd: &Path, tool: &str, input: &Value) -
         let outside: Vec<&String> = touched.iter().filter(|p| !card.allows(p)).collect();
         if let Some(path) = outside.first() {
             let msg = format!("05: {path} is outside the declared scope ({}). Say so to the user, or widen the intent.", card.scope.include.join(", "));
-            log["why"] = json!("outside scope");
             match ctx.policy.drift.scope {
                 Severity::Deny | Severity::Approval => {
                     log["decision"] = json!("deny");
+                    log["why"] = json!("outside scope");
                     return Decision { output: Some(deny(&msg)), log };
                 }
                 Severity::Warn => {
                     log["decision"] = json!("ask");
+                    log["why"] = json!("outside scope");
                     return Decision { output: Some(ask(&msg)), log };
                 }
                 Severity::Allow => {}
@@ -324,14 +325,15 @@ fn pre_tool_use(ctx: &Ctx, task: &Task, cwd: &Path, tool: &str, input: &Value) -
         if let Some((path, r)) = touched.iter().find_map(|p| use05_core::overlap::reserved(&res, p).map(|r| (p, r))) {
             let msg = format!("05: {}. Stay out of it, or coordinate with the user.", r.describe(path));
             log["overlap"] = json!([format!("{}:{path}", r.task)]);
-            log["why"] = json!("overlap");
             match ctx.policy.drift.overlap {
                 Severity::Deny => {
                     log["decision"] = json!("deny");
+                    log["why"] = json!("overlap");
                     return Decision { output: Some(deny(&msg)), log };
                 }
                 Severity::Approval => {
                     log["decision"] = json!("ask");
+                    log["why"] = json!("overlap");
                     return Decision { output: Some(ask(&msg)), log };
                 }
                 _ => {
@@ -347,14 +349,15 @@ fn pre_tool_use(ctx: &Ctx, task: &Task, cwd: &Path, tool: &str, input: &Value) -
                 first.path, first.minutes_ago, first.task, first.title
             );
             log["overlap"] = json!(overlaps.iter().map(|o| format!("{}:{}", o.task, o.path)).collect::<Vec<_>>());
-            log["why"] = json!("overlap");
             match ctx.policy.drift.overlap {
                 Severity::Deny => {
                     log["decision"] = json!("deny");
+                    log["why"] = json!("overlap");
                     return Decision { output: Some(deny(&msg)), log };
                 }
                 Severity::Approval => {
                     log["decision"] = json!("ask");
+                    log["why"] = json!("overlap");
                     return Decision { output: Some(ask(&msg)), log };
                 }
                 _ => {

@@ -23,7 +23,7 @@ fn matches_ref(pattern: &str, name: &str) -> bool {
 }
 
 pub fn is_kept(policy: &Policy, name: &str) -> bool {
-    policy.branches.keep.iter().any(|p| matches_ref(p, name))
+    policy.branches.keep.iter().any(|p| matches_ref(p, name)) || policy.environment.iter().any(|e| e.branch == name)
 }
 
 /// An agent's working branch. A kept branch never is, whatever the patterns say.

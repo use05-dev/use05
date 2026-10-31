@@ -132,6 +132,19 @@ pub struct Policy {
     pub trust: TrustPolicy,
     pub risk: RiskPolicy,
     pub branches: BranchPolicy,
+    /// The environments, lowest first: which branch is dev, uat, pre-prod, prod (D77, D82).
+    /// Recorded and shown; promotion between them is not built yet. Not written out when empty,
+    /// so existing digests hold.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub environment: Vec<Environment>,
+}
+
+/// One environment: a name and the branch it lives on.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct Environment {
+    pub name: String,
+    pub branch: String,
 }
 
 /// About the policy file itself (D78).
@@ -396,6 +409,7 @@ impl Default for Policy {
             trust: TrustPolicy::default(),
             risk: RiskPolicy::default(),
             branches: BranchPolicy::default(),
+            environment: Vec::new(),
         }
     }
 }
@@ -543,6 +557,14 @@ impl Policy {
             return Err(Error::new("POLICY_INVALID", format!("a lock no bypass can clear covers {POLICY_PATH}, so the policy could never be changed again"))
                 .with_next("leave the policy file out of `absolute`, or turn `bypass` back on"));
         }
+        for (i, e) in self.environment.iter().enumerate() {
+            if e.name.trim().is_empty() || e.branch.trim().is_empty() {
+                return Err(Error::new("POLICY_INVALID", "every [[environment]] needs a name and a branch"));
+            }
+            if self.environment[..i].iter().any(|o| o.name == e.name || o.branch == e.branch) {
+                return Err(Error::new("POLICY_INVALID", format!("the environment {:?} or its branch {:?} is listed twice", e.name, e.branch)));
+            }
+        }
         if self.approvals.min == 0 {
             return Err(Error::new("POLICY_INVALID", "approvals.min must be at least 1"));
         }
@@ -609,6 +631,13 @@ pub struct Row {
 }
 
 /// Every setting that matters, with where its value came from.
+fn envs(p: &Policy) -> String {
+    if p.environment.is_empty() {
+        return "none".to_string();
+    }
+    p.environment.iter().map(|e| format!("{}: {}", e.name, e.branch)).collect::<Vec<_>>().join(" → ")
+}
+
 pub fn explain(repo: &Policy, effective: &Policy) -> Vec<Row> {
     let default = Policy::default();
     let row = |key: &'static str, d: String, r: String, e: String| Row {
@@ -657,6 +686,7 @@ pub fn explain(repo: &Policy, effective: &Policy) -> Vec<Row> {
         row("env.allow", env(&default), env(repo), env(effective)),
         row("trusted keys", keys(&default), keys(repo), keys(effective)),
         row("risk.rules", rules(&default), rules(repo), rules(effective)),
+        row("environments", envs(&default), envs(repo), envs(effective)),
         row("branches.keep", default.branches.keep.join(", "), repo.branches.keep.join(", "), effective.branches.keep.join(", ")),
         row("branches.work", default.branches.work.join(", "), repo.branches.work.join(", "), effective.branches.work.join(", ")),
         row("branches.target", target(&default), target(repo), target(effective)),
@@ -889,4 +919,27 @@ mod tests {
         let cargo = detect_checks(dir.path()).into_iter().find(|c| c.name == "test").unwrap();
         assert_eq!(cargo.run, ["cargo", "test"], "the first ecosystem to claim a name keeps it");
     }
+
+    #[test]
+    fn environments_are_read_in_ladder_order_kept_and_explained() {
+        let p = Policy::parse("[[environment]]\nname = \"dev\"\nbranch = \"main\"\n\n[[environment]]\nname = \"prod\"\nbranch = \"production\"\n").unwrap();
+        assert_eq!(p.environment.iter().map(|e| (e.name.as_str(), e.branch.as_str())).collect::<Vec<_>>(), [("dev", "main"), ("prod", "production")]);
+        assert!(crate::branches::is_kept(&p, "production"), "an environment's branch is never deleted");
+        let row = explain(&p, &p).into_iter().find(|r| r.key == "environments").unwrap();
+        assert_eq!(row.value, "dev: main → prod: production");
+        // No environments: nothing is written out, so existing policy digests do not change.
+        assert!(!toml::to_string(&Policy::default()).unwrap().contains("environment"));
+    }
+
+    #[test]
+    fn environments_need_a_name_and_a_branch_and_no_repeats() {
+        for bad in [
+            "[[environment]]\nname = \"\"\nbranch = \"main\"\n",
+            "[[environment]]\nname = \"dev\"\nbranch = \"main\"\n[[environment]]\nname = \"dev\"\nbranch = \"uat\"\n",
+            "[[environment]]\nname = \"dev\"\nbranch = \"main\"\n[[environment]]\nname = \"uat\"\nbranch = \"main\"\n",
+        ] {
+            assert_eq!(Policy::parse(bad).unwrap_err().code, "POLICY_INVALID", "{bad}");
+        }
+    }
+
 }

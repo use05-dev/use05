@@ -26,6 +26,10 @@ pub struct Args {
     pub no_hooks: bool,
     pub no_agents_md: bool,
     pub repo: PathBuf,
+    /// Ask the setup questions (on a terminal, or with --guided).
+    pub interactive: bool,
+    /// Answers given as flags.
+    pub flags: crate::cmd::setup::Flags,
 }
 
 #[derive(Serialize, Deserialize, Default)]
@@ -113,7 +117,7 @@ pub fn inspect(top: &Path) -> Setup {
 
 // ----------------------------------------------------------------------------- init
 
-fn policy_template(checks: &[CheckDef]) -> String {
+pub(crate) fn policy_template(checks: &[CheckDef]) -> String {
     let mut text = format!(
         "# 05 policy. A change is held to the rules at its base, so editing this file needs a person's approval.\n\
          \n\
@@ -356,16 +360,62 @@ pub fn run(args: Args) -> Report {
 
     // Policy
     let policy_path = top.join(POLICY_PATH);
+    use crate::cmd::setup::{AFTER_EDIT, Outcome, run_on};
+    let stopped = || Report::error("init", "SETUP_STOPPED", "Setup stopped; nothing was changed.".into(), Some("run use05 init again when you are ready".into()), 1);
+    let mut after = Vec::new();
     if policy_path.exists() {
-        kept.push(format!("{POLICY_PATH} already exists; left as it is"));
+        let wanted = if args.interactive {
+            let mut a = crate::prompt::Asker::new(std::io::stdin().lock(), std::io::stderr());
+            match a.yes("05 is already set up here. Change your settings?", false) {
+                None => return stopped(),
+                Some(yes) => yes,
+            }
+        } else {
+            args.flags.any()
+        };
+        let current = fs::read_to_string(&policy_path).unwrap_or_default();
+        match if wanted { run_on(&current, &top, true, args.interactive, &args.flags) } else { Ok((Outcome::Unchanged, Vec::new())) } {
+            Err(e) => return Report::error("init", "POLICY_INVALID", format!("{POLICY_PATH}: {e}"), Some("fix the file, or move it away and run use05 init again".into()), 3),
+            Ok((Outcome::Stopped, _)) => return stopped(),
+            Ok((Outcome::Written(text), notes)) => {
+                if let Err(e) = fs::write(&policy_path, &text) {
+                    return Report::error("init", "IO_ERROR", format!("cannot write {POLICY_PATH}: {e}"), None, 4);
+                }
+                changed.push(format!("updated {POLICY_PATH} with your answers"));
+                after.extend(notes);
+                after.push(AFTER_EDIT.to_string());
+            }
+            Ok((Outcome::Unchanged, notes)) => {
+                after.extend(notes);
+                kept.push(format!("{POLICY_PATH} already exists; left as it is"));
+            }
+        }
     } else {
         let checks = detect_checks(&top);
         let text = policy_template(&checks);
+        let text = if args.interactive || args.flags.any() {
+            match run_on(&text, &top, false, args.interactive, &args.flags) {
+                Err(e) => return Report::error("init", "SETUP_INVALID", e, None, 6),
+                Ok((Outcome::Stopped, _)) => return stopped(),
+                Ok((Outcome::Written(t), notes)) => {
+                    after.extend(notes);
+                    t
+                }
+                Ok((Outcome::Unchanged, notes)) => {
+                    after.extend(notes);
+                    text
+                }
+            }
+        } else {
+            text
+        };
         if let Err(e) = fs::create_dir_all(policy_path.parent().expect("has parent")).and_then(|_| fs::write(&policy_path, &text)) {
             return Report::error("init", "IO_ERROR", format!("cannot write {POLICY_PATH}: {e}"), None, 4);
         }
         manifest.items.push(Item::File { path: POLICY_PATH.into(), sha256: sha(&text) });
-        changed.push(if checks.is_empty() {
+        changed.push(if args.interactive || args.flags.any() {
+            format!("created {POLICY_PATH} with your answers")
+        } else if checks.is_empty() {
             format!("created {POLICY_PATH} (no checks detected; add yours)")
         } else {
             format!("created {POLICY_PATH}, proposing the checks: {}", checks.iter().map(|c| c.name.as_str()).collect::<Vec<_>>().join(", "))
@@ -509,7 +559,11 @@ pub fn run(args: Args) -> Report {
         tone: Tone::Good,
         headline: if changed.is_empty() { "Already set up".to_string() } else { format!("Set up 05 in this repository ({} change{})", changed.len(), if changed.len() == 1 { "" } else { "s" }) },
         rows,
-        notes: vec!["Everything above is recorded; `use05 uninstall` reverses exactly it. Your code, branches and policy file are never touched.".into()],
+        notes: {
+            let mut notes = vec!["Everything above is recorded; `use05 uninstall` reverses exactly it, and never touches your code, your branches or your policy file.".to_string()];
+            notes.extend(after);
+            notes
+        },
         next: Some("use05 doctor   to see how strongly each control is enforced".into()),
         excerpt: vec![],
         details: json!({ "changed": changed, "kept": kept, "not_covered": gaps }),

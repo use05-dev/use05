@@ -50,7 +50,7 @@ The installer downloads a release for your platform, checks its SHA-256 against 
 
 ```sh
 cd your-repo
-use05 init                    # policy, keys, hooks; says exactly what it changed and what is not covered
+use05 init                    # asks a few questions (team, branches, rules), then sets up policy, keys and hooks
 use05 start "Stop retrying failed charges" --scope "src/billing/**"
 # ... you or an agent do the work ...
 use05 prove                   # runs the policy's checks on the exact files, signs the result

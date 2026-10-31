@@ -116,6 +116,18 @@ fn gather(ui: &Ui, repo: &Path) -> Status {
     out.section("Change", change);
     out.blank();
 
+    // Environments, lowest first, each with the commit its branch is at (D82).
+    if !ctx.policy.environment.is_empty() {
+        let head = |b: &str| {
+            use05_core::git::resolve_commit(ctx.top(), &format!("refs/heads/{b}"))
+                .or_else(|| use05_core::git::resolve_commit(ctx.top(), &format!("refs/remotes/origin/{b}")))
+                .map_or_else(|| "no such branch yet".to_string(), |c| c.chars().take(7).collect())
+        };
+        let ladder = ctx.policy.environment.iter().map(|e| format!("{}: {} ({})", e.name, e.branch, head(&e.branch))).collect::<Vec<_>>().join(" → ");
+        out.section("Environments", vec![Item::dim(ladder)]);
+        out.blank();
+    }
+
     // Controls
     let mark = |on: bool| if on { Item::new(Glyph::Ok, Tone::Good, "") } else { Item::new(Glyph::Pending, Tone::Dim, "") };
     let control = |on: bool, what: &str, how: &str| {

@@ -159,11 +159,21 @@ pub fn analyse(top: &Path, base: Option<&str>, target: &str, changes: &[Change])
             specs.push(format!("{b}:{}", c.path));
         }
     }
-    let contents: std::collections::HashMap<String, Vec<u8>> = specs.iter().cloned().zip(git::blobs(top, &specs)?).filter_map(|(k, v)| v.map(|v| (k, v))).collect();
-    let test_start_at = |rev: Option<&str>, path: &str| rev.and_then(|r| contents.get(&format!("{r}:{path}"))).and_then(|b| rust_test_start(&String::from_utf8_lossy(b)));
-    let needs_diff = changes.iter().any(|c| c.status != 'D' && matches!(classify(&c.path), Class::Tests | Class::Configuration | Class::Verification))
-        || rust.iter().any(|c| test_start_at(base, &c.path).is_some() || test_start_at(Some(target), &c.path).is_some());
-    let all = if needs_diff { git::hunks_by_path(top, base, target)? } else { std::collections::HashMap::new() };
+    // Only where each file's test module starts is kept, not the file.
+    let starts: std::collections::HashMap<String, usize> = specs
+        .iter()
+        .cloned()
+        .zip(git::blobs_with(top, &specs, |b| rust_test_start(&String::from_utf8_lossy(b)))?)
+        .filter_map(|(k, v)| v.flatten().map(|v| (k, v)))
+        .collect();
+    let test_start_at = |rev: Option<&str>, path: &str| rev.and_then(|r| starts.get(&format!("{r}:{path}")).copied());
+    let mut wanted: std::collections::HashSet<String> = changes
+        .iter()
+        .filter(|c| c.status != 'D' && matches!(classify(&c.path), Class::Tests | Class::Configuration | Class::Verification))
+        .map(|c| c.path.clone())
+        .collect();
+    wanted.extend(rust.iter().filter(|c| test_start_at(base, &c.path).is_some() || test_start_at(Some(target), &c.path).is_some()).map(|c| c.path.clone()));
+    let all = if wanted.is_empty() { std::collections::HashMap::new() } else { git::hunks_by_path(top, base, target, &wanted)? };
     let hunks = |path: &str| -> Result<git::Hunks> {
         match all.get(path) {
             Some(h) => Ok(h.clone()),

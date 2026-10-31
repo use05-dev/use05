@@ -52,7 +52,21 @@ cd your-repo
 use05 init
 ```
 
-`init` lists exactly what it changed, and what is still not covered. It:
+On a terminal, `init` first asks a few questions, each with a default you accept by pressing Enter:
+
+1. **Who works in this repository:** just you, a small team, or a larger or regulated team. This sets how strict the rules start; you can change each one afterwards.
+2. **Which branch finished changes land on.**
+3. **Which environment each long-lived branch is:** dev, uat, pre-prod, prod, or not an environment. 05 suggests a role from the branch's name (`main` is dev, `staging` is uat, `production` is prod). 05 records the environments and shows them; rules for promoting between them come in a later version.
+4. **The checks that must pass**, and any you want to add (`lint: npm run lint`).
+5. **Folder and file rules:** what needs a person's approval, what is locked, where only new files may be added (it suggests migration folders it finds), and what agents may not read (it suggests `.env*` if you have one).
+6. **How strict to be** when an agent works outside its plan, and when a change weakens tests.
+7. **How finished changes land:** you run `use05 land`, or automatically when 05 allows it.
+
+It then shows a summary and asks before writing anything. To change your settings later, run `use05 init` again or `use05 policy --edit`: the same questions, with your current settings as the defaults. Your comments and any settings the questions don't cover are kept.
+
+The answers can also be flags, for scripts: `use05 init --team small --target main --env dev=main --env uat=staging --env prod=production`. `--defaults` skips the questions; `--guided` asks them even without a terminal, reading the answers from stdin.
+
+Then `init` lists exactly what it changed, and what is still not covered. It:
 
 - writes `.05/policy.toml`, your rules, with a `test` check guessed from your project;
 - creates a signing key for this machine;
@@ -90,7 +104,7 @@ With Claude Code or Codex, most of 05 runs on its own through the hooks. Work as
    ```
    The pre-push hook checks what you push. No pull request is needed. If your team wants pull requests, push the branch and open one; the CI gate checks it either way.
 
-Bare `use05` shows where you stand at any time: the current task, whether the staged change would be allowed, and which controls are on.
+Bare `use05` shows where you stand at any time: the current task, whether the staged change would be allowed, your environments and which controls are on.
 
 Any other agent with hooks of its own can call `use05 hook generic` (see [Extending 05](extending.md)). Every agent, hooks or not, is covered by the pre-push hook and the CI gate.
 
@@ -173,7 +187,7 @@ Run as many agents as you like on one repository:
 
 ## Configure: `.05/policy.toml`
 
-`use05 init` writes the file with comments. `use05 policy` shows the effective value of every setting and where it came from. A change is held to the rules at its **base**, never its own, so editing the policy is itself a change a person approves before it takes effect.
+`use05 init` writes the file with comments, and `use05 policy --edit` changes it by asking the setup questions again, so you rarely need to edit it by hand. `use05 policy` shows the effective value of every setting and where it came from. A change is held to the rules at its **base**, never its own, so editing the policy is itself a change a person approves before it takes effect.
 
 | Setting | Default | What it does |
 |---|---|---|
@@ -206,6 +220,7 @@ Run as many agents as you like on one repository:
 | `[enforce] on_error` | `"open"` | If 05 itself fails: `open` lets the change through and says so loudly; `closed` refuses it. |
 | `[env] allow` | unrestricted | If set, the only environment variables any check may be passed. |
 | `[[trust.key]]` | none | Public keys whose receipts count, e.g. your CI runner's. See the CI gate guide. |
+| `[[environment]]` `name`, `branch` | none | Which branch is which environment, lowest first, e.g. `name = "dev"`, `branch = "main"`. Shown by `use05` and the brief; environment branches are never deleted. |
 
 An organisation can add a signed layer of rules on top. Repositories can tighten that layer, but never loosen it. `use05 policy` shows which settings came from it.
 
@@ -218,7 +233,7 @@ Hooks and the pre-push hook run on your machine, where an agent running as you c
 | Command | What it does |
 |---|---|
 | `use05` | Where you stand: the task, whether the staged change would be allowed, which controls are on. |
-| `use05 init` | Set up this repository: policy, keys, hooks. Shows exactly what it changes. |
+| `use05 init` | Set up this repository, asking a few questions on a terminal: policy, keys, hooks. Shows exactly what it changes. Also `--team`, `--target`, `--env`, `--defaults`, `--guided`. |
 | `use05 start "<title>" --scope <glob>` | Begin a task: what you are about to do and where. Also `--goal`, `--exclude`, `--check`, `--no-new-deps`. |
 | `use05 finish --outcome "<text>"` | Record what was done, in the author's words. Treated as a claim, never a fact. |
 | `use05 prove [names] [-- command]` | Run checks on the change and sign the result. |
@@ -227,7 +242,7 @@ Hooks and the pre-push hook run on your machine, where an agent running as you c
 | `use05 bypass --reason "<text>"` | Let one exact change through a block, for a stated reason. Logged. |
 | `use05 land` | Move an allowed change into its target branch, then clean up its branch and worktree. |
 | `use05 verify <receipt>` | Check a receipt offline: no account, no network. |
-| `use05 policy` | The effective policy, and where each setting came from. |
+| `use05 policy` | The effective policy, and where each setting came from. `--edit` changes it through the setup questions. |
 | `use05 doctor` | Check the setup, and how strongly each control is enforced. |
 | `use05 key new --approver` | Create your passphrase-protected approver key. `use05 key show` lists this machine's keys. |
 | `use05 uninstall` | Reverse exactly what `init` did. |

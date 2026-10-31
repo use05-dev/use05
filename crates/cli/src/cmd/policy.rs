@@ -78,3 +78,41 @@ pub fn org_sign(floor_path: &Path, org_name: &str, key_path: &Path, out: &Path) 
         exit: 0,
     }
 }
+
+/// `use05 policy --edit`: the guided setup's questions on the existing policy file.
+pub fn edit(repo: &Path, interactive: bool, flags: &crate::cmd::setup::Flags) -> Report {
+    use crate::cmd::setup::{AFTER_EDIT, Outcome, run_on};
+    let store = match use05_core::task::Store::open(repo) {
+        Ok(s) => s,
+        Err(e) => return Report::from_core("policy", e),
+    };
+    let top = store.dirs.top.clone();
+    let path = top.join(POLICY_PATH);
+    let Ok(text) = std::fs::read_to_string(&path) else {
+        return Report::error("policy", "NO_POLICY", format!("there is no {POLICY_PATH} here yet"), Some("use05 init   sets up this repository, with the same questions".into()), 6);
+    };
+    if !interactive && !flags.any() {
+        return Report::error("policy", "NOT_INTERACTIVE", "use05 policy --edit asks its questions on a terminal".into(), Some("run it in a terminal, add --guided to answer on stdin, or pass --team, --target and --env".into()), 6);
+    }
+    match run_on(&text, &top, true, interactive, flags) {
+        Err(e) => Report::error("policy", "POLICY_INVALID", format!("{POLICY_PATH}: {e}"), None, 3),
+        Ok((Outcome::Stopped, _)) => Report::error("policy", "SETUP_STOPPED", "Stopped; nothing was changed.".into(), None, 1),
+        Ok((Outcome::Unchanged, notes)) => Report { command: "policy", outcome: "unchanged", code: "POLICY_UNCHANGED", tone: Tone::Plain, headline: format!("No change to {POLICY_PATH}"), rows: vec![], notes, next: None, excerpt: vec![], details: json!({ "changed": false }), exit: 0 },
+        Ok((Outcome::Written(new), notes)) => match std::fs::write(&path, &new) {
+            Err(e) => Report::error("policy", "IO_ERROR", format!("cannot write {POLICY_PATH}: {e}"), None, 4),
+            Ok(()) => Report {
+                command: "policy",
+                outcome: "updated",
+                code: "POLICY_UPDATED",
+                tone: Tone::Good,
+                headline: format!("Updated {POLICY_PATH}"),
+                rows: vec![],
+                notes: notes.into_iter().chain([AFTER_EDIT.to_string()]).collect(),
+                next: Some("git diff .05/policy.toml   to see exactly what changed".into()),
+                excerpt: vec![],
+                details: json!({ "changed": true }),
+                exit: 0,
+            },
+        },
+    }
+}

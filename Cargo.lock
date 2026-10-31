@@ -676,7 +676,7 @@ dependencies = [
 
 [[package]]
 name = "use05"
-version = "0.0.3"
+version = "0.0.4"
 dependencies = [
  "clap",
  "hex",
@@ -686,6 +686,7 @@ dependencies = [
  "sha2",
  "tempfile",
  "toml",
+ "toml_edit",
  "use05-core",
  "use05-receipt",
  "use05-runner",
@@ -693,7 +694,7 @@ dependencies = [
 
 [[package]]
 name = "use05-core"
-version = "0.0.3"
+version = "0.0.4"
 dependencies = [
  "base64",
  "chacha20poly1305",
@@ -711,7 +712,7 @@ dependencies = [
 
 [[package]]
 name = "use05-receipt"
-version = "0.0.3"
+version = "0.0.4"
 dependencies = [
  "base64",
  "ed25519-dalek",
@@ -723,7 +724,7 @@ dependencies = [
 
 [[package]]
 name = "use05-runner"
-version = "0.0.3"
+version = "0.0.4"
 dependencies = [
  "hex",
  "libc",

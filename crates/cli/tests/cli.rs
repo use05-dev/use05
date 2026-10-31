@@ -2751,3 +2751,198 @@ fn a_project_level_npm_install_writes_hooks_that_find_it() {
     let pre_push = fs::read_to_string(s.path(".git/hooks/pre-push")).unwrap();
     assert!(pre_push.contains("node_modules/.bin"), "{pre_push}");
 }
+
+#[test]
+fn an_allowed_action_carries_no_refusal_reason() {
+    let s = Sandbox::with_agent_hooks();
+    let policy = fs::read_to_string(s.path(".05/policy.toml")).unwrap();
+    s.write(".05/policy.toml", &policy.replacen("scope = \"warn\"", "scope = \"allow\"", 1));
+    s.commit_all("scope drift allowed");
+    declare(&s, "sess-allow001", "Billing", "src/**");
+    let payload = serde_json::json!({ "session_id": "sess-allow001", "cwd": s.dir.path(), "hook_event_name": "PreToolUse", "tool_name": "Edit", "tool_input": { "file_path": s.path("docs/x.md"), "old_string": "a", "new_string": "b" } }).to_string();
+    s.run_with_stdin(&["hook", "claude-code", "PreToolUse"], &payload);
+    let line = log_text(&s, "sess-allow001").lines().filter_map(|l| serde_json::from_str::<Value>(l).ok()).map(|l| l["event"].clone()).find(|e| e["event"] == "tool" && e["paths"][0] == "docs/x.md").unwrap();
+    assert_eq!(line["decision"], "allow", "{line}");
+    assert!(line["why"].is_null(), "{line}");
+}
+
+// ----------------------------------------------------------------------------- guided setup (D82)
+
+/// A repository with long-lived branches main, uat and production, not yet set up.
+fn with_environment_branches() -> Sandbox {
+    let s = Sandbox::new();
+    fs::create_dir_all(s.path(".claude")).unwrap();
+    s.write("package.json", "{\"scripts\":{\"test\":\"./test.sh\"}}\n");
+    s.write("LICENSE", "Apache-2.0\n");
+    s.commit_all("first");
+    s.git(&["branch", "uat"]);
+    s.git(&["branch", "production"]);
+    s
+}
+
+fn policy_of(s: &Sandbox) -> use05_core::policy::Policy {
+    use05_core::policy::Policy::parse(&fs::read_to_string(s.path(".05/policy.toml")).unwrap()).unwrap()
+}
+
+#[test]
+fn guided_init_asks_about_the_team_branches_and_rules_and_writes_the_answers() {
+    let s = with_environment_branches();
+    // team: small; lands on: main; main=dev, uat=uat, production=prod; keep checks; add lint;
+    // protected: none; locked: LICENSE; append-only: none; do-not-read: none; outside plan,
+    // weakened tests, landing: defaults; write: yes.
+    let answers = "2\n\n\n\n\n\nlint: npm run lint\n\n\nLICENSE\n\n\n\n\n\n\n";
+    let out = s.run_with_stdin(&["init", "--guided"], answers);
+    assert_eq!(code(&out), 0, "{}", text(&out));
+    let shown = text(&out);
+    assert!(shown.contains("Who works in this repository?") && shown.contains("Which environment is"), "{shown}");
+    assert!(shown.contains("created .05/policy.toml with your answers") && !shown.contains("> []"), "{shown}");
+    let p = policy_of(&s);
+    let envs: Vec<(String, String)> = p.environment.iter().map(|e| (e.name.clone(), e.branch.clone())).collect();
+    assert_eq!(envs, [("dev".into(), "main".into()), ("uat".into(), "uat".into()), ("prod".into(), "production".into())]);
+    assert_eq!(p.intent.mode, use05_core::policy::IntentMode::Risky, "the small-team preset");
+    assert_eq!(p.drift.scope, use05_core::policy::Severity::Approval);
+    assert_eq!(p.check.iter().map(|c| c.name.as_str()).collect::<Vec<_>>(), ["test", "lint"]);
+    assert_eq!(p.protect.locked, ["LICENSE"]);
+    assert_eq!(p.branches.target.as_deref(), Some("main"));
+    assert!(fs::read_to_string(s.path(".05/policy.toml")).unwrap().contains("# files outside the declared scope"), "the template's comments stay");
+}
+
+#[test]
+fn policy_edit_changes_an_existing_setup_and_says_how_the_change_takes_effect() {
+    let s = with_environment_branches();
+    assert_eq!(code(&s.run(&["init", "--defaults"])), 0);
+    s.commit_all("05");
+    // keep the current rules; lands on main; environments: defaults; checks kept, none added;
+    // paths: defaults; outside plan: refuse; tests: default; landing: automatic; write: yes.
+    let answers = "\n\n\n\n\n\n\n\n\n\n\n4\n\n2\n\n";
+    let out = s.run_with_stdin(&["policy", "--edit", "--guided"], answers);
+    assert_eq!(code(&out), 0, "{}", text(&out));
+    let p = policy_of(&s);
+    assert_eq!(p.drift.scope, use05_core::policy::Severity::Deny);
+    assert_eq!(p.branches.land, use05_core::policy::LandMode::Auto);
+    assert!(text(&out).contains("use05 approve --outcome"), "a policy change is approved like any protected change: {}", text(&out));
+}
+
+#[test]
+fn stopping_part_way_through_changes_nothing() {
+    let s = with_environment_branches();
+    let out = s.run_with_stdin(&["init", "--guided"], "2\n");
+    assert_ne!(code(&out), 0, "{}", text(&out));
+    assert!(text(&out).contains("nothing was changed"), "{}", text(&out));
+    assert!(!s.path(".05/policy.toml").exists());
+}
+
+#[test]
+fn init_takes_the_answers_as_flags_without_asking() {
+    let s = with_environment_branches();
+    let out = s.run(&["init", "--team", "regulated", "--target", "main", "--env", "dev=main", "--env", "prod=production"]);
+    assert_eq!(code(&out), 0, "{}", text(&out));
+    assert!(!text(&out).contains("Who works"), "{}", text(&out));
+    let p = policy_of(&s);
+    assert_eq!(p.environment.iter().map(|e| e.name.as_str()).collect::<Vec<_>>(), ["dev", "prod"]);
+    assert_eq!((p.approvals.min, p.drift.tests), (2, use05_core::policy::Severity::Deny));
+}
+
+#[test]
+fn environments_show_in_the_status_and_the_brief_says_where_a_change_lands() {
+    let s = with_environment_branches();
+    assert_eq!(code(&s.run(&["init", "--target", "main", "--env", "dev=main", "--env", "uat=uat", "--env", "prod=production"])), 0);
+    s.commit_all("05");
+    let status = text(&s.run(&[]));
+    assert!(status.contains("Environments") && status.contains("dev: main (") && status.contains("prod: production ("), "{status}");
+    s.write("main.rs", "fn main() { println!(\"hi\"); }\n");
+    s.git(&["add", "-A"]);
+    let brief = text(&s.run(&["brief"]));
+    assert!(brief.contains("lands on main (dev)"), "{brief}");
+}
+
+#[test]
+fn environments_added_to_an_older_policy_raise_its_minimum_version() {
+    let s = with_environment_branches();
+    assert_eq!(code(&s.run(&["init", "--defaults"])), 0);
+    let p = fs::read_to_string(s.path(".05/policy.toml")).unwrap();
+    s.write(".05/policy.toml", &p.replace(&format!("min_version = \"{}\"", env!("CARGO_PKG_VERSION")), "min_version = \"0.0.2\""));
+    assert_eq!(code(&s.run(&["policy", "--edit", "--env", "dev=main"])), 0);
+    let text = fs::read_to_string(s.path(".05/policy.toml")).unwrap();
+    assert!(text.contains("min_version = \"0.0.4\""), "an older use05 must be told to upgrade, not fail to parse:\n{text}");
+}
+
+#[test]
+fn pressing_enter_through_an_edit_changes_nothing() {
+    let s = with_environment_branches();
+    assert_eq!(code(&s.run(&["init", "--defaults"])), 0);
+    s.git(&["branch", "qa"]);
+    let p = fs::read_to_string(s.path(".05/policy.toml")).unwrap();
+    s.write(".05/policy.toml", &format!("{}\n[[environment]]\nname = \"staging\"\nbranch = \"qa\"\n", p.replace("tests = \"approval\"", "tests = \"allow\"")));
+    let before = fs::read_to_string(s.path(".05/policy.toml")).unwrap();
+    let out = s.run_with_stdin(&["policy", "--edit", "--guided"], &"\n".repeat(40));
+    assert_eq!(code(&out), 0, "{}", text(&out));
+    assert_eq!(fs::read_to_string(s.path(".05/policy.toml")).unwrap(), before, "{}", text(&out));
+}
+
+#[test]
+fn two_branches_never_share_a_role_without_being_told() {
+    let s = with_environment_branches();
+    s.git(&["branch", "develop"]);
+    let out = s.run_with_stdin(&["init", "--guided"], &"\n".repeat(40));
+    assert_eq!(code(&out), 0, "{}", text(&out));
+    let p = policy_of(&s);
+    let dev: Vec<&str> = p.environment.iter().filter(|e| e.name == "dev").map(|e| e.branch.as_str()).collect();
+    assert_eq!(dev.len(), 1, "{:?}", p.environment);
+    let skipped = if dev[0] == "main" { "develop" } else { "main" };
+    assert!(!p.environment.iter().any(|e| e.branch == skipped), "{:?}", p.environment);
+    // The question for the second one did not offer dev as its default.
+    assert!(text(&out).contains("dev is already"), "{}", text(&out));
+}
+
+#[test]
+fn with_no_remote_the_landing_branch_defaults_to_the_current_one() {
+    let s = Sandbox::new();
+    s.git(&["checkout", "-q", "-b", "master"]);
+    s.write("package.json", "{\"scripts\":{\"test\":\"./test.sh\"}}\n");
+    s.commit_all("first");
+    let out = s.run_with_stdin(&["init", "--guided"], &"\n".repeat(40));
+    assert_eq!(code(&out), 0, "{}", text(&out));
+    assert_eq!(policy_of(&s).branches.target.as_deref(), Some("master"));
+}
+
+#[test]
+fn an_organisation_rule_stricter_than_an_answer_is_named() {
+    let s = with_environment_branches();
+    s.key("org.key");
+    s.write("floor.toml", "drift_scope = \"deny\"\n");
+    assert_eq!(code(&s.run(&["policy", "org-sign", "floor.toml", "--org", "Acme", "--key", "org.key", "--out", "org.json"])), 0);
+    fs::copy(s.path("org.json"), s.home.path().join("org.json")).unwrap();
+    fs::copy(s.path("org.key.pub"), s.home.path().join("org.pub")).unwrap();
+    let out = s.run(&["init", "--team", "solo"]);
+    assert_eq!(code(&out), 0, "{}", text(&out));
+    assert!(text(&out).contains("Acme") && text(&out).contains("refuse"), "the person is told the organisation's rule applies: {}", text(&out));
+}
+
+#[test]
+fn only_branches_that_look_long_lived_are_asked_about() {
+    let s = with_environment_branches();
+    for i in 0..30 {
+        s.git(&["branch", &format!("feature/f{i}")]);
+    }
+    let out = s.run_with_stdin(&["init", "--guided"], &"\n".repeat(40));
+    assert_eq!(code(&out), 0, "{}", text(&out));
+    assert!(!text(&out).contains("feature/f1"), "{}", text(&out));
+    assert!(text(&out).contains("30 other branches"), "{}", text(&out));
+}
+
+#[test]
+fn policy_answer_flags_need_edit() {
+    let s = with_environment_branches();
+    assert_eq!(code(&s.run(&["init", "--defaults"])), 0);
+    assert_ne!(code(&s.run(&["policy", "--team", "regulated"])), 0, "a flag that would be ignored is refused");
+}
+
+#[test]
+fn bad_answers_to_write_this_do_not_write() {
+    let s = with_environment_branches();
+    let mut answers = "\n".repeat(14);
+    answers.push_str("quit\nquit\nquit\n");
+    let out = s.run_with_stdin(&["init", "--guided"], &answers);
+    assert!(!s.path(".05/policy.toml").exists(), "{}", text(&out));
+}

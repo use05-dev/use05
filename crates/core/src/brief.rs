@@ -66,6 +66,9 @@ pub struct Brief {
     pub undo: Vec<String>,
     /// What happened during the agent's session, from its action log; `None` without a log.
     pub session: Option<crate::session::Session>,
+    /// Where the change lands and the environment that branch is, when the policy names
+    /// environments: `main (dev)`.
+    pub lands_on: Option<String>,
 }
 
 /// A part of the change: a directory (ending in `/`), `(root)` for files at the top, or
@@ -104,6 +107,8 @@ pub fn areas(changes: &[(&str, u64, u64)], max: usize) -> Vec<Area> {
         for &i in members {
             let (name, d) = match dir_at(changes[i].0, depth + 1) {
                 Some(k) => (k, depth + 1),
+                // Files directly in a split directory: `src/*`, so the row cannot be read as all of `src/`.
+                None if parent.ends_with('/') => (format!("{parent}*"), 0),
                 None => (parent.to_string(), 0),
             };
             let at = *index.entry(name.clone()).or_insert_with(|| {
@@ -294,6 +299,7 @@ pub fn build(task: Option<&Task>, gate: GateResult, tree: &str, tree_label: &str
         unknowns,
         undo,
         session: None,
+        lands_on: None,
     }
 }
 
@@ -353,6 +359,16 @@ mod tests {
         assert_eq!(got[0].name, "src/d19/", "the biggest area's own subfolders get the rows: {got:?}");
         assert!(got.iter().any(|a| a.name.starts_with("(") && a.name.contains("more in src/")), "{got:?}");
         assert_eq!(got.iter().map(|a| a.files).sum::<usize>(), 102);
+    }
+
+    #[test]
+    fn files_directly_in_a_split_folder_are_named_as_such() {
+        let mut v = many("src/x/", 3, 10);
+        v.extend(many("src/y/", 3, 10));
+        v.extend(many("src/", 2, 1));
+        let got = areas(&view(&v), 8);
+        let names: Vec<&str> = got.iter().map(|a| a.name.as_str()).collect();
+        assert!(names.contains(&"src/*") && !names.contains(&"src/"), "{names:?}");
     }
 
     #[test]

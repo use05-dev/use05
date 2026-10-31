@@ -239,62 +239,101 @@ pub fn diff_hunks(top: &Path, base: Option<&str>, target: &str, path: &str) -> R
     Ok(parse_hunks(&String::from_utf8_lossy(&raw)))
 }
 
-/// [`diff_hunks`] for every file of a change, from one `git diff-tree`: a change of thousands of
-/// files costs one process, not thousands. A path git quotes in the header (a quote, a
-/// backslash or a control character in its name) is left out; ask [`diff_hunks`] for it.
-pub fn hunks_by_path(top: &Path, base: Option<&str>, target: &str) -> Result<std::collections::HashMap<String, Hunks>> {
-    let base = base.unwrap_or(EMPTY_TREE);
-    let raw = run(top, &["-c", "core.quotePath=false", "diff-tree", "-r", "-p", "-U0", "--no-color", "--no-ext-diff", "--no-renames", base, target])?;
-    let text = String::from_utf8_lossy(&raw);
-    let mut out = std::collections::HashMap::new();
-    let mut sections: Vec<&str> = text.split("\ndiff --git ").collect();
-    if let Some(first) = sections.first_mut() {
-        *first = first.strip_prefix("diff --git ").unwrap_or(first);
+/// [`diff_hunks`] for the `wanted` files of a change, from one `git diff-tree`: a change of
+/// thousands of files costs one process, not thousands. The patch is read as it streams and only
+/// wanted files' lines are kept, so a huge lockfile in the same change costs no memory. A path
+/// git quotes in the header (a quote, a backslash or a control character in its name) is left
+/// out; ask [`diff_hunks`] for it.
+pub fn hunks_by_path(top: &Path, base: Option<&str>, target: &str, wanted: &std::collections::HashSet<String>) -> Result<std::collections::HashMap<String, Hunks>> {
+    use std::io::{BufRead, BufReader};
+    let base_tree = base.unwrap_or(EMPTY_TREE);
+    let mut cmd = self::base(top);
+    cmd.args(["-c", "core.quotePath=false", "diff-tree", "-r", "-p", "-U0", "--no-color", "--no-ext-diff", "--no-renames", base_tree, target]);
+    cmd.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::null());
+    let mut child = cmd.spawn().map_err(|e| Error::new("GIT_MISSING", format!("git could not be started ({e})")))?;
+    let reader = BufReader::new(child.stdout.take().expect("piped"));
+    let mut out: std::collections::HashMap<String, Hunks> = std::collections::HashMap::new();
+    // The file whose section is being read, when it is wanted, and its patch so far.
+    let mut current: Option<(String, String)> = None;
+    let finish = |current: &mut Option<(String, String)>, out: &mut std::collections::HashMap<String, Hunks>| {
+        if let Some((path, patch)) = current.take() {
+            // A type change (a file replaced by a symlink, say) is two sections for one path: a
+            // deletion and an addition. Keep both.
+            let (removed, added) = parse_hunks(&patch);
+            let entry = out.entry(path).or_default();
+            entry.0.extend(removed);
+            entry.1.extend(added);
+        }
+    };
+    for raw in reader.split(b'\n') {
+        let raw = raw.map_err(|e| Error::io("reading from git", e))?;
+        let line = String::from_utf8_lossy(&raw);
+        if let Some(header) = line.strip_prefix("diff --git ") {
+            finish(&mut current, &mut out);
+            current = header_path(header).filter(|p| wanted.contains(p)).map(|p| (p, String::new()));
+        }
+        if let Some((_, patch)) = current.as_mut() {
+            patch.push_str(&line);
+            patch.push('\n');
+        }
     }
-    for section in sections.into_iter().filter(|s| !s.is_empty()) {
-        let header = section.lines().next().unwrap_or("");
-        // `a/P b/P`, the same P twice with no renames: 2P + 5 characters.
-        if header.starts_with('"') || header.len() < 5 || (header.len() - 5) % 2 != 0 {
-            continue;
-        }
-        let n = (header.len() - 5) / 2;
-        let (Some(a), Some(b)) = (header.get(2..2 + n), header.get(2 + n + 3..)) else { continue };
-        if !header.starts_with("a/") || header.get(2 + n..2 + n + 3) != Some(" b/") || a != b {
-            continue;
-        }
-        // A type change (a file replaced by a symlink, say) is two sections for one path: a
-        // deletion and an addition. Keep both.
-        let (removed, added) = parse_hunks(&format!("diff --git {section}"));
-        let entry: &mut Hunks = out.entry(a.to_string()).or_default();
-        entry.0.extend(removed);
-        entry.1.extend(added);
+    finish(&mut current, &mut out);
+    let status = child.wait().map_err(|e| Error::io("waiting for git", e))?;
+    if !status.success() {
+        return Err(Error::new("GIT_FAILED", "git diff-tree failed"));
     }
     Ok(out)
 }
 
-/// The bytes of many blobs, each named `rev:path`, from one `git cat-file --batch`; `None` for
-/// one that does not exist. Requests are written from another thread, so a large answer cannot
-/// stall git while it is still being asked.
+/// The path in a `diff --git a/P b/P` header (no renames: the same P twice, so 2P + 5
+/// characters), or `None` for a quoted path.
+fn header_path(header: &str) -> Option<String> {
+    if header.starts_with('"') || header.len() < 5 || (header.len() - 5) % 2 != 0 {
+        return None;
+    }
+    let n = (header.len() - 5) / 2;
+    let (a, b) = (header.get(2..2 + n)?, header.get(2 + n + 3..)?);
+    (header.starts_with("a/") && header.get(2 + n..2 + n + 3) == Some(" b/") && a == b).then(|| a.to_string())
+}
+
+/// The bytes of many blobs, each named `rev:path`; `None` for one that does not exist.
 pub fn blobs(top: &Path, specs: &[String]) -> Result<Vec<Option<Vec<u8>>>> {
+    blobs_with(top, specs, |b| b.to_vec())
+}
+
+/// Each blob named `rev:path`, handed to `f` as it is read, from one `git cat-file --batch`;
+/// only `f`'s answer is kept, so reading thousands of large files costs no memory. `None` for a
+/// blob that does not exist. Requests are written from another thread, so a large answer cannot
+/// stall git while it is still being asked. A path with a newline in it cannot be asked for in
+/// batch mode and is read on its own.
+pub fn blobs_with<T>(top: &Path, specs: &[String], mut f: impl FnMut(&[u8]) -> T) -> Result<Vec<Option<T>>> {
     use std::io::{BufRead, BufReader, Read};
-    if specs.is_empty() {
-        return Ok(Vec::new());
+    let batched: Vec<usize> = (0..specs.len()).filter(|&i| !specs[i].contains('\n')).collect();
+    let mut out: Vec<Option<T>> = std::iter::repeat_with(|| None).take(specs.len()).collect();
+    for (i, spec) in specs.iter().enumerate().filter(|(_, s)| s.contains('\n')) {
+        if let Some((rev, path)) = spec.split_once(':') {
+            out[i] = blob_at(top, rev, path).map(|b| f(&b));
+        }
+    }
+    if batched.is_empty() {
+        return Ok(out);
     }
     let mut cmd = base(top);
     cmd.args(["cat-file", "--batch"]).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::null());
     let mut child = cmd.spawn().map_err(|e| Error::new("GIT_MISSING", format!("git could not be started ({e})")))?;
     let mut stdin = child.stdin.take().expect("piped");
-    let input: String = specs.iter().map(|s| format!("{}\n", s.replace('\n', " "))).collect();
+    let input: String = batched.iter().map(|&i| format!("{}\n", specs[i])).collect();
     let writer = std::thread::spawn(move || {
         let _ = stdin.write_all(input.as_bytes());
     });
     let mut reader = BufReader::new(child.stdout.take().expect("piped"));
-    let mut out = Vec::with_capacity(specs.len());
-    for _ in specs {
+    let mut answered = 0;
+    for &i in &batched {
         let mut header = String::new();
         if reader.read_line(&mut header).map_err(|e| Error::io("reading from git", e))? == 0 {
             break;
         }
+        answered += 1;
         // `<oid> <type> <size>` for an object, `<request> missing` (or `ambiguous`) otherwise. The
         // request may hold spaces; an object line never does.
         let fields: Vec<&str> = header.trim_end_matches('\n').split(' ').collect();
@@ -302,19 +341,17 @@ pub fn blobs(top: &Path, specs: &[String]) -> Result<Vec<Option<Vec<u8>>>> {
             [oid, kind, size] if oid.len() >= 40 && oid.bytes().all(|b| b.is_ascii_hexdigit()) => size.parse::<usize>().ok().map(|n| (*kind == "blob", n)),
             _ => None,
         };
-        match object {
-            Some((is_blob, size)) => {
-                let mut body = vec![0u8; size + 1];
-                reader.read_exact(&mut body).map_err(|e| Error::io("reading from git", e))?;
-                body.truncate(size);
-                out.push(is_blob.then_some(body));
+        if let Some((is_blob, size)) = object {
+            let mut body = vec![0u8; size + 1];
+            reader.read_exact(&mut body).map_err(|e| Error::io("reading from git", e))?;
+            if is_blob {
+                out[i] = Some(f(&body[..size]));
             }
-            None => out.push(None),
         }
     }
     let _ = writer.join();
     let _ = child.wait();
-    if out.len() != specs.len() {
+    if answered != batched.len() {
         return Err(Error::new("GIT_FAILED", "git cat-file stopped before answering every request"));
     }
     Ok(out)
@@ -418,6 +455,32 @@ mod tests {
     }
 
     #[test]
+    fn a_newline_in_a_file_name_reads_that_file_not_its_lookalike() {
+        let dir = tempfile::tempdir().unwrap();
+        let top = dir.path();
+        run(top, &["init", "-q"]).unwrap();
+        std::fs::write(top.join("new\nline.rs"), "with newline").unwrap();
+        std::fs::write(top.join("new line.rs"), "with space").unwrap();
+        run(top, &["add", "-A"]).unwrap();
+        let tree = text(top, &["write-tree"]).unwrap();
+        let got = blobs(top, &[format!("{tree}:new\nline.rs"), format!("{tree}:new line.rs")]).unwrap();
+        assert_eq!(got[0].as_deref(), Some(&b"with newline"[..]));
+        assert_eq!(got[1].as_deref(), Some(&b"with space"[..]));
+    }
+
+    #[test]
+    fn blobs_with_hands_each_blob_to_a_function_and_keeps_only_its_answer() {
+        let dir = tempfile::tempdir().unwrap();
+        let top = dir.path();
+        run(top, &["init", "-q"]).unwrap();
+        std::fs::write(top.join("a.rs"), "12345").unwrap();
+        run(top, &["add", "-A"]).unwrap();
+        let tree = text(top, &["write-tree"]).unwrap();
+        let got = blobs_with(top, &[format!("{tree}:a.rs"), format!("{tree}:gone.rs")], |b| b.len()).unwrap();
+        assert_eq!(got, vec![Some(5), None]);
+    }
+
+    #[test]
     fn hunks_for_a_whole_change_match_the_per_file_answer() {
         let dir = tempfile::tempdir().unwrap();
         let top = dir.path();
@@ -435,11 +498,16 @@ mod tests {
         std::os::unix::fs::symlink("c.rs", top.join("a.rs")).unwrap();
         run(top, &["add", "-A"]).unwrap();
         let target = text(top, &["write-tree"]).unwrap();
-        let all = hunks_by_path(top, Some(&base), &target).unwrap();
+        let wanted: std::collections::HashSet<String> = ["a.rs", "dir with space/b.rs", "c.rs"].iter().map(|p| p.to_string()).collect();
+        let all = hunks_by_path(top, Some(&base), &target, &wanted).unwrap();
         for path in ["a.rs", "dir with space/b.rs", "c.rs"] {
             assert_eq!(all.get(path), Some(&diff_hunks(top, Some(&base), &target, path).unwrap()), "{path}");
         }
         assert_eq!(all["a.rs"].0.len(), 3, "the deleted file's lines are kept: {:?}", all["a.rs"]);
         assert_eq!(all.len(), 3);
+        // Only the files asked for are kept.
+        let one: std::collections::HashSet<String> = ["c.rs".to_string()].into();
+        let some = hunks_by_path(top, Some(&base), &target, &one).unwrap();
+        assert_eq!(some.keys().collect::<Vec<_>>(), ["c.rs"]);
     }
 }

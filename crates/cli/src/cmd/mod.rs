@@ -7,6 +7,7 @@ pub mod init;
 pub mod land;
 pub mod policy;
 pub mod prove;
+pub mod setup;
 pub mod start;
 pub mod status;
 pub mod verify;

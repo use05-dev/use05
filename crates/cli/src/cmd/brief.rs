@@ -41,10 +41,14 @@ pub fn run(repo: &Path, task: Option<&str>, tree: Option<&str>, fetch: bool, jso
     };
     let mut brief = build(ctx.task.as_ref(), gate, &target.oid, &target.label, target.base_commit.as_deref(), target.head_commit.as_deref());
     // The session, digested from the task's log as this machine has it, or as it travelled.
-    brief.session = ctx.task.as_ref().and_then(|t| {
-        let found = use05_core::evidence::classify(&ctx.trust, &use05_core::store::find(ctx.top(), &t.id));
-        use05_core::logseal::copy(ctx.top(), Some(&ctx.store.state_dir()), &found, &t.id)
-    }).map(|text| use05_core::session::digest(&text));
+    if !ctx.policy.environment.is_empty() {
+        let target = use05_core::branches::target_for(&ctx.policy, ctx.task.as_ref().and_then(|t| t.intent.as_ref()), ctx.top());
+        brief.lands_on = Some(match ctx.policy.environment.iter().find(|e| e.branch == target) {
+            Some(e) => format!("{target} ({})", e.name),
+            None => format!("{target} (not an environment)"),
+        });
+    }
+    brief.session = ctx.task.as_ref().zip(ctx.task_found()).and_then(|(t, found)| use05_core::logseal::copy(ctx.top(), Some(&ctx.store.state_dir()), found, &t.id)).map(|text| use05_core::session::digest(&text));
     if json {
         println!("{}", serde_json::to_string_pretty(&serde_json::json!({ "v": 1, "command": "brief", "decision": decision.word(), "label": brief.label, "brief": brief, "overlap": overlaps })).expect("brief serialises"));
     } else {
@@ -138,6 +142,9 @@ pub fn render(ui: &Ui, b: &Brief, org: Option<&str>, overlaps: &[use05_core::ove
         (Some(_), Some(goal)) => intent.push(Item::plain(goal.clone())),
         (Some(_), None) => intent.push(Item::dim("no goal written")),
         (None, _) => intent.push(Item::dim("inferred from the task; no card was written")),
+    }
+    if let Some(l) = &b.lands_on {
+        intent.push(Item::dim(format!("lands on {l}")));
     }
     if let Some(a) = &b.agent {
         let model = a.model.as_deref().map(|m| format!(" · model {m}")).unwrap_or_default();

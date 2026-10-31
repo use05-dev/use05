@@ -8,6 +8,8 @@
 mod cmd;
 mod ctx;
 mod extend;
+mod policy_edit;
+mod prompt;
 mod report;
 mod ui;
 
@@ -94,6 +96,21 @@ struct InitCli {
     /// Do not touch AGENTS.md
     #[arg(long)]
     no_agents_md: bool,
+    /// Do not ask anything; write the default policy
+    #[arg(long)]
+    defaults: bool,
+    /// Ask the setup questions even without a terminal, reading the answers from stdin
+    #[arg(long, conflicts_with = "defaults")]
+    guided: bool,
+    /// Who works here, setting how strict the rules start: solo, small or regulated
+    #[arg(long, value_name = "TEAM", value_parser = ["solo", "small", "regulated"])]
+    team: Option<String>,
+    /// The branch finished changes land on
+    #[arg(long, value_name = "BRANCH")]
+    target: Option<String>,
+    /// An environment and its branch, lowest first (repeatable): dev=main, prod=production
+    #[arg(long = "env", value_name = "NAME=BRANCH")]
+    envs: Vec<String>,
     #[command(flatten)]
     common: Common,
 }
@@ -222,6 +239,21 @@ struct VerifyCli {
 struct PolicyCli {
     #[command(subcommand)]
     action: Option<PolicyCmd>,
+    /// Change the policy by answering the setup questions again
+    #[arg(long)]
+    edit: bool,
+    /// Ask the setup questions even without a terminal, reading the answers from stdin
+    #[arg(long, requires = "edit")]
+    guided: bool,
+    /// Who works here, setting how strict the rules start: solo, small or regulated
+    #[arg(long, requires = "edit", value_name = "TEAM", value_parser = ["solo", "small", "regulated"])]
+    team: Option<String>,
+    /// The branch finished changes land on
+    #[arg(long, requires = "edit", value_name = "BRANCH")]
+    target: Option<String>,
+    /// An environment and its branch, lowest first (repeatable): dev=main, prod=production
+    #[arg(long = "env", requires = "edit", value_name = "NAME=BRANCH")]
+    envs: Vec<String>,
     #[command(flatten)]
     common: Common,
 }
@@ -365,7 +397,14 @@ fn main() -> ExitCode {
     };
 
     match command {
-        Cmd::Init(a) => emit(&cmd::init::run(cmd::init::Args { ci: a.ci, no_hooks: a.no_hooks, no_agents_md: a.no_agents_md, repo: a.common.repo }), a.common.json),
+        Cmd::Init(a) => {
+            let flags = match setup_flags(a.team.as_deref(), a.target, &a.envs) {
+                Ok(f) => f,
+                Err(e) => return emit(&report::Report::error("init", "USAGE", e, None, 6), a.common.json),
+            };
+            let interactive = a.guided || (!a.defaults && terminal());
+            emit(&cmd::init::run(cmd::init::Args { ci: a.ci, no_hooks: a.no_hooks, no_agents_md: a.no_agents_md, repo: a.common.repo, interactive, flags }), a.common.json)
+        }
         Cmd::Start(a) => emit(
             &cmd::start::run(cmd::start::Args {
                 title: a.title,
@@ -405,6 +444,13 @@ fn main() -> ExitCode {
         Cmd::Verify(a) => emit(&cmd::verify::run(cmd::verify::Args { receipt: a.receipt, key: a.key, tree: a.tree, repo: a.common.repo }), a.common.json),
         Cmd::Policy(a) => match a.action {
             Some(PolicyCmd::OrgSign { floor, org, key, out }) => emit(&cmd::policy::org_sign(&floor, &org, &key, &out), a.common.json),
+            None if a.edit => {
+                let flags = match setup_flags(a.team.as_deref(), a.target, &a.envs) {
+                    Ok(f) => f,
+                    Err(e) => return emit(&report::Report::error("policy", "USAGE", e, None, 6), a.common.json),
+                };
+                emit(&cmd::policy::edit(&a.common.repo, a.guided || terminal(), &flags), a.common.json)
+            }
             None => emit(&cmd::policy::run(&a.common.repo), a.common.json),
         },
         Cmd::Doctor(a) => cmd::doctor::run(&a.common.repo, a.common.json),
@@ -423,4 +469,19 @@ fn main() -> ExitCode {
         Cmd::Uninstall(a) => emit(&cmd::init::uninstall(&a.common.repo), a.common.json),
         Cmd::External(argv) => extend::run_command(&argv),
     }
+}
+
+/// A person at a terminal to answer questions: stdin, and stderr where the questions go.
+fn terminal() -> bool {
+    use std::io::IsTerminal;
+    std::io::stdin().is_terminal() && std::io::stderr().is_terminal()
+}
+
+/// The setup answers given as flags.
+fn setup_flags(team: Option<&str>, target: Option<String>, envs: &[String]) -> Result<cmd::setup::Flags, String> {
+    Ok(cmd::setup::Flags {
+        team: team.and_then(use05_core::setup::Team::from_name),
+        target,
+        envs: envs.iter().map(|e| cmd::setup::Flags::parse_env(e)).collect::<Result<_, _>>()?,
+    })
 }

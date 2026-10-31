@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.0.4
+
+- **Guided setup.** On a terminal, `use05 init` now asks a few plain questions before it writes anything: who works in the repository (setting how strict the rules start), which branch changes land on, which long-lived branch is dev, uat, pre-prod or prod, the checks, folder and file rules, how strict to be, and how changes land. It shows a summary and asks before writing. The same answers work as flags (`--team`, `--target`, `--env dev=main`); `--defaults` skips the questions.
+- **Change your settings without editing the file.** `use05 policy --edit`, or `use05 init` again, asks the same questions with your current settings as the defaults. Comments and settings the questions don't cover are kept.
+- **Environments.** `[[environment]]` records which branch is which environment, lowest first. Bare `use05` shows them with each branch's commit, the brief says where a change lands (`lands on main (dev)`), and environment branches are never deleted. Rules for promoting between environments come later. A policy with environments needs use05 0.0.4 or newer; older versions are told to upgrade.
+- Smaller fixes: a file name with a newline in it is read correctly; very large changes use less memory; the brief reads receipts once; refusal reasons are recorded only on refusals; files directly in a split folder show as `src/*`; a subagent's type is not hidden by a line that does not name it.
+
 ## 0.0.3
 
 - **Briefs for large, long sessions.** The brief's outcome now counts lines added and removed, overall and per area, and groups the files into at most eight named areas (`src/billing/ · 285 files · +28,500 −11,400`) instead of top-level folders only. Files outside the declared scope are grouped by area too. `brief --json` keeps `areas` as before and adds `area_summary` and `outside_scope_areas`. A new Session section digests what the agent did, in at most four lines: how long it ran, turns, tool calls, what 05 refused and why, which checks ran along the way and how they ended, and the subagents that took part.

@@ -60,7 +60,11 @@ pub fn digest(text: &str) -> Session {
         let e = &line["event"];
         if let Some(id) = e["agent_id"].as_str().filter(|i| !i.is_empty()) {
             let kind = e["agent_type"].as_str().filter(|k| !k.is_empty()).unwrap_or("subagent");
-            agents.entry(id.to_string()).or_insert_with(|| kind.to_string());
+            // A line without a type does not hide one another line gives.
+            let known = agents.entry(id.to_string()).or_insert_with(|| kind.to_string());
+            if known == "subagent" {
+                *known = kind.to_string();
+            }
         }
         match e["event"].as_str() {
             Some("tool") => {
@@ -168,6 +172,16 @@ mod tests {
         assert_eq!(d.checks, vec![CheckRuns { name: "test".into(), runs: 3, failed: 2, last_passed: true }]);
         assert_eq!(d.subagents, vec![("Explore".to_string(), 2), ("security-reviewer".to_string(), 1)]);
         assert_eq!((d.approvals, d.bypasses), (1, 0));
+    }
+
+    #[test]
+    fn a_subagent_s_type_is_taken_from_any_line_that_names_it() {
+        let text = [
+            line("2026-10-31T09:00:00Z", json!({ "event": "tool", "agent_id": "a1", "agent_type": "" })),
+            line("2026-10-31T09:01:00Z", json!({ "event": "tool", "agent_id": "a1", "agent_type": "Explore" })),
+        ]
+        .join("\n");
+        assert_eq!(digest(&text).subagents, vec![("Explore".to_string(), 1)]);
     }
 
     #[test]

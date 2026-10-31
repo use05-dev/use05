@@ -19,6 +19,8 @@ pub struct Ctx {
     pub policy: Policy,
     pub org: Option<String>,
     pub trust: Trust,
+    /// The current task's receipts, read and checked once however many times they are asked for.
+    task_found: std::cell::OnceCell<use05_core::evidence::Found>,
 }
 
 pub struct Target {
@@ -72,7 +74,7 @@ impl Ctx {
             None => None,
         };
         let trust = Trust::new(&policy, true);
-        Ok(Ctx { store, task, repo_policy, policy, org, trust })
+        Ok(Ctx { store, task, repo_policy, policy, org, trust, task_found: std::cell::OnceCell::new() })
     }
 
     /// Resolve what to look at: `index` (staged files) or any commit or tree.
@@ -103,12 +105,15 @@ impl Ctx {
         Ok(t)
     }
 
+    /// The current task's receipts and log seals, verified against the trusted keys.
+    pub fn task_found(&self) -> Option<&use05_core::evidence::Found> {
+        let task = self.task.as_ref()?;
+        Some(self.task_found.get_or_init(|| use05_core::evidence::classify(&self.trust, &use05_core::store::find(self.top(), &task.id))))
+    }
+
     pub fn gate(&self, target: &Target) -> Result<GateResult> {
         let late = self.task.as_ref().map(|t| use05_core::task::declared_late(&self.store, t)).unwrap_or_default();
-        let log = self.task.as_ref().and_then(|t| {
-            let found = use05_core::evidence::classify(&self.trust, &use05_core::store::find(self.top(), &t.id));
-            use05_core::logseal::check(self.top(), Some(&self.store.state_dir()), &found, &t.id)
-        });
+        let log = self.task.as_ref().and_then(|t| use05_core::logseal::check(self.top(), Some(&self.store.state_dir()), self.task_found().expect("a task"), &t.id));
         let overlaps = match &self.task {
             Some(t) => {
                 let changed: Vec<String> = git::changed(self.top(), target.base_tree.as_deref(), &target.oid)?.into_iter().map(|c| c.path).collect();
