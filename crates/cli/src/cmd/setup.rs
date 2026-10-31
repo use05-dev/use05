@@ -5,7 +5,7 @@
 use std::io::{BufRead, Write};
 use std::path::Path;
 
-use use05_core::policy::{CheckDef, Environment, IntentMode, LandMode, Policy, Severity};
+use use05_core::policy::{CheckDef, Environment, IntentMode, LandMode, Policy, Require, Severity};
 use use05_core::setup::{Role, Team, preset, scan, suggest_role};
 
 use crate::policy_edit::Settings;
@@ -75,6 +75,19 @@ pub fn from_flags(current: &Policy, flags: &Flags) -> Settings {
 
 /// The steps of the setup, for the `n/7` headings.
 const STEPS: usize = 7;
+
+/// Fresh base: what happens when an agent starts from older code than origin has.
+const FRESH_OPTIONS: [(&str, Severity); 4] = [
+    ("do not check", Severity::Allow),
+    ("tell the agent, and note it in the brief", Severity::Warn),
+    ("hold the change until a person approves", Severity::Approval),
+    ("refuse the change", Severity::Deny),
+];
+
+/// The one `[[require]]` rule the setup asks about: these folders change with any change.
+fn docs_rule(s: &Settings) -> Option<&Require> {
+    s.require.iter().find(|r| r.when == ["**"])
+}
 
 /// How a strictness reads in notes.
 const SEVERITY: [(&str, Severity); 4] = [("let it", Severity::Allow), ("note it in the brief", Severity::Warn), ("a person approves", Severity::Approval), ("refuse", Severity::Deny)];
@@ -228,6 +241,11 @@ fn summary(s: &Settings) -> Vec<(&'static str, String)> {
         ("Agents may not read", list(&s.no_read)),
         ("Outside the plan", option(&SCOPE_OPTIONS, s.scope)),
         ("Weakened tests", option(&TESTS_OPTIONS, s.tests)),
+        ("Starts behind origin", option(&FRESH_OPTIONS, s.fresh_base)),
+        ("Must change too", {
+            let rules: Vec<String> = s.require.iter().map(|r| if r.when == ["**"] { format!("{} with every change", r.also.join(" or ")) } else { r.describe() }).collect();
+            list(&rules)
+        }),
         ("Dependency changes", sev(s.dependencies)),
         ("Two agents, one file", sev(s.overlap)),
         ("Approvals needed", s.approvals_min.to_string()),
@@ -405,11 +423,20 @@ pub fn ask<R: BufRead, W: Write>(a: &mut Asker<R, W>, top: &Path, current: &Poli
     let has_env = std::fs::read_dir(top).map(|d| d.filter_map(|e| e.ok()).any(|e| e.file_name().to_string_lossy().starts_with(".env"))).unwrap_or(false);
     let read_default = if s.no_read.is_empty() && !editing && has_env { vec![".env*".to_string()] } else { s.no_read.clone() };
     s.no_read = a.list("Files agents may not read, like secrets.", &read_default)?;
+    let docs_default: Vec<String> = docs_rule(&s).map(|r| r.also.clone()).unwrap_or_default();
+    let docs = a.list("Folders that must be updated with every change, like docs/** or CHANGELOG.md (05 checks that they changed, not what they say).", &docs_default)?;
+    if docs != docs_default {
+        s.require.retain(|r| r.when != ["**"]);
+        if !docs.is_empty() {
+            s.require.push(Require { when: vec!["**".into()], also: docs, severity: Severity::Approval, why: None });
+        }
+    }
 
     // 6. How strict.
     a.step(6, STEPS, "How strict, and how changes land");
     s.scope = severity_choice(a, "When an agent changes files outside its plan:", &SCOPE_OPTIONS, s.scope)?;
     s.tests = severity_choice(a, "When a change weakens or removes tests:", &TESTS_OPTIONS, s.tests)?;
+    s.fresh_base = severity_choice(a, "When an agent starts from older code than origin has (05 fetches origin when a session starts):", &FRESH_OPTIONS, s.fresh_base)?;
     let land = a.choice("How should a finished change land?", &["I run use05 land", "Automatically, when 05 allows it"], usize::from(s.land == LandMode::Auto))?;
     s.land = if land == 1 { LandMode::Auto } else { LandMode::Manual };
 
@@ -469,6 +496,12 @@ fn org_overrides(text: &str) -> Vec<String> {
         if yours != theirs {
             notes.push(format!("Your organisation ({org}) requires {:?} {what}; that applies instead of {:?}.", sev(theirs), sev(yours)));
         }
+    }
+    if mine.branches.fresh_base != effective.branches.fresh_base {
+        notes.push(format!("Your organisation ({org}) requires {:?} when an agent starts behind origin; that applies instead of {:?}.", sev(effective.branches.fresh_base), sev(mine.branches.fresh_base)));
+    }
+    if mine.require.len() != effective.require.len() {
+        notes.push(format!("Your organisation ({org}) adds files that must change together: {}.", effective.require.iter().filter(|r| !mine.require.contains(r)).map(use05_core::policy::Require::describe).collect::<Vec<_>>().join("; ")));
     }
     if mine.approvals.min != effective.approvals.min {
         notes.push(format!("Your organisation ({org}) requires {} approvals; that applies instead of {}.", effective.approvals.min, mine.approvals.min));

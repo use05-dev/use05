@@ -8,6 +8,7 @@ pub mod brief;
 pub mod claims;
 pub mod error;
 pub mod evidence;
+pub mod fresh;
 pub mod gate;
 pub mod git;
 pub mod glob;

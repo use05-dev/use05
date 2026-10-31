@@ -2,13 +2,16 @@
 //! settings the questions do not cover and the order of the file are kept.
 
 use toml_edit::{Array, ArrayOfTables, DocumentMut, Item, Table, Value};
-use use05_core::policy::{CheckDef, Environment, IntentMode, LandMode, Policy, Severity};
+use use05_core::policy::{CheckDef, Environment, IntentMode, LandMode, Policy, Require, Severity};
 
 /// The first use05 that reads `[[environment]]`.
 const ENVIRONMENTS_SINCE: &str = "0.0.4";
 
 /// The first use05 that reads an environment's `level`.
 const LEVELS_SINCE: &str = "0.0.5";
+
+/// The first use05 that reads `fresh_base` and `[[require]]`.
+const RULES_SINCE: &str = "0.0.6";
 
 /// Everything the guided setup asks about.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -28,6 +31,8 @@ pub struct Settings {
     pub append_only: Vec<String>,
     pub no_delete: Vec<String>,
     pub no_read: Vec<String>,
+    pub fresh_base: Severity,
+    pub require: Vec<Require>,
 }
 
 impl Settings {
@@ -49,6 +54,8 @@ impl Settings {
             append_only: p.protect.append_only.clone(),
             no_delete: p.protect.no_delete.clone(),
             no_read: p.protect.no_read.clone(),
+            fresh_base: p.branches.fresh_base,
+            require: p.require.clone(),
         }
     }
 }
@@ -105,6 +112,9 @@ pub fn apply(text: &str, s: &Settings) -> Result<String, String> {
     if s.land != now.land {
         set(table(&mut doc, "branches"), "land", word(&s.land).into());
     }
+    if s.fresh_base != now.fresh_base {
+        set(table(&mut doc, "branches"), "fresh_base", word(&s.fresh_base).into());
+    }
     for (key, want, have) in [
         ("paths", &s.protect_paths, &now.protect_paths),
         ("locked", &s.locked, &now.locked),
@@ -130,6 +140,35 @@ pub fn apply(text: &str, s: &Settings) -> Result<String, String> {
                 envs.push(t);
             }
             doc.insert("environment", Item::ArrayOfTables(envs));
+        }
+    }
+    if s.require != now.require {
+        // Rules that stay keep their own table and comments; the rest are written fresh.
+        let old: Vec<Table> = doc.get("require").and_then(Item::as_array_of_tables).map(|a| a.iter().cloned().collect()).unwrap_or_default();
+        let mut rules = ArrayOfTables::new();
+        for r in &s.require {
+            let kept = now.require.iter().position(|o| o == r).and_then(|at| old.get(at)).cloned();
+            rules.push(kept.unwrap_or_else(|| {
+                let mut t = Table::new();
+                t.insert("when", Item::Value(strings(&r.when)));
+                t.insert("also", Item::Value(strings(&r.also)));
+                if r.severity != Severity::Approval {
+                    t.insert("severity", Item::Value(word(&r.severity).into()));
+                }
+                if let Some(why) = &r.why {
+                    t.insert("why", Item::Value(why.as_str().into()));
+                }
+                t
+            }));
+        }
+        match doc.get_mut("require").and_then(Item::as_array_of_tables_mut) {
+            Some(existing) if !rules.is_empty() => *existing = rules,
+            _ => {
+                doc.remove("require");
+                if !rules.is_empty() {
+                    doc.insert("require", Item::ArrayOfTables(rules));
+                }
+            }
         }
     }
     if s.checks != now.checks {
@@ -160,7 +199,9 @@ pub fn apply(text: &str, s: &Settings) -> Result<String, String> {
     }
     // Environments need 0.0.4 to be read. Raise the minimum so an older use05 is told to
     // upgrade instead of failing on a section it does not know.
-    let needs = if s.environments.iter().any(|e| e.level.is_some()) {
+    let needs = if s.fresh_base != Severity::Allow || !s.require.is_empty() {
+        Some(RULES_SINCE)
+    } else if s.environments.iter().any(|e| e.level.is_some()) {
         Some(LEVELS_SINCE)
     } else if !s.environments.is_empty() {
         Some(ENVIRONMENTS_SINCE)

@@ -23,6 +23,12 @@ pub struct Args {
 /// Sign the task's sealed declaration with this machine's key and keep it with the receipts, so
 /// it travels to CI (D65). The person's request is never included. Best effort: a failure is
 /// logged, never fatal.
+
+/// `--scope "src/** docs/**"` or `--scope src/**,docs/**` is several patterns, as agents write
+/// them. A path with a space in it is written with `?` or `*` for the space.
+fn patterns(values: &[String]) -> Vec<String> {
+    values.iter().flat_map(|v| v.split(|c: char| c == ',' || c.is_whitespace())).filter(|p| !p.is_empty()).map(str::to_string).collect()
+}
 pub fn publish_declaration(ctx: &Ctx, task: &use05_core::task::Task) {
     let (Some(card), Some(digest)) = (&task.intent, &task.intent_sha256) else { return };
     let predicate = use05_receipt::Declaration {
@@ -165,7 +171,7 @@ pub fn run(args: Args) -> Report {
         Some(IntentCard {
             title: args.title.clone(),
             goal: args.goal.clone().unwrap_or_default(),
-            scope: Scope { include: args.scope.clone(), exclude: args.exclude.clone() },
+            scope: Scope { include: patterns(&args.scope), exclude: patterns(&args.exclude) },
             acceptance: args.check.clone(),
             no_new_dependencies: args.no_new_deps,
             ..IntentCard::default()

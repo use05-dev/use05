@@ -47,11 +47,18 @@ impl Ctx {
     /// that case a base with no policy means defaults, never the change's own file.
     pub fn open_with(repo: &Path, task_id: Option<&str>, policy_rev: Option<&str>) -> Result<Ctx> {
         let store = Store::open(repo)?;
-        let task = match task_id {
+        let mut task = match task_id {
             Some(id) => Some(store.load(id)?),
             None => store.current(),
         };
         let top = store.dirs.top.clone();
+        // Fresh base: work updated since its session started has its base moved, so the commits
+        // it pulled in are not counted as its change (the hooks do the same as the agent works).
+        if let Some(t) = task.as_mut().filter(|t| t.fresh.is_some()) {
+            if use05_core::fresh::catch_up(&top, t) {
+                store.save(t)?;
+            }
+        }
         let strict = policy_rev.is_some();
         let base = policy_rev.map(str::to_string).or_else(|| task.as_ref().and_then(|t| t.base_commit.clone())).or_else(|| git::head_commit(&top));
         // A change's rules come from its base. If there is no committed policy yet, fall back to
@@ -122,6 +129,11 @@ impl Ctx {
             }
             None => Vec::new(),
         };
+        // Fresh base: only what the session-start hook recorded, and only while the policy asks.
+        let stale = match (&self.task, self.policy.branches.fresh_base) {
+            (_, use05_core::policy::Severity::Allow) | (None, _) => None,
+            (Some(t), _) => t.fresh.as_ref().and_then(|f| use05_core::fresh::stale(self.top(), f, target.head_commit.as_deref())),
+        };
         evaluate(&GateInput {
             top: self.top(),
             policy: &self.policy,
@@ -134,6 +146,7 @@ impl Ctx {
             late: &late,
             overlaps: &overlaps,
             log: log.as_ref(),
+            stale_base: stale.as_ref(),
         })
     }
 }

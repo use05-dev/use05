@@ -60,8 +60,8 @@ On a terminal, `init` first asks a few questions, each with a default you accept
 2. **Which branch finished changes land on.**
 3. **Which environment each long-lived branch is:** dev, uat, pre-prod, prod, another environment you name, or not an environment. 05 suggests a level from the branch's name (`main` is dev, `staging` is uat, `production` is prod). A level can hold several environments: pick dev for a second branch and you name it, for example `dev-eu`. Then you can add any other branch as an environment. 05 records the environments and shows them; rules for promoting between them come in a later version.
 4. **The checks that must pass**, and any you want to add (`lint: npm run lint`).
-5. **Folder and file rules:** what needs a person's approval, what is locked, where only new files may be added (it suggests migration folders it finds), and what agents may not read (it suggests `.env*` if you have one).
-6. **How strict to be** when an agent works outside its plan, and when a change weakens tests.
+5. **Folder and file rules:** what needs a person's approval, what is locked, where only new files may be added (it suggests migration folders it finds), what agents may not read (it suggests `.env*` if you have one), and which folders must be updated with every change, such as `docs/**` or `CHANGELOG.md` (a `[[require]]` rule on `**`; narrower rules go in the file).
+6. **How strict to be** when an agent works outside its plan, when a change weakens tests, and when an agent starts from older code than origin has.
 7. **How finished changes land:** you run `use05 land`, or automatically when 05 allows it.
 
 It then shows a summary and asks before writing anything. To change your settings later, run `use05 init` again or `use05 policy --edit`: the same questions, with your current settings as the defaults. Your comments and any settings the questions don't cover are kept.
@@ -89,14 +89,14 @@ use05 key new --approver
 
 With Claude Code or Codex, most of 05 runs on its own through the hooks. Work as you normally do; this is what happens:
 
-1. **The session starts.** The agent is told the rules: protected and locked paths, files it may not read, the checks it can name. Every subagent is told the same when it starts.
+1. **The session starts.** The agent is told the rules: protected and locked paths, files it may not read, files that must change together, the checks it can name. Every subagent is told the same when it starts. With `fresh_base` on (new setups have it), 05 fetches origin first and tells the agent whether it is starting from the latest code, and how to update if not.
 2. **The agent declares its plan** before its first edit:
    ```sh
    use05 start "Cap payment retries at three" --scope "src/billing/**" --check test
    ```
    The hook seals the plan, so a later change to it shows. If another agent's plan already covers that area, the agent is told who holds it.
 3. **The agent works.** Before each tool call, the hook refuses what the policy forbids: a force push, `git reset --hard`, `--no-verify`, an edit to a protected or locked path without approval, a read of a do-not-read file. Each refusal tells the agent why, and is recorded.
-4. **The agent stops.** The hook runs the required checks on the change and signs the result. It runs those that have run before and whose last run fits the time budget (60 seconds by default); slower ones are left for the pre-push hook and CI. If a check fails, Claude Code is asked to fix it before finishing. The agent can record what it says it did with `use05 finish --outcome "…"`.
+4. **The agent stops.** The hook runs the required checks on the change and signs the result. It runs those that have run before and whose last run fits the time budget (60 seconds by default); slower ones are left for the pre-push hook and CI. If a check fails, or the change skipped files a `[[require]]` rule says must change with it, Claude Code is asked to fix it before finishing. The agent can record what it says it did with `use05 finish --outcome "…"`.
 5. **You read the brief.** `use05 brief`. If it ends in `ALLOW, nothing to read`, you don't need to read anything.
 6. **You approve, if asked.** `use05 approve --outcome`.
 7. **You land and push.**
@@ -155,7 +155,7 @@ The same plan as flags: `use05 start "Cap payment retries" --goal "…" --scope 
 | Intent | What was asked and what the agent declared: goal, scope, checks, the agent and the person accountable for it, and how risky the change is (auth, money, migrations, secrets, deployment). |
 | Outcome | How many files and lines changed, grouped into at most eight areas with lines added and removed, and anything outside the declared scope, grouped by area. |
 | Evidence | Each required check: passed, failed, missing or stale, and who signed it. A check signed on your machine is marked advisory; one signed in CI is not. |
-| Drift | Each place the change departs from the plan or the rules, with a stable code: `SCOPE_EXCEEDED`, `TESTS_WEAKENED`, `PROTECTED_PATH`, `LOCKED_PATH`, `OVERLAP` and others. |
+| Drift | Each place the change departs from the plan or the rules, with a stable code: `SCOPE_EXCEEDED`, `TESTS_WEAKENED`, `PROTECTED_PATH`, `LOCKED_PATH`, `OVERLAP`, `ALSO_CHANGE_MISSING`, `BASE_STALE` and others. |
 | Approvals | Who approved or rejected, and whether each approval still counts. |
 | Session | For agent work, what happened during the session in at most four lines: how long it ran, turns and tool calls, what 05 refused and why, which checks ran along the way and how they ended, and which subagents took part. |
 | Log | Whether the record of what the agent did is intact, and how strongly it is sealed. |
@@ -241,10 +241,12 @@ Run as many agents as you like on one repository:
 | `[branches] work` | `05/*`, `agent/*`, `claude/*`, `codex/*` | Agents' working branches: removed with their worktree once landed. |
 | `[branches] target` | the remote's default branch | The branch finished changes land on, unless a plan names another. |
 | `[branches] land` | `"manual"` | `manual`: you run `use05 land`. `auto`: a change the gate allows lands when its agent stops. |
+| `[branches] fresh_base` | `"allow"` (new setups write `"warn"`) | An agent that starts behind origin's copy of the landing branch. When it is not `allow`, the hook fetches that branch when a new session starts (not on a resume or compaction; giving up after 5 seconds, and never asking for a password or passphrase) and tells the agent how far behind it is and how to update. Until the work contains what origin had, the brief reports `BASE_STALE`: `warn` notes it, `approval` asks a person, `deny` refuses. When the agent updates, by rebasing or merging, the commits it pulled in are not counted as its change, including any pushed after its session started. Checked on your machine only, not by the CI gate. |
 | `[record] middle` | `"local"` | What agents did is recorded on this machine and never uploaded. `off` records nothing. |
 | `[enforce] on_error` | `"open"` | If 05 itself fails: `open` lets the change through and says so loudly; `closed` refuses it. |
 | `[env] allow` | unrestricted | If set, the only environment variables any check may be passed. |
 | `[[trust.key]]` `name`, `role`, `public`, `expires` | none | A public key whose signatures count: `role = "runner"` for a CI runner (authoritative), `"approver"` for a person's approval key, `"local"` for another machine (advisory). `public` is the contents of the `.pub` file; `expires` (for example `"2027-12-31"`) stops trusting it after that date. See the CI gate guide. |
+| `[[require]]` `when`, `also` | none | Files that must change together. A change that touches anything in `when` must also touch something in `also`, or the brief reports `ALSO_CHANGE_MISSING`. For example `when = ["src/api/**"]`, `also = ["docs/api/**"]`; `when = ["**"]` means every change. Optional: `severity` (`approval` by default; `warn` or `deny`) and `why`, which the agent and the brief are told. 05 checks only that a file there changed, not what the change says. Any number of rules. |
 | `[[environment]]` `name`, `branch`, `level` | none | Which branch is which environment, e.g. `name = "dev"`, `branch = "main"`. `level` (`dev`, `uat`, `pre-prod` or `prod`) is needed only when the name is not a level, such as a second dev environment `dev-eu`. Shown by `use05` and the brief, levels side by side; environment branches are never deleted. |
 
 An organisation can add a signed layer of rules on top. Repositories can tighten that layer, but never loosen it. `use05 policy` shows which settings came from it.
@@ -264,7 +266,7 @@ An organisation can set a minimum for every repository: rules a repository can t
    evidence_accept = ["runner"]
    ```
 
-   Also available: `intent_mode`, `check` (required checks), `drift_dependencies`, `drift_overlap`, `drift_claims`, `approvals_expire_days_max`, `record_middle`, `enforce_on_error`, `env_allow`, `trust_key`, `risk_rules`, `risk_exempt_allowed`, `protect_absolute`, `protect_append_only`, `protect_no_delete`, `protect_no_read` and `protect_bypass`.
+   Also available: `intent_mode`, `check` (required checks), `drift_dependencies`, `drift_overlap`, `drift_claims`, `approvals_expire_days_max`, `record_middle`, `enforce_on_error`, `env_allow`, `trust_key`, `risk_rules`, `risk_exempt_allowed`, `protect_absolute`, `protect_append_only`, `protect_no_delete`, `protect_no_read`, `protect_bypass`, `branches_fresh_base` and `require` (rules added to every repository's).
 2. Sign it with the organisation's key (make one with `use05 key new org.key`):
 
    ```sh
@@ -282,7 +284,7 @@ Hooks and the pre-push hook run on your machine, where an agent running as you c
 |---|---|
 | `use05` | Where you stand: the task, whether the staged change would be allowed, which controls are on. |
 | `use05 init` | Set up this repository, asking a few questions on a terminal: policy, keys, hooks. Shows exactly what it changes. Also `--team`, `--target`, `--env`, `--defaults`, `--guided`. |
-| `use05 start "<title>" --scope <glob>` | Begin a task: what you are about to do and where. Also `--goal`, `--exclude`, `--check`, `--no-new-deps`. |
+| `use05 start "<title>" --scope <glob>` | Begin a task: what you are about to do and where. Several patterns go in one `--scope`, separated by spaces or commas, or in several. Also `--goal`, `--exclude`, `--check`, `--no-new-deps`. |
 | `use05 finish --outcome "<text>"` | Record what was done, in the author's words. Treated as a claim, never a fact. |
 | `use05 prove [names] [-- command]` | Run checks on the change and sign the result. |
 | `use05 brief` | The one page a person reads. `--json` for data, `--fetch` to pull others' receipts first. |

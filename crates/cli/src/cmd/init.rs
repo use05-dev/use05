@@ -154,6 +154,7 @@ pub(crate) fn policy_template(checks: &[CheckDef]) -> String {
          keep = [\"main\", \"master\", \"develop\", \"release/*\"]   # real branches: never deleted\n\
          work = [\"05/*\", \"agent/*\", \"claude/*\", \"codex/*\"]   # agents' working branches: removed with their worktree once landed\n\
          land = \"manual\"            # manual: `use05 land` | auto: the Stop hook lands a change the gate allows\n\
+         fresh_base = \"warn\"        # an agent that starts behind origin: allow (do not check) | warn (tell it) | approval | deny\n\
          \n\
          [risk]                     # built-in risk areas (auth, money, migrations, secrets, deployment, ...) need one approval\n\
          exempt = []                # paths a risk pattern catches by mistake, e.g. [\"src/session_store.rs\"]\n\
@@ -183,7 +184,14 @@ pub(crate) fn policy_template(checks: &[CheckDef]) -> String {
          # name = \"ci\"\n\
          # role = \"runner\"\n\
          # public = \"use05-ed25519-public:...\"\n\
-         # expires = \"2027-12-31\"   # optional: stop trusting this key after this date\n",
+         # expires = \"2027-12-31\"   # optional: stop trusting this key after this date\n\
+         \n\
+         # Files that must change together: a change to `when` must also change one of `also`.\n\
+         # [[require]]\n\
+         # when = [\"src/api/**\"]\n\
+         # also = [\"docs/api/**\"]\n\
+         # severity = \"approval\"    # allow | warn | approval | deny\n\
+         # why = \"the API docs\"     # said to the agent and in the brief\n",
     );
     text
 }

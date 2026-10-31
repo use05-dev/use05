@@ -67,7 +67,8 @@ pub fn dirs(dir: &Path) -> Result<Dirs> {
     let top = PathBuf::from(lines.next().unwrap_or(""));
     let git_dir = PathBuf::from(lines.next().unwrap_or(""));
     let common_raw = PathBuf::from(lines.next().unwrap_or(""));
-    let common = if common_raw.is_absolute() { common_raw } else { top.join(common_raw) };
+    // git prints a relative common dir relative to where it ran, not to the top.
+    let common = if common_raw.is_absolute() { common_raw } else { dir.join(common_raw) };
     let common = std::fs::canonicalize(&common).unwrap_or(common);
     Ok(Dirs { top, git_dir, common })
 }
@@ -415,6 +416,30 @@ pub fn merge_base(top: &Path, a: &str, b: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn dirs_from_a_deep_subfolder_finds_the_repositorys_own_git_dir() {
+        // git prints --git-common-dir relative to where it ran (`../../../.git`), not to the top.
+        let dir = tempfile::tempdir().unwrap();
+        let top = std::fs::canonicalize(dir.path()).unwrap().join("repo");
+        let deep = top.join("apps/web/[account]/workspace");
+        std::fs::create_dir_all(&deep).unwrap();
+        run(&top, &["init", "-q"]).unwrap();
+        let want = std::fs::canonicalize(top.join(".git")).unwrap();
+        for at in [top.clone(), top.join("apps"), deep] {
+            let d = dirs(&at).unwrap();
+            assert_eq!(d.common, want, "from {}", at.display());
+        }
+        // A linked worktree, as agents use, from deep inside it: still the main repository's.
+        std::fs::write(top.join("apps/web/[account]/workspace/f.txt"), "x").unwrap();
+        run(&top, &["add", "-A"]).unwrap();
+        run(&top, &["-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "-m", "x"]).unwrap();
+        let linked = top.parent().unwrap().join("linked");
+        run(&top, &["worktree", "add", "-q", linked.to_str().unwrap()]).unwrap();
+        let d = dirs(&linked.join("apps/web/[account]/workspace")).unwrap();
+        assert_eq!(d.common, want, "from inside a linked worktree");
+        assert_eq!(std::fs::canonicalize(&d.top).unwrap(), std::fs::canonicalize(&linked).unwrap());
+    }
 
     #[test]
     fn numstat_counts_lines_and_treats_binary_as_zero() {

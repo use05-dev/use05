@@ -8,9 +8,9 @@ use std::time::Duration;
 
 use tempfile::TempDir;
 use use05_core::evidence::{Trust, TrustedKey};
-use use05_core::gate::{Decision, Effect, GateInput, GateResult, evaluate};
+use use05_core::gate::{Decision, Effect, GateInput, GateResult, StaleBase, evaluate};
 use use05_core::intent::{IntentCard, Scope};
-use use05_core::policy::{CheckDef, IntentMode, Policy, Role, Severity};
+use use05_core::policy::{CheckDef, IntentMode, Policy, Require, Role, Severity};
 use use05_core::task::Task;
 use use05_core::time::{now_rfc3339, now_secs, rfc3339};
 use use05_core::{git, store};
@@ -94,6 +94,7 @@ struct Ctx<'a> {
     trust: Trust,
     task: Option<Task>,
     late: Vec<String>,
+    stale: Option<StaleBase>,
 }
 
 impl Ctx<'_> {
@@ -114,6 +115,7 @@ impl Ctx<'_> {
             late: &self.late,
             overlaps: &[],
             log: None,
+            stale_base: self.stale.as_ref(),
         })
         .unwrap()
     }
@@ -143,7 +145,7 @@ fn file_outcome_approval(repo: &Repo, tree: &str, digest: &str, a: Approval, sig
 }
 
 fn ctx<'a>(repo: &'a Repo, policy: Policy, trust: Vec<TrustedKey>) -> Ctx<'a> {
-    Ctx { repo, policy, trust: Trust { keys: trust }, task: None, late: Vec::new() }
+    Ctx { repo, policy, trust: Trust { keys: trust }, task: None, late: Vec::new(), stale: None }
 }
 
 fn task_with(card: Option<IntentCard>, outcome: Option<&str>) -> Task {
@@ -169,6 +171,7 @@ fn task_with(card: Option<IntentCard>, outcome: Option<&str>) -> Task {
         agent: None,
         owner: None,
         sandbox: None,
+        fresh: None,
     }
 }
 
@@ -520,7 +523,7 @@ fn it_works_on_a_repository_whose_base_is_empty() {
     let id = identify(dir.path(), "index").unwrap();
     let trust = Trust::default();
     let policy = Policy::default();
-    let r = evaluate(&GateInput { top: dir.path(), policy: &policy, trust: &trust, task: None, base_tree: None, target_tree: &id.oid, target_digest: &id.sha256, now: now_secs(), late: &[], overlaps: &[], log: None }).unwrap();
+    let r = evaluate(&GateInput { top: dir.path(), policy: &policy, trust: &trust, task: None, base_tree: None, target_tree: &id.oid, target_digest: &id.sha256, now: now_secs(), late: &[], overlaps: &[], log: None, stale_base: None }).unwrap();
     assert_eq!(r.decision, Decision::Allow);
     assert_eq!(r.changed.len(), 1);
     let _ = git::EMPTY_TREE;
@@ -725,4 +728,75 @@ fn another_tools_records_are_counted_as_its_own_not_as_untrusted() {
     assert_eq!((r.foreign_receipts, r.unverified_receipts, r.newer_receipts), (2, 0, 0));
     let brief = use05_core::brief::build(None, r, &tree, "staged files", None, None);
     assert!(brief.unknowns.iter().any(|u| u.contains("2 receipt(s) of other tools' kinds were not read")), "{:?}", brief.unknowns);
+}
+
+// ---------------------------------------------------------------------------- files that change together
+
+fn require(when: &str, also: &str, severity: Severity) -> Require {
+    Require { when: vec![when.into()], also: vec![also.into()], severity, why: Some("keep the docs current".into()) }
+}
+
+#[test]
+fn a_change_that_skips_its_required_update_is_held_at_the_rules_severity() {
+    let repo = Repo::new();
+    repo.write("docs/api.md", "# API\n");
+    repo.git(&["add", "-A"]);
+    repo.git(&["-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "-m", "docs"]);
+    let mut policy = Policy::default();
+    policy.require = vec![require("src/**", "docs/**", Severity::Approval)];
+    let c = ctx(&repo, policy, vec![]);
+
+    repo.write("src/lib.rs", "pub fn f() { /* changed */ }\n");
+    let r = c.gate();
+    assert_eq!(r.decision, Decision::ApprovalRequired, "{:?}", codes(&r));
+    let f = r.findings.iter().find(|f| f.code == "ALSO_CHANGE_MISSING").expect("finding");
+    assert_eq!((f.effect, f.approvable), (Effect::Approval, true));
+    assert_eq!(f.paths, vec!["src/lib.rs".to_string()]);
+    assert!(f.message.contains("docs/**") && f.message.contains("keep the docs current"), "{}", f.message);
+
+    // Updating the docs meets it; the gate does not judge what the update says.
+    repo.write("docs/api.md", "# API\n\nf() changed.\n");
+    let met = c.gate();
+    assert!(!codes(&met).contains(&"ALSO_CHANGE_MISSING"), "{:?}", codes(&met));
+    assert_eq!(met.decision, Decision::Allow);
+}
+
+#[test]
+fn require_rules_are_independent_and_follow_their_own_severity() {
+    let repo = Repo::new();
+    let mut policy = Policy::default();
+    policy.require = vec![require("src/**", "docs/**", Severity::Warn), require("src/**", "CHANGELOG.md", Severity::Deny), require("migrations/**", "docs/**", Severity::Deny)];
+    let c = ctx(&repo, policy, vec![]);
+    repo.write("src/lib.rs", "pub fn f() { /* v2 */ }\n");
+    let r = c.gate();
+    let mut missing: Vec<Effect> = r.findings.iter().filter(|f| f.code == "ALSO_CHANGE_MISSING").map(|f| f.effect).collect();
+    missing.sort();
+    assert_eq!(missing, vec![Effect::Warn, Effect::Deny], "the migrations rule watches nothing that changed");
+    assert_eq!(r.decision, Decision::Deny);
+}
+
+// ---------------------------------------------------------------------------- fresh base
+
+#[test]
+fn work_that_started_behind_origin_is_held_at_fresh_base() {
+    let repo = Repo::new();
+    repo.write("src/lib.rs", "pub fn f() { /* v3 */ }\n");
+    let stale = StaleBase { remote_ref: "origin/main".into(), behind: 14 };
+    for (severity, effect, decision) in [(Severity::Warn, Effect::Warn, Decision::Allow), (Severity::Approval, Effect::Approval, Decision::ApprovalRequired), (Severity::Deny, Effect::Deny, Decision::Deny)] {
+        let mut policy = Policy::default();
+        policy.branches.fresh_base = severity;
+        let mut c = ctx(&repo, policy, vec![]);
+        c.stale = Some(stale.clone());
+        let r = c.gate();
+        let f = r.findings.iter().find(|f| f.code == "BASE_STALE").expect("finding");
+        assert_eq!(f.effect, effect);
+        assert_eq!(f.approvable, effect == Effect::Approval);
+        assert!(f.message.contains("14 commits behind origin/main"), "{}", f.message);
+        assert!(f.next.as_deref().unwrap_or("").contains("git pull --rebase origin main"), "{:?}", f.next);
+        assert_eq!(r.decision, decision);
+    }
+    // Off, or not behind: nothing.
+    let mut off = ctx(&repo, Policy::default(), vec![]);
+    off.stale = Some(stale);
+    assert!(!codes(&off.gate()).contains(&"BASE_STALE"));
 }

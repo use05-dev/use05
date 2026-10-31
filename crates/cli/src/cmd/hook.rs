@@ -395,12 +395,70 @@ fn session_context(ctx: &Ctx, task: &Task) -> String {
             lines.push(format!("{what}: {}.", list.join(", ")));
         }
     }
+    for rule in ctx.policy.require.iter().filter(|r| r.severity != Severity::Allow) {
+        let why = rule.why.as_deref().map(|w| format!(" ({w})")).unwrap_or_default();
+        lines.push(format!("When you change {}, also update {}{why}.", rule.when.join(", "), rule.also.join(" or ")));
+    }
     let names: Vec<&str> = ctx.policy.check.iter().map(|c| c.name.as_str()).collect();
     if !names.is_empty() {
         lines.push(format!("Checks you can name with --check: {}.", names.join(", ")));
     }
-    lines.push("Before you edit, declare your plan with `use05 start \"<what you will do>\" --scope \"<paths>\"`. When you are done, `use05 finish --outcome \"<what you did>\"`; 05 runs the checks itself.".into());
+    lines.push("Before you edit, declare your plan with `use05 start \"<what you will do>\" --scope \"<paths, separated by spaces>\"`. When you are done, `use05 finish --outcome \"<what you did>\"`; 05 runs the checks itself.".into());
     lines.join(" ")
+}
+
+/// Fresh base: fetch origin's copy of the target, record how far behind this work starts, and
+/// say so. Off unless the policy asks. A failed fetch is said, never held against the agent.
+fn fresh_base_line(ctx: &Ctx, task: &mut Task) -> Option<String> {
+    let severity = ctx.policy.branches.fresh_base;
+    // No origin to compare with: nothing to say at every session start.
+    if severity == Severity::Allow || use05_core::git::text(ctx.top(), &["remote", "get-url", "origin"]).is_err() {
+        return None;
+    }
+    match use05_core::fresh::check(ctx.top(), &ctx.policy, task.intent.as_ref(), use05_core::fresh::FETCH_TIMEOUT) {
+        Ok(fresh) => {
+            let line = if fresh.behind == 0 {
+                format!("Your starting point is up to date with {}.", fresh.remote_ref)
+            } else {
+                let (remote, branch) = fresh.remote_ref.split_once('/').unwrap_or(("origin", fresh.remote_ref.as_str()));
+                let held = match severity {
+                    Severity::Deny => " 05 refuses work that does not start from it.",
+                    Severity::Approval => " Until you do, a person must approve this change.",
+                    _ => "",
+                };
+                format!(
+                    "This work starts {} commit{} behind {}. Update before you edit: git pull --rebase {remote} {branch}.{held}",
+                    fresh.behind,
+                    if fresh.behind == 1 { "" } else { "s" },
+                    fresh.remote_ref
+                )
+            };
+            task.fresh = Some(fresh);
+            Some(line)
+        }
+        // What was recorded earlier stands; a fetch that fails now never erases it.
+        Err(why) => Some(format!("05 could not fetch origin to check your starting point is current ({why}).")),
+    }
+}
+
+/// Files the policy says must change with this change, and do not yet: `(what changed, what must)`.
+fn unmet_requires(ctx: &Ctx) -> Vec<(Vec<String>, String)> {
+    if ctx.policy.require.is_empty() {
+        return Vec::new();
+    }
+    // Everything the agent has done, staged or not: an update it has not staged yet still counts.
+    let Ok(target) = ctx.target(Some("worktree")) else { return Vec::new() };
+    let Ok(changed) = use05_core::git::changed(ctx.top(), target.base_tree.as_deref(), &target.oid) else { return Vec::new() };
+    let paths: Vec<String> = changed.into_iter().map(|c| c.path).collect();
+    ctx.policy
+        .require
+        .iter()
+        .filter(|r| r.severity != Severity::Allow)
+        .filter_map(|r| {
+            let unmet = r.unmet(&paths);
+            (!unmet.is_empty()).then(|| (unmet, r.also.join(" or ") + &r.why.as_deref().map(|w| format!(" ({w})")).unwrap_or_default()))
+        })
+        .collect()
 }
 
 /// Seal what this session's agent left in the inbox: its declarations become the task's intent,
@@ -574,6 +632,12 @@ fn run_inner(agent: &str, event: &str) -> Result<Option<Value>, String> {
         }
     }
     let mut ctx = Ctx::open(&cwd, Some(&task.id)).map_err(|e| e.message)?;
+    // The agent updated to what origin had at its start: its base moves there, so the commits
+    // it pulled in are not its change.
+    if ctx.policy.branches.fresh_base != Severity::Allow && use05_core::fresh::catch_up(ctx.top(), &mut task) {
+        probe.save(&task).map_err(|e| e.message)?;
+        ctx = Ctx::open(&cwd, Some(&task.id)).map_err(|e| e.message)?;
+    }
     let notes = seal_pending(&ctx, &mut task, agent, &session);
     if !notes.is_empty() {
         // The intent changed: read the rules and approvals for the task as it is now.
@@ -586,13 +650,14 @@ fn run_inner(agent: &str, event: &str) -> Result<Option<Value>, String> {
     let subagent = payload.get("agent_id").and_then(Value::as_str).filter(|a| !a.is_empty()).map(|id| {
         (id.to_string(), payload.get("agent_type").and_then(Value::as_str).unwrap_or("").to_string())
     });
+    let task_id = task.id.clone();
     let note = |mut v: Value| {
         if recording {
             if let Some((id, kind)) = &subagent {
                 v["agent_id"] = json!(id);
                 v["agent_type"] = json!(kind);
             }
-            let _ = log::append(&state, &task.id, v);
+            let _ = log::append(&state, &task_id, v);
         }
     };
 
@@ -611,7 +676,18 @@ fn run_inner(agent: &str, event: &str) -> Result<Option<Value>, String> {
         }
         "SessionStart" => {
             note(json!({ "event": "session_start", "agent": agent }));
-            Ok(Some(json!({ "hookSpecificOutput": { "hookEventName": "SessionStart", "additionalContext": session_context(&ctx, &task) } })))
+            let mut context = session_context(&ctx, &task);
+            // Only a new session starts the work: a resume, /clear or compaction is mid-task.
+            let source = payload.get("source").and_then(Value::as_str).unwrap_or("startup");
+            let fresh_line = if source == "startup" { fresh_base_line(&ctx, &mut task) } else { None };
+            if let Some(line) = fresh_line {
+                if let Some(f) = &task.fresh {
+                    note(json!({ "event": "fresh_base", "remote": f.remote_ref, "behind": f.behind }));
+                }
+                ctx.store.save(&task).map_err(|e| e.message)?;
+                context = format!("{context} {line}");
+            }
+            Ok(Some(json!({ "hookSpecificOutput": { "hookEventName": "SessionStart", "additionalContext": context } })))
         }
         "SubagentStart" => {
             // A subagent is held to the same rules by the same hooks; tell it what they are
@@ -651,8 +727,14 @@ fn run_inner(agent: &str, event: &str) -> Result<Option<Value>, String> {
             }
             note(json!({ "event": "stop" }));
             let failed = prove_at_stop(&ctx, &task);
+            // Claude Code can be asked to keep going; its own flag stops this from looping.
+            let looping = payload.get("stop_hook_active").and_then(Value::as_bool).unwrap_or(false);
+            // Asked once per session. A stop that follows a failed check is a looping one, so the
+            // log says whether this was asked yet; without a log, never ask while looping.
+            let asked = !recording || log::read(&state, &task.id).iter().any(|e| e["event"]["event"] == "asked_to_update");
+            let missing = if failed.is_empty() && agent != "codex" && (!looping || !asked) { unmet_requires(&ctx) } else { Vec::new() };
             // With `land = "auto"`, a change the gate allows lands when its agent stops (D69).
-            if failed.is_empty() && ctx.policy.branches.land == use05_core::policy::LandMode::Auto {
+            if failed.is_empty() && missing.is_empty() && ctx.policy.branches.land == use05_core::policy::LandMode::Auto {
                 if let Ok(current) = ctx.store.load(&task.id) {
                     let report = crate::cmd::land::land_task(&ctx, current);
                     note(json!({ "event": "auto_land", "code": report.code, "message": report.headline }));
@@ -662,13 +744,20 @@ fn run_inner(agent: &str, event: &str) -> Result<Option<Value>, String> {
             if recording {
                 crate::cmd::start::publish_log_seal(&ctx, &task, false);
             }
-            // Claude Code can be asked to keep going; its own flag stops this from looping.
-            let looping = payload.get("stop_hook_active").and_then(Value::as_bool).unwrap_or(false);
-            match failed.first() {
-                Some(name) if agent != "codex" && !looping => Ok(Some(json!({
+            match (failed.first(), missing.first()) {
+                (Some(name), _) if agent != "codex" && !looping => Ok(Some(json!({
                     "decision": "block",
                     "reason": format!("05: the check {name} failed on your change. Fix it before you finish, then run: use05 prove {name}"),
                 }))),
+                (None, Some((changed, also))) => {
+                    note(json!({ "event": "asked_to_update", "also": also }));
+                    let shown: Vec<&str> = changed.iter().take(3).map(String::as_str).collect();
+                    let more = if changed.len() > 3 { format!(" and {} more", changed.len() - 3) } else { String::new() };
+                    Ok(Some(json!({
+                        "decision": "block",
+                        "reason": format!("05: you changed {}{more}, and the policy says {also} must change with it. Update it before you finish.", shown.join(", ")),
+                    })))
+                }
                 _ => Ok(None),
             }
         }

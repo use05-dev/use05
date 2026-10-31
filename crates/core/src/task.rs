@@ -63,6 +63,9 @@ pub struct Task {
     /// What the agent's own process reported about its sandbox (`CODEX_SANDBOX`). Its own word.
     #[serde(default)]
     pub sandbox: Option<String>,
+    /// How far behind origin the work started, when the policy asks (fresh base).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fresh: Option<crate::fresh::Fresh>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
@@ -162,6 +165,7 @@ impl Store {
             agent: None,
             owner: None,
             sandbox: None,
+            fresh: None,
         };
         self.save(&task)?;
         self.set_current(&task.id)?;
@@ -196,6 +200,7 @@ impl Store {
             agent: None,
             owner: None,
             sandbox: None,
+            fresh: None,
         }
     }
 

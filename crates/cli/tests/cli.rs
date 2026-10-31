@@ -1470,6 +1470,22 @@ fn hook(s: &Sandbox, session: &str, event: &str, tool: &str, file: &str) -> Outp
 }
 
 #[test]
+fn hooks_from_a_deep_subfolder_keep_their_state_in_the_repositorys_own_git_dir() {
+    // An agent that cd's into apps/web/app/[account]/workspace: git names the common dir relative to
+    // there, so joining it to the top escaped the repository (to `/`, read-only on macOS).
+    let s = Sandbox::initialised();
+    let deep = s.path("apps/web/app/[account]/workspace");
+    fs::create_dir_all(&deep).unwrap();
+    for event in ["PreToolUse", "PostToolUse"] {
+        let payload = serde_json::json!({ "session_id": "deep-agent", "cwd": deep, "hook_event_name": event, "tool_name": "Bash", "tool_input": { "command": "ls" }, "tool_response": { "stdout": "" } }).to_string();
+        let out = s.run_with_stdin(&["hook", "claude-code", event], &payload);
+        assert_eq!(code(&out), 0, "{event}: {}", text(&out));
+    }
+    assert!(s.path(".git/05/sessions/deep-agent").exists(), "the session is recorded in the repository's .git/05");
+    assert!(!s.path("apps/.git").exists() && !s.path("apps/web/.git").exists(), "nothing is written inside the work tree");
+}
+
+#[test]
 fn an_agent_is_told_when_another_session_edited_the_same_file_and_policy_can_make_it_ask_or_deny() {
     let s = Sandbox::initialised();
     s.run_with_stdin(&["hook", "claude-code", "SessionStart"], &serde_json::json!({ "session_id": "agent-a", "cwd": s.dir.path(), "hook_event_name": "SessionStart" }).to_string());
@@ -2789,9 +2805,9 @@ fn policy_of(s: &Sandbox) -> use05_core::policy::Policy {
 fn guided_init_asks_about_the_team_branches_and_rules_and_writes_the_answers() {
     let s = with_environment_branches();
     // team: small; lands on: main; main=dev, uat=uat, production=prod; keep checks; add lint;
-    // protected: none; locked: LICENSE; append-only: none; do-not-read: none; outside plan,
-    // weakened tests, landing: defaults; write: yes.
-    let answers = "2\n\n\n\n\n\n\nlint: npm run lint\n\n\nLICENSE\n\n\n\n\n\n\n";
+    // protected: none; locked: LICENSE; append-only: none; do-not-read: none; docs: none;
+    // outside plan, weakened tests, fresh base, landing: defaults; write: yes.
+    let answers = "2\n\n\n\n\n\n\nlint: npm run lint\n\n\nLICENSE\n\n\n\n\n\n\n\n\n";
     let out = s.run_with_stdin(&["init", "--guided"], answers);
     assert_eq!(code(&out), 0, "{}", text(&out));
     let shown = text(&out);
@@ -2814,8 +2830,9 @@ fn policy_edit_changes_an_existing_setup_and_says_how_the_change_takes_effect() 
     assert_eq!(code(&s.run(&["init", "--defaults"])), 0);
     s.commit_all("05");
     // keep the current rules; lands on main; environments: defaults; checks kept, none added;
-    // paths: defaults; outside plan: refuse; tests: default; landing: automatic; write: yes.
-    let answers = "\n\n\n\n\n\n\n\n\n\n\n\n4\n\n2\n\n";
+    // paths and docs: defaults; outside plan: refuse; tests, fresh base: default; landing:
+    // automatic; write: yes.
+    let answers = "\n\n\n\n\n\n\n\n\n\n\n\n\n4\n\n\n2\n\n";
     let out = s.run_with_stdin(&["policy", "--edit", "--guided"], answers);
     assert_eq!(code(&out), 0, "{}", text(&out));
     let p = policy_of(&s);
@@ -2862,7 +2879,8 @@ fn environments_added_to_an_older_policy_raise_its_minimum_version() {
     let s = with_environment_branches();
     assert_eq!(code(&s.run(&["init", "--defaults"])), 0);
     let p = fs::read_to_string(s.path(".05/policy.toml")).unwrap();
-    s.write(".05/policy.toml", &p.replace(&format!("min_version = \"{}\"", env!("CARGO_PKG_VERSION")), "min_version = \"0.0.2\""));
+    let older: String = p.replace(&format!("min_version = \"{}\"", env!("CARGO_PKG_VERSION")), "min_version = \"0.0.2\"").lines().filter(|l| !l.starts_with("fresh_base")).map(|l| format!("{l}\n")).collect();
+    s.write(".05/policy.toml", &older);
     assert_eq!(code(&s.run(&["policy", "--edit", "--env", "dev=main"])), 0);
     let text = fs::read_to_string(s.path(".05/policy.toml")).unwrap();
     assert!(text.contains("min_version = \"0.0.4\""), "an older use05 must be told to upgrade, not fail to parse:\n{text}");
@@ -2955,7 +2973,7 @@ fn a_level_can_hold_several_environments_and_any_branch_can_be_one() {
     s.git(&["branch", "eu-main"]);
     // team; landing main; dev=dev (suggested); main: dev again, named dev-main by default;
     // uat=uat; production=prod; add eu-main: name dev-eu, level dev; finish; the rest defaults.
-    let answers = "\n\n\n1\n\n\n\neu-main\ndev-eu\n1\n\n".to_string() + &"\n".repeat(12);
+    let answers = "\n\n\n1\n\n\n\neu-main\ndev-eu\n1\n\n".to_string() + &"\n".repeat(14);
     let out = s.run_with_stdin(&["init", "--guided"], &answers);
     assert_eq!(code(&out), 0, "{}", text(&out));
     let p = policy_of(&s);
@@ -2967,7 +2985,8 @@ fn a_level_can_hold_several_environments_and_any_branch_can_be_one() {
         ("uat".into(), "uat".into(), Some("uat")),
         ("prod".into(), "production".into(), Some("prod")),
     ], "{}", text(&out));
-    assert!(fs::read_to_string(s.path(".05/policy.toml")).unwrap().contains("min_version = \"0.0.5\""));
+    let min = policy_of(&s).use05.min_version.unwrap();
+    assert!(!use05_core::policy::version_below(&min, "0.0.5"), "levels need 0.0.5 or newer: {min}");
     let status = text(&s.run(&[]));
     assert!(status.contains("dev: dev (") && status.contains(", dev-eu: eu-main (") && status.contains("→ uat: uat"), "{status}");
 }
@@ -3046,8 +3065,8 @@ fn the_review_says_what_the_scope_choice_does_and_long_paths_are_not_cut() {
     let s = with_environment_branches();
     let long = "infra/terraform/environments/production-europe-west/customer-facing/**";
     // team, landing, envs x3, add none, keep checks, add none, protected = long, locked, append,
-    // no-read, scope = 2 (ask me), tests, land, write.
-    let answers = format!("\n\n\n\n\n\n\n\n{long}\n\n\n\n2\n\n\n\n");
+    // no-read, docs, scope = 2 (ask me), tests, fresh base, land, write.
+    let answers = format!("\n\n\n\n\n\n\n\n{long}\n\n\n\n\n2\n\n\n\n\n");
     let out = s.run_with_stdin(&["init", "--guided"], &answers);
     assert_eq!(code(&out), 0, "{}", text(&out));
     let review = text(&out);
@@ -3064,4 +3083,269 @@ fn env_flags_infer_a_level_from_a_common_name() {
     let out = s.run(&["init", "--env", "dev=main", "--env", "staging=uat", "--env", "prod=production"]);
     assert_eq!(code(&out), 0, "{}", text(&out));
     assert_eq!(policy_of(&s).environment[1].level(), Some("uat"));
+}
+
+// ---------------------------------------------------------------- fresh base and files that change together
+
+/// A bare `origin` the sandbox pushes main to, and a way for someone else to land commits there.
+struct Origin {
+    bare: TempDir,
+}
+
+impl Origin {
+    fn for_sandbox(s: &Sandbox) -> Origin {
+        let bare = tempfile::tempdir().unwrap();
+        let ok = Command::new("git").args(["init", "-q", "--bare", "-b", "main"]).arg(bare.path()).status().unwrap();
+        assert!(ok.success());
+        s.git(&["remote", "add", "origin", bare.path().to_str().unwrap()]);
+        s.git(&["push", "-q", "origin", "main"]);
+        s.git(&["remote", "set-head", "origin", "main"]);
+        Origin { bare }
+    }
+
+    /// Someone else lands `n` commits on origin's main.
+    fn someone_lands(&self, n: usize) {
+        let clone = tempfile::tempdir().unwrap();
+        let git = |args: &[&str]| {
+            let out = Command::new("git").arg("-C").arg(clone.path()).args(["-c", "user.name=o", "-c", "user.email=o@example.com", "-c", "commit.gpgsign=false"]).args(args).output().unwrap();
+            assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+        };
+        git(&["clone", "-q", self.bare.path().to_str().unwrap(), "."]);
+        let landed = fs::read_dir(clone.path()).unwrap().filter(|e| e.as_ref().unwrap().file_name().to_string_lossy().starts_with("upstream")).count();
+        for i in landed..landed + n {
+            fs::write(clone.path().join(format!("upstream{i}.txt")), format!("{i}\n")).unwrap();
+            git(&["add", "-A"]);
+            git(&["commit", "-q", "-m", &format!("upstream {i}")]);
+        }
+        git(&["push", "-q", "origin", "main"]);
+    }
+}
+
+fn set_policy(s: &Sandbox, extra: &str) {
+    let policy = fs::read_to_string(s.path(".05/policy.toml")).unwrap();
+    s.write(".05/policy.toml", &format!("{policy}\n{extra}\n"));
+    s.commit_all("policy");
+}
+
+fn start_session(s: &Sandbox, session: &str) -> Output {
+    let out = s.run_with_stdin(&["hook", "claude-code", "SessionStart"], &serde_json::json!({ "session_id": session, "cwd": s.dir.path(), "hook_event_name": "SessionStart", "source": "startup" }).to_string());
+    assert_eq!(code(&out), 0, "{}", text(&out));
+    out
+}
+
+#[test]
+fn an_agent_that_starts_behind_origin_is_told_and_its_brief_says_so_until_it_updates() {
+    let s = Sandbox::initialised();
+    // The template tells the agent (warn); hold the change here instead.
+    let policy = fs::read_to_string(s.path(".05/policy.toml")).unwrap();
+    assert!(policy.contains("fresh_base = \"warn\""), "{policy}");
+    s.write(".05/policy.toml", &policy.replacen("fresh_base = \"warn\"", "fresh_base = \"approval\"", 1));
+    s.commit_all("policy");
+    let origin = Origin::for_sandbox(&s);
+    origin.someone_lands(2);
+
+    let started = context_of(&start_session(&s, "behind"));
+    assert!(started.contains("2 commits behind origin/main") && started.contains("git pull --rebase origin main"), "{started}");
+    let task = find_task(&s, "behind");
+
+    s.write("main.rs", "fn main() { /* the agent's work */ }\n");
+    s.git(&["add", "-A"]);
+    let brief = s.run(&["brief", "--task", &task, "--json"]);
+    assert!(finding_codes(&brief).contains(&"BASE_STALE".to_string()), "{}", text(&brief));
+    assert_eq!(decision_of(&brief), "approval_required");
+
+    // The agent updates. Its change is still only its own work: what it pulled is not counted.
+    s.git(&["stash", "-q"]);
+    s.git(&["pull", "-q", "--rebase", "origin", "main"]);
+    s.git(&["stash", "pop", "-q"]);
+    s.git(&["add", "-A"]);
+    // No hook call in between: a person can update after the session, and the brief still knows.
+    let after = s.run(&["brief", "--task", &task, "--json"]);
+    assert!(!finding_codes(&after).contains(&"BASE_STALE".to_string()), "{}", text(&after));
+    let changed: Vec<String> = json(&after)["brief"]["gate"]["changed"].as_array().unwrap().iter().map(|c| c["path"].as_str().unwrap().to_string()).collect();
+    assert_eq!(changed, vec!["main.rs".to_string()], "pulled commits are not the agent's change");
+}
+
+#[test]
+fn an_agent_on_the_latest_code_is_told_so_and_a_failed_fetch_never_blocks() {
+    let s = Sandbox::initialised();
+    let policy = fs::read_to_string(s.path(".05/policy.toml")).unwrap();
+    s.write(".05/policy.toml", &policy.replacen("fresh_base = \"warn\"", "fresh_base = \"deny\"", 1));
+    s.commit_all("policy");
+    let _origin = Origin::for_sandbox(&s);
+    let current = context_of(&start_session(&s, "current"));
+    assert!(current.contains("up to date with origin/main"), "{current}");
+
+    // An origin that cannot be reached: the agent is told 05 could not check, and nothing is held.
+    s.git(&["remote", "set-url", "origin", "/nowhere/at/all.git"]);
+    let unreachable = context_of(&start_session(&s, "offline"));
+    assert!(unreachable.contains("could not fetch origin"), "{unreachable}");
+    s.write("main.rs", "fn main() { /* offline work */ }\n");
+    s.git(&["add", "-A"]);
+    let brief = s.run(&["brief", "--task", &find_task(&s, "offline"), "--json"]);
+    assert!(!finding_codes(&brief).contains(&"BASE_STALE".to_string()), "{}", text(&brief));
+}
+
+#[test]
+fn with_fresh_base_off_the_hook_does_not_fetch() {
+    let s = Sandbox::initialised();
+    let policy = fs::read_to_string(s.path(".05/policy.toml")).unwrap();
+    s.write(".05/policy.toml", &policy.replacen("fresh_base = \"warn\"", "fresh_base = \"allow\"", 1));
+    s.commit_all("policy");
+    let origin = Origin::for_sandbox(&s);
+    origin.someone_lands(1);
+    let before = s.git(&["rev-parse", "refs/remotes/origin/main"]);
+    let context = context_of(&start_session(&s, "off"));
+    assert!(!context.contains("origin/main"), "{context}");
+    assert_eq!(s.git(&["rev-parse", "refs/remotes/origin/main"]), before, "nothing was fetched");
+}
+
+#[test]
+fn a_require_rule_is_told_at_start_and_the_agent_is_asked_to_finish_it_at_stop() {
+    let s = Sandbox::initialised();
+    fs::create_dir_all(s.path("src")).unwrap();
+    fs::create_dir_all(s.path("docs")).unwrap();
+    s.write("src/api.rs", "pub fn api() {}\n");
+    s.write("docs/api.md", "# API\n");
+    set_policy(&s, "[[require]]\nwhen = [\"src/**\"]\nalso = [\"docs/**\"]\nwhy = \"the API docs\"\n");
+
+    let context = context_of(&start_session(&s, "docs"));
+    assert!(context.contains("When you change src/**, also update docs/** (the API docs)"), "{context}");
+
+    let stop = |looping: bool| {
+        let payload = serde_json::json!({ "session_id": "docs", "cwd": s.dir.path(), "hook_event_name": "Stop", "stop_hook_active": looping }).to_string();
+        s.run_with_stdin(&["hook", "claude-code", "Stop"], &payload)
+    };
+    s.write("src/api.rs", "pub fn api() { /* changed */ }\n");
+    let asked = stop(false);
+    let v = json(&asked);
+    assert_eq!(v["decision"], "block", "{v}");
+    let reason = v["reason"].as_str().unwrap();
+    assert!(reason.contains("src/api.rs") && reason.contains("docs/**"), "{reason}");
+    assert!(stop(true).stdout.is_empty(), "asked once, never in a loop");
+
+    s.write("docs/api.md", "# API\n\napi() changed.\n");
+    assert!(stop(false).stdout.is_empty(), "the rule is met");
+    let brief = s.run(&["brief", "--task", &find_task(&s, "docs"), "--json"]);
+    assert!(!finding_codes(&brief).contains(&"ALSO_CHANGE_MISSING".to_string()), "{}", text(&brief));
+}
+
+#[test]
+fn the_setup_asks_which_folders_change_with_code_and_how_strict_fresh_base_is() {
+    let s = with_environment_branches();
+    // team, landing, envs x3, add none, keep checks, add none, protected, locked, append-only,
+    // no-read, docs = docs/**, scope, tests, fresh base = 4 (refuse), land, write.
+    let answers = "\n\n\n\n\n\n\n\n\n\n\n\ndocs/**\n\n\n4\n\n\n";
+    let out = s.run_with_stdin(&["init", "--guided"], answers);
+    assert_eq!(code(&out), 0, "{}", text(&out));
+    let shown = text(&out);
+    assert!(shown.contains("Folders that must be updated with every change") && shown.contains("starts from older code than origin has"), "{shown}");
+    let words = shown.split_whitespace().collect::<Vec<_>>().join(" ");
+    assert!(words.contains("docs/** with every change") && words.contains("refuse the change"), "{shown}");
+    let p = policy_of(&s);
+    assert_eq!(p.branches.fresh_base, use05_core::policy::Severity::Deny);
+    assert_eq!(p.require.len(), 1);
+    assert_eq!((p.require[0].when.clone(), p.require[0].also.clone(), p.require[0].severity), (vec!["**".to_string()], vec!["docs/**".to_string()], use05_core::policy::Severity::Approval));
+
+    // Editing: the docs answer starts from what is there; clearing it removes only that rule.
+    s.commit_all("05");
+    let text_now = fs::read_to_string(s.path(".05/policy.toml")).unwrap();
+    s.write(".05/policy.toml", &format!("{text_now}\n# the API reference\n[[require]]\nwhen = [\"src/api/**\"]\nalso = [\"docs/api/**\"]\n"));
+    let edit = s.run_with_stdin(&["policy", "--edit", "--guided"], &format!("{}-\n{}", "\n".repeat(12), "\n".repeat(10)));
+    assert_eq!(code(&edit), 0, "{}", text(&edit));
+    let after = fs::read_to_string(s.path(".05/policy.toml")).unwrap();
+    let p = policy_of(&s);
+    assert_eq!(p.require.iter().map(|r| r.also.join(",")).collect::<Vec<_>>(), ["docs/api/**"], "{after}");
+    assert!(after.contains("# the API reference"), "a rule the setup does not ask about keeps its comment:\n{after}");
+}
+
+#[test]
+fn rules_from_0_0_6_raise_an_older_policys_minimum_version() {
+    let s = with_environment_branches();
+    assert_eq!(code(&s.run(&["init", "--defaults"])), 0);
+    let p = fs::read_to_string(s.path(".05/policy.toml")).unwrap();
+    let older: String = p.replace(&format!("min_version = \"{}\"", env!("CARGO_PKG_VERSION")), "min_version = \"0.0.2\"").lines().filter(|l| !l.starts_with("fresh_base")).map(|l| format!("{l}\n")).collect();
+    s.write(".05/policy.toml", &older);
+    // team, landing, envs x3, add none, keep checks, add none, paths x4, docs, scope, tests,
+    // fresh base = 2 (tell the agent), land, write.
+    let out = s.run_with_stdin(&["policy", "--edit", "--guided"], &format!("{}2\n\n\n", "\n".repeat(15)));
+    assert_eq!(code(&out), 0, "{}", text(&out));
+    let text = fs::read_to_string(s.path(".05/policy.toml")).unwrap();
+    assert!(text.contains("fresh_base = \"warn\"") && text.contains("min_version = \"0.0.6\""), "{text}");
+}
+
+#[test]
+fn a_scope_written_as_one_string_is_read_as_its_patterns() {
+    // A real agent wrote --scope "src/** docs/** test/**": one pattern that matched nothing, so
+    // every file it changed was outside its plan.
+    let s = Sandbox::initialised();
+    let out = s.run(&["start", "Add mul", "--scope", "src/** docs/**", "--scope", "test/**,lib/**", "--exclude", "src/gen/**, src/vendor/**"]);
+    assert_eq!(code(&out), 0, "{}", text(&out));
+    s.write("main.rs", "fn main() { /* edit */ }\n");
+    s.git(&["add", "-A"]);
+    let v = json(&s.run(&["brief", "--json"]));
+    let list = |k: &str| v["brief"]["card"]["scope"][k].as_array().unwrap().iter().map(|p| p.as_str().unwrap().to_string()).collect::<Vec<_>>();
+    assert_eq!(list("include"), ["src/**", "docs/**", "test/**", "lib/**"], "{v}");
+    assert_eq!(list("exclude"), ["src/gen/**", "src/vendor/**"], "{v}");
+}
+
+#[test]
+fn fresh_base_is_checked_once_at_startup_and_a_later_failed_fetch_never_erases_it() {
+    let s = Sandbox::initialised();
+    let policy = fs::read_to_string(s.path(".05/policy.toml")).unwrap();
+    s.write(".05/policy.toml", &policy.replacen("fresh_base = \"warn\"", "fresh_base = \"deny\"", 1));
+    s.commit_all("policy");
+    let origin = Origin::for_sandbox(&s);
+    origin.someone_lands(3);
+    assert!(context_of(&start_session(&s, "long")).contains("3 commits behind"));
+    let task = find_task(&s, "long");
+    s.write("main.rs", "fn main() { /* still on the old code */ }\n");
+    s.git(&["add", "-A"]);
+
+    // Compaction, a resume or /clear mid-task: no new fetch, no new telling-off.
+    origin.someone_lands(1);
+    s.git(&["remote", "set-url", "origin", "/nowhere/at/all.git"]);
+    for source in ["compact", "resume", "clear"] {
+        let out = s.run_with_stdin(&["hook", "claude-code", "SessionStart"], &serde_json::json!({ "session_id": "long", "cwd": s.dir.path(), "hook_event_name": "SessionStart", "source": source }).to_string());
+        let context = context_of(&out);
+        assert!(!context.contains("behind") && !context.contains("could not fetch"), "{source}: {context}");
+    }
+    let brief = s.run(&["brief", "--task", &task, "--json"]);
+    assert!(finding_codes(&brief).contains(&"BASE_STALE".to_string()), "the record survives: {}", text(&brief));
+    assert_eq!(decision_of(&brief), "deny");
+}
+
+#[test]
+fn the_stop_reminder_sees_unstaged_updates_and_still_comes_after_a_failed_check() {
+    let s = Sandbox::initialised();
+    fs::create_dir_all(s.path("src")).unwrap();
+    fs::create_dir_all(s.path("docs")).unwrap();
+    s.write("src/api.rs", "pub fn api() {}\n");
+    s.write("docs/api.md", "# API\n");
+    set_policy(&s, "[[require]]\nwhen = [\"src/**\"]\nalso = [\"docs/**\"]\n");
+    start_session(&s, "stops");
+    let stop = |looping: bool| {
+        let payload = serde_json::json!({ "session_id": "stops", "cwd": s.dir.path(), "hook_event_name": "Stop", "stop_hook_active": looping }).to_string();
+        s.run_with_stdin(&["hook", "claude-code", "Stop"], &payload)
+    };
+
+    // The code is staged and the docs are edited but not staged: the docs did change.
+    s.write("src/api.rs", "pub fn api() { /* v2 */ }\n");
+    s.git(&["add", "src/api.rs"]);
+    s.write("docs/api.md", "# API\n\nv2.\n");
+    assert!(stop(false).stdout.is_empty(), "{}", text(&stop(false)));
+
+    // A failing check is reported first; the docs reminder still comes on the next stop, once.
+    s.git(&["checkout", "-q", "--", "docs/api.md"]);
+    s.write("test.sh", "#!/bin/sh\nexit 1\n");
+    s.git(&["add", "-A"]);
+    s.run(&["prove"]);
+    // A new edit after that run: Stop runs the check again itself, and it fails.
+    s.write("src/api.rs", "pub fn api() { /* v3 */ }\n");
+    s.git(&["add", "-A"]);
+    let first = json(&stop(false));
+    assert!(first["reason"].as_str().unwrap().contains("the check test failed"), "{first}");
+    let second = json(&stop(true));
+    assert!(second["reason"].as_str().unwrap().contains("docs/** must change"), "{second}");
+    assert!(stop(true).stdout.is_empty(), "never asked twice");
 }

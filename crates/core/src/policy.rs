@@ -137,6 +137,48 @@ pub struct Policy {
     /// so existing digests hold.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub environment: Vec<Environment>,
+    /// Files that must change together: when a change touches `when`, it must also touch `also`.
+    /// Not written out when empty, so existing digests hold.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub require: Vec<Require>,
+}
+
+/// A rule that some files change together: docs with the code they describe, say. 05 checks only
+/// that an `also` file changed, never whether the change to it is any good.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct Require {
+    /// When the change touches any of these...
+    pub when: Vec<String>,
+    /// ...it must also touch at least one of these.
+    pub also: Vec<String>,
+    /// What a change that does not is held to.
+    #[serde(default = "approval")]
+    pub severity: Severity,
+    /// Said to the agent and in the brief.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub why: Option<String>,
+}
+
+fn approval() -> Severity {
+    Severity::Approval
+}
+
+impl Require {
+    /// The changed files that call for an update this change does not make; empty when the rule
+    /// is met or nothing it watches changed. A file matching both lists counts as the update.
+    pub fn unmet(&self, changed: &[String]) -> Vec<String> {
+        let any = |patterns: &[String], path: &str| patterns.iter().any(|p| crate::glob::matches(p, path));
+        if changed.iter().any(|p| any(&self.also, p)) {
+            return Vec::new();
+        }
+        changed.iter().filter(|p| any(&self.when, p)).cloned().collect()
+    }
+
+    /// `src/** needs docs/** (approval)`.
+    pub fn describe(&self) -> String {
+        format!("{} needs {} ({})", self.when.join(", "), self.also.join(" or "), format!("{:?}", self.severity).to_lowercase())
+    }
 }
 
 /// One environment: a name, the branch it lives on, and its level on the ladder.
@@ -251,6 +293,15 @@ pub struct BranchPolicy {
     /// Where work lands unless a declaration names another; default: the remote's default branch.
     pub target: Option<String>,
     pub land: LandMode,
+    /// An agent that starts behind origin's copy of the target: at session start the hook fetches
+    /// and tells it; the brief says how far behind it started. Off (`allow`) unless set, and then
+    /// not written out, so existing digests hold.
+    #[serde(skip_serializing_if = "is_allow")]
+    pub fresh_base: Severity,
+}
+
+fn is_allow(s: &Severity) -> bool {
+    *s == Severity::Allow
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
@@ -265,7 +316,7 @@ pub enum LandMode {
 impl Default for BranchPolicy {
     fn default() -> Self {
         let v = |items: &[&str]| items.iter().map(|s| s.to_string()).collect();
-        BranchPolicy { keep: v(&["main", "master", "develop", "release/*"]), work: v(&["05/*", "agent/*", "claude/*", "codex/*"]), target: None, land: LandMode::Manual }
+        BranchPolicy { keep: v(&["main", "master", "develop", "release/*"]), work: v(&["05/*", "agent/*", "claude/*", "codex/*"]), target: None, land: LandMode::Manual, fresh_base: Severity::Allow }
     }
 }
 
@@ -462,6 +513,7 @@ impl Default for Policy {
             risk: RiskPolicy::default(),
             branches: BranchPolicy::default(),
             environment: Vec::new(),
+            require: Vec::new(),
         }
     }
 }
@@ -505,6 +557,12 @@ pub struct Floor {
     /// `false` forbids bypassing path rules.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub protect_bypass: Option<bool>,
+    /// The least an agent starting behind origin is held to.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub branches_fresh_base: Option<Severity>,
+    /// Files that must change together, in every repository.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub require: Vec<Require>,
 }
 
 impl Policy {
@@ -582,6 +640,12 @@ impl Policy {
         if floor.protect_bypass == Some(false) {
             self.protect.bypass = false;
         }
+        self.branches.fresh_base = max_sev(self.branches.fresh_base, floor.branches_fresh_base);
+        for rule in &floor.require {
+            if !self.require.contains(rule) {
+                self.require.push(rule.clone());
+            }
+        }
     }
 
     pub fn parse(text: &str) -> Result<Policy> {
@@ -620,6 +684,11 @@ impl Policy {
             }
             if self.environment[..i].iter().any(|o| o.name == e.name || o.branch == e.branch) {
                 return Err(Error::new("POLICY_INVALID", format!("the environment {:?} or its branch {:?} is listed twice", e.name, e.branch)));
+            }
+        }
+        for r in &self.require {
+            if r.when.is_empty() || r.also.is_empty() {
+                return Err(Error::new("POLICY_INVALID", "every [[require]] needs `when` and `also`: the files that call for an update, and the files that must change with them"));
             }
         }
         if self.approvals.min == 0 {
@@ -720,6 +789,7 @@ pub fn explain(repo: &Policy, effective: &Policy) -> Vec<Row> {
         (false, true) => p.risk.exempt.join(", "),
     };
     let min = |p: &Policy| p.use05.min_version.clone().unwrap_or_else(|| "not set".to_string());
+    let require = |p: &Policy| if p.require.is_empty() { "none".to_string() } else { p.require.iter().map(Require::describe).collect::<Vec<_>>().join("; ") };
     vec![
         row("use05.min_version", min(&default), min(repo), min(effective)),
         row("intent.mode", format!("{:?}", default.intent.mode).to_lowercase(), format!("{:?}", repo.intent.mode).to_lowercase(), format!("{:?}", effective.intent.mode).to_lowercase()),
@@ -749,6 +819,8 @@ pub fn explain(repo: &Policy, effective: &Policy) -> Vec<Row> {
         row("branches.work", default.branches.work.join(", "), repo.branches.work.join(", "), effective.branches.work.join(", ")),
         row("branches.target", target(&default), target(repo), target(effective)),
         row("branches.land", land(&default), land(repo), land(effective)),
+        row("branches.fresh_base", word(default.branches.fresh_base), word(repo.branches.fresh_base), word(effective.branches.fresh_base)),
+        row("require", require(&default), require(repo), require(effective)),
         row("risk.exempt", exempt(&default), exempt(repo), exempt(effective)),
     ]
 }
@@ -943,6 +1015,58 @@ mod tests {
         let mut open = Policy::default();
         open.tighten(&Floor { env_allow: Some(vec!["X".into()]), ..Floor::default() });
         assert_eq!(open.env.allow, Some(vec!["X".to_string()]));
+    }
+
+    #[test]
+    fn fresh_base_and_require_rules_parse_and_leave_old_digests_alone() {
+        let p = parse("[branches]\nfresh_base = \"approval\"\n\n[[require]]\nwhen = [\"src/api/**\"]\nalso = [\"docs/api/**\"]\nwhy = \"the API docs\"\n\n[[require]]\nwhen = [\"**\"]\nalso = [\"CHANGELOG.md\"]\nseverity = \"warn\"");
+        assert_eq!(p.branches.fresh_base, Severity::Approval);
+        assert_eq!(p.require.len(), 2);
+        assert_eq!(p.require[0].severity, Severity::Approval, "a rule someone wrote bites by default");
+        assert_eq!(p.require[0].why.as_deref(), Some("the API docs"));
+        assert_eq!(p.require[1].severity, Severity::Warn);
+        // Off by default, and not written out, so every existing policy keeps its digest.
+        let d = Policy::default();
+        assert_eq!(d.branches.fresh_base, Severity::Allow);
+        let json = serde_json::to_string(&d).unwrap();
+        assert!(!json.contains("fresh_base") && !json.contains("require"), "{json}");
+    }
+
+    #[test]
+    fn a_require_rule_needs_both_lists() {
+        for bad in ["[[require]]\nwhen = []\nalso = [\"docs/**\"]", "[[require]]\nwhen = [\"src/**\"]\nalso = []", "[[require]]\nwhen = [\"src/**\"]", "[[require]]\nwhen = [\"src/**\"]\nalso = [\"docs/**\"]\nunless = 1"] {
+            assert_eq!(Policy::parse(bad).unwrap_err().code, "POLICY_INVALID", "{bad}");
+        }
+    }
+
+    #[test]
+    fn a_require_rule_is_met_only_when_an_also_path_changed() {
+        let p = parse("[[require]]\nwhen = [\"src/**\"]\nalso = [\"docs/**\"]");
+        let r = &p.require[0];
+        let v = |items: &[&str]| items.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert_eq!(r.unmet(&v(&["src/a.rs", "README.md"])), v(&["src/a.rs"]));
+        assert!(r.unmet(&v(&["src/a.rs", "docs/a.md"])).is_empty());
+        assert!(r.unmet(&v(&["README.md"])).is_empty(), "nothing it watches changed");
+        let all = parse("[[require]]\nwhen = [\"**\"]\nalso = [\"docs/**\"]");
+        assert!(all.require[0].unmet(&v(&["docs/only.md"])).is_empty(), "a file matching both counts as the update");
+    }
+
+    #[test]
+    fn a_floor_adds_require_rules_and_raises_fresh_base() {
+        let mut repo = parse("[branches]\nfresh_base = \"warn\"");
+        let rule = Require { when: vec!["**".into()], also: vec!["docs/**".into()], severity: Severity::Approval, why: None };
+        repo.tighten(&Floor { branches_fresh_base: Some(Severity::Deny), require: vec![rule.clone()], ..Floor::default() });
+        assert_eq!(repo.branches.fresh_base, Severity::Deny);
+        assert_eq!(repo.require, vec![rule.clone()]);
+        repo.tighten(&Floor { branches_fresh_base: Some(Severity::Allow), require: vec![rule], ..Floor::default() });
+        assert_eq!(repo.branches.fresh_base, Severity::Deny, "a floor never loosens");
+        assert_eq!(repo.require.len(), 1, "the same rule is not added twice");
+        let floor_json = serde_json::to_string(&Floor::default()).unwrap();
+        assert!(!floor_json.contains("fresh_base") && !floor_json.contains("require"), "signed floors keep their bytes: {floor_json}");
+        let rows = explain(&Policy::default(), &repo);
+        let row = |k: &str| rows.iter().find(|r| r.key == k).map(|r| (r.value.clone(), r.source.word())).unwrap();
+        assert_eq!(row("branches.fresh_base"), ("deny".to_string(), "org"));
+        assert_eq!(row("require"), ("** needs docs/** (approval)".to_string(), "org"));
     }
 
     #[test]

@@ -190,6 +190,17 @@ pub struct GateInput<'a> {
     pub overlaps: &'a [String],
     /// How strongly the task's action log is sealed (D70).
     pub log: Option<&'a crate::logseal::LogIntegrity>,
+    /// The work started behind origin's copy of its target and has not caught up since.
+    pub stale_base: Option<&'a StaleBase>,
+}
+
+/// How far behind origin a task's work started, as the hook saw it when the session began.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct StaleBase {
+    /// `origin/main`.
+    pub remote_ref: String,
+    /// Commits on it the work does not have.
+    pub behind: u32,
 }
 
 /// Rebuild, from signed receipts alone, the task that finished on `target_tree`: what its agent
@@ -222,6 +233,7 @@ pub fn task_from_receipts(found: &crate::evidence::Found, target_tree: &str) -> 
         agent: declared.and_then(|d| d.statement.predicate.agent.clone()).map(|a| crate::task::AgentId { kind: a.kind, session: a.session, model: a.model }),
         owner: declared.and_then(|d| d.statement.predicate.owner.clone()).map(|o| crate::task::Owner { name: o.name, key_id: o.key_id }),
         sandbox: declared.and_then(|d| d.statement.predicate.sandbox.clone()),
+        fresh: None,
     };
     Some((task, done.signer.clone()))
 }
@@ -406,6 +418,34 @@ pub fn evaluate(input: &GateInput<'_>) -> Result<GateResult> {
             }
             findings.push(f);
         }
+    }
+
+    // ------------------------------------------------------------- started behind origin
+    if let (Some(stale), Some(effect)) = (input.stale_base.filter(|s| s.behind > 0), effect_for(policy.branches.fresh_base)) {
+        let (remote, branch) = stale.remote_ref.split_once('/').unwrap_or(("origin", stale.remote_ref.as_str()));
+        let mut f = Finding::new("BASE_STALE", effect, format!("the work started {} commit{} behind {}", stale.behind, if stale.behind == 1 { "" } else { "s" }, stale.remote_ref))
+            .next(format!("update first: git pull --rebase {remote} {branch}, then prove again"));
+        if effect == Effect::Approval {
+            f = f.approvable();
+        }
+        findings.push(f);
+    }
+
+    // ------------------------------------------------------------- files that change together
+    for rule in &policy.require {
+        let unmet = rule.unmet(&paths);
+        if unmet.is_empty() {
+            continue;
+        }
+        let Some(effect) = effect_for(rule.severity) else { continue };
+        let why = rule.why.as_deref().map(|w| format!(" ({w})")).unwrap_or_default();
+        let mut f = Finding::new("ALSO_CHANGE_MISSING", effect, format!("{} file(s) changed that need {} to change too, and nothing there did{why}", unmet.len(), rule.also.join(" or ")))
+            .paths(unmet)
+            .next(format!("update {} in this change", rule.also.join(" or ")));
+        if effect == Effect::Approval {
+            f = f.approvable();
+        }
+        findings.push(f);
     }
 
     // ------------------------------------------------------------- protected paths and dependencies
