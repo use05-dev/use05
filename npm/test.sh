@@ -18,11 +18,14 @@ case "$(uname -s)-$(uname -m)" in
 esac
 tmp=$(mktemp -d)
 trap 'rm -rf "$tmp"' EXIT
-D="use05-$V-$target"
+# The packages get a version no release will ever use, so the publish dry run below does not
+# depend on what is already on the registry. The binary still reports the real version.
+PKG_V="0.0.0-ci"
+D="use05-$PKG_V-$target"
 mkdir -p "$tmp/dist/$D" "$tmp/packs"
 cp "$BIN" "$tmp/dist/$D/use05"
 (cd "$tmp/dist" && tar czf "$D.tar.gz" "$D" && rm -r "$D" && { command -v sha256sum >/dev/null && sha256sum "$D.tar.gz" || shasum -a 256 "$D.tar.gz"; } > "$D.tar.gz.sha256")
-"$ROOT/npm/build.sh" "$V" "$tmp/dist" "$tmp/out" >/dev/null
+"$ROOT/npm/build.sh" "$PKG_V" "$tmp/dist" "$tmp/out" >/dev/null
 (cd "$tmp/packs" && for d in "$tmp"/out/*; do npm pack -q "$d" >/dev/null; done)
 npm install -g -q --offline --no-audit --no-fund --prefix "$tmp/prefix" "$tmp"/packs/*.tgz >/dev/null
 got=$("$tmp/prefix/bin/use05" --version)
@@ -30,5 +33,5 @@ got=$("$tmp/prefix/bin/use05" --version)
 set +e; "$tmp/prefix/bin/use05" no-such-command 2>/dev/null; code=$?; set -e
 [ "$code" = 6 ] || { echo "npm test: the exit code was not passed through (got $code, want 6)" >&2; exit 1; }
 # The publish step the workflow runs, as a dry run: nothing is sent.
-"$ROOT/npm/publish.sh" "$tmp/out" --dry-run >/dev/null 2>&1 || { echo "npm test: npm/publish.sh --dry-run failed" >&2; exit 1; }
+"$ROOT/npm/publish.sh" "$tmp/out" --dry-run --tag ci >/dev/null 2>&1 || { echo "npm test: npm/publish.sh --dry-run failed" >&2; exit 1; }
 echo "npm test: installed from packed packages, ran $got, exit codes pass through, publish dry run ok"
