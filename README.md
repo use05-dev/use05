@@ -1,19 +1,41 @@
-# 05
+<p align="center">
+  <a href="https://use05.dev">
+    <picture>
+      <source media="(prefers-color-scheme: dark)" srcset="docs/assets/logo-dark.svg">
+      <img src="docs/assets/logo.svg" alt="05" height="88">
+    </picture>
+  </a>
+</p>
+
+<h3 align="center">Land AI-written code with no pull request to review.</h3>
+
+<p align="center">
+  Agents declare a plan. 05 checks the result on the exact code, signs the evidence,<br>
+  and keeps several agents out of each other's way. You approve by exception; it lands as a commit.
+</p>
+
+<p align="center">
+  <a href="https://github.com/use05-dev/use05/actions/workflows/ci.yml"><img src="https://github.com/use05-dev/use05/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
+  <a href="https://github.com/use05-dev/use05/releases/latest"><img src="https://img.shields.io/github/v/release/use05-dev/use05?color=0f6b47&label=release" alt="Latest release"></a>
+  <a href="https://www.npmjs.com/package/use05"><img src="https://img.shields.io/npm/v/use05?color=0f6b47&label=npm" alt="npm"></a>
+  <a href="LICENSE"><img src="https://img.shields.io/badge/license-Apache--2.0-0f6b47" alt="Apache-2.0"></a>
+</p>
+
+<p align="center">
+  <a href="https://use05.dev">Website</a> ·
+  <a href="#install">Install</a> ·
+  <a href="#five-minutes">Five minutes</a> ·
+  <a href="docs/turn-on-the-ci-gate.md">CI gate</a> ·
+  <a href="docs/extending.md">Extend</a>
+</p>
+
+<p align="center">
+  <img src="docs/assets/brief-clean.png" alt="use05 brief on an agent's branch: the change stayed in its declared scope, its checks passed on the exact tree, and the verdict is ALLOW, nothing to read." width="820">
+</p>
 
 **You own the request and the acceptance. Agents own the plan and the work. 05 holds them to the plan.**
 
 05 is an acceptance layer for AI-written code that takes the place of pull-request review. The agent declares what it will do before it starts, and 05 seals that plan where the agent cannot change it. When it finishes, 05 proves what was checked on the exact files and compares the result to the plan. When everything matched, you approve, the change lands as a commit and you push it: no pull request to review. When something did not match, you read one page instead of the diff. With several agents in one repository, 05 keeps them out of each other's way. Everything runs on your machine: no account, no telemetry, nothing uploaded.
-
-```
-$ use05 prove
-✓ Proved: the check passed
-  check     test
-  result    passed in 396ms
-  tree      7fa8fe0e10a8 (working tree)
-  signed    def1b067b692 (this machine, advisory)
-  Advisory: a key on this machine can be used by an agent running as you.
-  Authoritative evidence is produced in CI.
-```
 
 ## Install
 
@@ -38,6 +60,17 @@ git push origin main          # no pull request needed; CI gates every pushed br
 ```
 
 Bare `use05` shows where you stand. `use05 doctor` says how strongly each control is enforced.
+
+## What it looks like
+
+Real output from the `use05` binary on a demo repository.
+
+| | |
+|---|---|
+| <img src="docs/assets/prove-verify.png" alt="use05 prove signs a receipt for a check on the exact tree; use05 verify checks it offline."> | <img src="docs/assets/brief.png" alt="use05 brief on a change that drifted: files outside scope, a migration, a risky area, and the verdict approval required."> |
+| **Prove, then verify.** A check on the exact tree, signed; verified offline. | **When something did not match**, the brief says what, and only that needs a person. |
+| <img src="docs/assets/land-and-clean-up.png" alt="use05 land fast-forwards an agent's branch onto main, removes its worktree and deletes the branch."> | <img src="docs/assets/hook-denied.png" alt="A Claude Code hook refuses an agent's edit to 05's own policy file until a person approves."> |
+| **Land it**, and the agent's branch and worktree are cleaned up. | **Agents are held to the rules** by their own hooks. |
 
 ## How it works
 
