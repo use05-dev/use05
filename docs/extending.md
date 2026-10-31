@@ -35,9 +35,11 @@ Claude Code and Codex have their own hook formats. Any other agent can use `gene
 | `PreToolUse` | before a tool runs | `tool_name`, `tool_input` |
 | `PostToolUse` | after a tool ran | `tool_name`, `tool_input` |
 | `Stop` | the agent finishes a turn | `last_assistant_message`, `stop_hook_active` |
+| `SubagentStart` | the agent starts a subagent | `agent_id`, `agent_type`; the answer's `context` holds the rules to give the subagent |
+| `SubagentStop` | a subagent finished | `agent_id`, `agent_type` |
 | `SessionEnd` | the session is over | |
 
-Every event needs `session_id` and `cwd`. A model name in `model` is recorded when given. In `tool_input`, 05 reads the files a tool is about to write from `file_path`, `notebook_path` or `path`, from patches (`*** Update File: <path>` lines) in `input`, `patch` or `command`, and shell commands from `command`.
+Every event needs `session_id` and `cwd`. A subagent's events keep the parent's `session_id` and add `agent_id` and `agent_type`, on its tool calls too, so its work belongs to the same task and every action is recorded with the subagent that took it. A model name in `model` is recorded when given. In `tool_input`, 05 reads the files a tool is about to write from `file_path`, `notebook_path` or `path`, from patches (`*** Update File: <path>` lines) in `input`, `patch` or `command`, and shell commands from `command`.
 
 The answer is on stdout, and empty when there is nothing to say:
 

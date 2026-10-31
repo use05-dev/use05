@@ -11,8 +11,10 @@ How to install 05, set it up in a repository, work with it day to day, and confi
 - [Long sessions, large changes and subagents](#long-sessions-large-changes-and-subagents)
 - [Several agents at once](#several-agents-at-once)
 - [Configure: `.05/policy.toml`](#configure-05policytoml)
+- [Organisation rules](#organisation-rules)
 - [Turn on the CI gate](#turn-on-the-ci-gate)
 - [Commands](#commands)
+- [Exit codes and environment variables](#exit-codes-and-environment-variables)
 - [Upgrade and uninstall](#upgrade-and-uninstall)
 
 ## Install
@@ -125,6 +127,25 @@ git push origin main
 
 `use05 prove` runs every required check. `use05 prove test lint` runs named checks; `use05 prove -- cargo test` runs any command. Checks run on a copy of exactly the staged files, with a scrubbed environment. A failing check still gets a receipt that records the failure.
 
+**A written plan (a plan card).** Instead of flags, `use05 start` can read the plan from a TOML file: `use05 start "Cap payment retries" --card card.toml`.
+
+```toml
+title = "Cap payment retries at three"
+goal = "Stop retrying failed charges forever"
+acceptance = ["test"]                          # checks that must pass for this change
+no_new_dependencies = true                     # dependency files must not change
+out_of_scope = ["changing the payment gateway client"]
+target = "main"                                # optional: the branch this lands on
+
+[scope]
+include = ["src/billing/**"]
+exclude = ["src/billing/legacy/**"]
+```
+
+The same plan as flags: `use05 start "Cap payment retries" --goal "…" --scope "src/billing/**" --exclude "src/billing/legacy/**" --check test --no-new-deps`. With `[intent] mode = "risky"` or `"always"`, the policy asks for such a written plan.
+
+**Another task than the current one.** `brief`, `approve`, `finish` and `land` work on the current task; `--task <id>` names another (bare `use05` shows ids). `brief`, `prove`, `approve` and `bypass` look at the staged files, else the working tree; `--tree index`, `--tree worktree` or `--tree <commit>` picks.
+
 ## Reading the brief
 
 `use05 brief` is the one page a person reads instead of the diff. `use05 brief --json` prints the same as data.
@@ -158,6 +179,8 @@ use05 approve --reject --reason "Retries must stay at five"
 ```
 
 You are asked for your approver passphrase. An approval is signed, tied to the exact content and the policy, and expires after `approvals.expire_days` (7 by default). If the change moves on, the approval no longer counts and the brief says so.
+
+**Across machines and CI.** Approvals and receipts live on ordinary git branches (`05-receipts/<key>`). Add `--push` to `approve`, `bypass` or `prove` to push that branch to `origin`, and `use05 brief --fetch` pulls everyone else's first. In scripts, `--passphrase-stdin` reads the passphrase from the first line of stdin instead of the terminal (for `approve`, `bypass` and `key new --approver`).
 
 **Break glass.** To let one exact change through a block, with a reason:
 ```sh
@@ -213,16 +236,41 @@ Run as many agents as you like on one repository:
 | `[approvals] min` | `1` | Approvals needed. |
 | `[approvals] expire_days` | `7` | How long an approval lasts. |
 | `[risk] exempt` | `[]` | Paths a built-in risk pattern catches by mistake. |
+| `[[risk.rules]]` `category`, `level`, `paths` | built-in only | Your own risk areas, on top of the built-in ones (auth, money, migration, secrets, privilege and deployment are high; persistence and network are medium). For example `category = "pricing"`, `level = "medium"`, `paths = ["src/pricing/**"]`. A high-risk change needs a person's approval. |
 | `[branches] keep` | `main`, `master`, `develop`, `release/*` | Real branches: never deleted. |
 | `[branches] work` | `05/*`, `agent/*`, `claude/*`, `codex/*` | Agents' working branches: removed with their worktree once landed. |
+| `[branches] target` | the remote's default branch | The branch finished changes land on, unless a plan names another. |
 | `[branches] land` | `"manual"` | `manual`: you run `use05 land`. `auto`: a change the gate allows lands when its agent stops. |
 | `[record] middle` | `"local"` | What agents did is recorded on this machine and never uploaded. `off` records nothing. |
 | `[enforce] on_error` | `"open"` | If 05 itself fails: `open` lets the change through and says so loudly; `closed` refuses it. |
 | `[env] allow` | unrestricted | If set, the only environment variables any check may be passed. |
-| `[[trust.key]]` | none | Public keys whose receipts count, e.g. your CI runner's. See the CI gate guide. |
+| `[[trust.key]]` `name`, `role`, `public`, `expires` | none | A public key whose signatures count: `role = "runner"` for a CI runner (authoritative), `"approver"` for a person's approval key, `"local"` for another machine (advisory). `public` is the contents of the `.pub` file; `expires` (for example `"2027-12-31"`) stops trusting it after that date. See the CI gate guide. |
 | `[[environment]]` `name`, `branch`, `level` | none | Which branch is which environment, e.g. `name = "dev"`, `branch = "main"`. `level` (`dev`, `uat`, `pre-prod` or `prod`) is needed only when the name is not a level, such as a second dev environment `dev-eu`. Shown by `use05` and the brief, levels side by side; environment branches are never deleted. |
 
 An organisation can add a signed layer of rules on top. Repositories can tighten that layer, but never loosen it. `use05 policy` shows which settings came from it.
+
+## Organisation rules
+
+An organisation can set a minimum for every repository: rules a repository can tighten but never loosen. 05 reads it on each machine and shows it in `use05 policy` as `[org]`.
+
+1. Write the minimum as TOML. The settings use the policy's names joined with `_`:
+
+   ```toml
+   drift_scope = "approval"
+   drift_tests = "deny"
+   protect_paths = ["infra/**"]
+   protect_locked = ["LICENSE"]
+   approvals_min = 2
+   evidence_accept = ["runner"]
+   ```
+
+   Also available: `intent_mode`, `check` (required checks), `drift_dependencies`, `drift_overlap`, `drift_claims`, `approvals_expire_days_max`, `record_middle`, `enforce_on_error`, `env_allow`, `trust_key`, `risk_rules`, `risk_exempt_allowed`, `protect_absolute`, `protect_append_only`, `protect_no_delete`, `protect_no_read` and `protect_bypass`.
+2. Sign it with the organisation's key (make one with `use05 key new org.key`):
+
+   ```sh
+   use05 policy org-sign floor.toml --org Acme --key org.key --out org.json
+   ```
+3. On each machine, put `org.json` and the organisation's public key, named `org.pub`, in 05's config directory: `~/.config/05/` (or `$XDG_CONFIG_HOME/05/`, or `$USE05_HOME`). From then on, a missing or tampered `org.json` is an error, not a silent fallback.
 
 ## Turn on the CI gate
 
@@ -245,9 +293,32 @@ Hooks and the pre-push hook run on your machine, where an agent running as you c
 | `use05 policy` | The effective policy, and where each setting came from. `--edit` changes it through the setup questions. |
 | `use05 doctor` | Check the setup, and how strongly each control is enforced. |
 | `use05 key new --approver` | Create your passphrase-protected approver key. `use05 key show` lists this machine's keys. |
+| `use05 gate` | The gate on its own: `--git-hook pre-push` is what the pre-push hook runs; `--ci` proves the required checks with the runner key, then gates (what the CI workflow runs; `--push` keeps the runner's receipts). |
+| `use05 policy org-sign` | Sign an organisation's rules. See [Organisation rules](#organisation-rules). |
+| `use05 hook <agent> <event>` | What agent hooks call: `claude-code`, `codex`, or `generic` for any other agent (see [Extending 05](extending.md)). |
 | `use05 uninstall` | Reverse exactly what `init` did. |
 
 Every command takes `--help`, `--repo <dir>` and `--json`.
+
+More flags worth knowing:
+
+- `use05 prove`: `--key <file>` signs with that key instead of this machine's (or the CI runner key); `--timeout <seconds>` stops a check after that long; `--env NAME` or `--env NAME=VALUE` passes a variable to the check; `--out <file>` also writes the receipt to a file; `--no-store` keeps it off the receipts branch; `--push` pushes the receipts branch.
+- `use05 verify <receipt>`: `--key <file.pub>` checks against that public key instead of the trusted ones; `--tree <rev>` also checks the receipt is for that tree.
+- `use05 bypass`: `--hours <n>` sets how long it lasts (4 by default).
+- `use05 key new <path>` makes a key pair at `path` and `path.pub`; `use05 key new --approver` makes your passphrase-protected approver key.
+
+## Exit codes and environment variables
+
+`use05 brief` and `use05 gate` exit with the decision, so scripts and CI can act on it: **0** allow, **2** deny, **3** a person's approval is needed, **5** evidence is missing (a check has not run on this change). Other commands exit 0 on success; **6** means the command was used wrongly (an unknown flag, say).
+
+| Variable | What it does |
+|---|---|
+| `USE05_HOME` | 05's config directory (keys, organisation rules). Default `~/.config/05`, or `$XDG_CONFIG_HOME/05`. |
+| `USE05_RUNNER_KEY` | The CI runner's secret key, from a CI secret. `prove` and `gate --ci` sign with it. |
+| `USE05_PUSH_TOKEN` | In CI, the token `gate --ci --push` pushes the runner's receipts with. |
+| `USE05_SESSION_ID` | For a generic agent: its session id, so `use05 start` from inside it waits for its hook to seal the plan. Claude Code and Codex set their own. |
+| `NO_COLOR`, `CLICOLOR_FORCE` | Turn colour off, or force it when output is not a terminal. |
+| `USE05_UNICODE` | Use Unicode symbols even when the locale does not say UTF-8. |
 
 ## Upgrade and uninstall
 
