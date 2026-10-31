@@ -1,7 +1,7 @@
 name: npm
 
 # When a release is published (not drafted), put its binaries on npm: one @use05/cli-<os>-<cpu>
-# package per platform, then the use05 package that runs the right one. It publishes with npm
+# package per platform, then @use05/cli, which runs the right one (its command is use05). It publishes with npm
 # trusted publishing (OIDC from this workflow, no stored token) once each package names this
 # repository and workflow as its trusted publisher on npmjs.com. Until then, the very first publish
 # can use an NPM_TOKEN secret. Run it by hand with "dry run" to build and pack without publishing.

@@ -5,7 +5,7 @@
 #
 # DIST holds the release's use05-VERSION-<target>.tar.gz files and their .sha256 files. OUT gets
 # one directory per package, ready for `npm publish`: a platform package @use05/cli-<os>-<cpu>
-# holding the binary, and the `use05` package that runs whichever one npm installed. A tarball
+# holding the binary, and @use05/cli, which runs whichever one npm installed (its command is use05). A tarball
 # whose checksum does not match stops the build. Targets missing from DIST are skipped and named.
 set -euo pipefail
 VERSION="${1:?usage: build.sh VERSION DIST OUT}"
@@ -40,7 +40,7 @@ for pair in $PLATFORMS; do
 {
   "name": "@use05/cli-$platform",
   "version": "$VERSION",
-  "description": "The use05 binary for $os on $cpu. Install the use05 package instead.",
+  "description": "The use05 binary for $os on $cpu. Install @use05/cli instead.",
   "license": "Apache-2.0",
   "repository": { "type": "git", "url": "git+https://github.com/use05-dev/use05.git" },
   "os": ["$os"],
@@ -54,12 +54,12 @@ done
 [ "$built" -gt 0 ] || { echo "npm: no release binaries found in $DIST" >&2; exit 1; }
 
 # The wrapper, pinned to exactly this version of every platform package.
-rm -rf "$OUT/use05" && cp -R "$HERE/use05" "$OUT/use05"
+rm -rf "$OUT/cli" && cp -R "$HERE/cli" "$OUT/cli"
 node -e '
   const fs = require("fs"), file = process.argv[1], v = process.argv[2];
   const p = JSON.parse(fs.readFileSync(file, "utf8"));
   p.version = v;
   for (const k of Object.keys(p.optionalDependencies)) p.optionalDependencies[k] = v;
   fs.writeFileSync(file, JSON.stringify(p, null, 2) + "\n");
-' "$OUT/use05/package.json" "$VERSION"
-echo "npm: built use05 $VERSION and $built platform package(s) in $OUT"
+' "$OUT/cli/package.json" "$VERSION"
+echo "npm: built @use05/cli $VERSION and $built platform package(s) in $OUT"

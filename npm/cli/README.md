@@ -1,9 +1,9 @@
-# use05
+# @use05/cli
 
-05 is the acceptance layer for AI-written code: agents declare their plan, 05 seals it, proves the change with deterministic checks, and gives you one page to accept or reject.
+05 lets AI-written code land with no pull request to review. Agents declare a plan; 05 seals it, checks the result on the exact code, signs the evidence and keeps several agents out of each other's way. You approve by exception, and the change lands as a commit.
 
 ```sh
-npm install -g use05
+npm install -g @use05/cli
 use05 init
 ```
 

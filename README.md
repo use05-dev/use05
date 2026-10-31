@@ -17,7 +17,7 @@
 <p align="center">
   <a href="https://github.com/use05-dev/use05/actions/workflows/ci.yml"><img src="https://github.com/use05-dev/use05/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
   <a href="https://github.com/use05-dev/use05/releases/latest"><img src="https://img.shields.io/github/v/release/use05-dev/use05?color=0f6b47&label=release" alt="Latest release"></a>
-  <a href="https://www.npmjs.com/package/use05"><img src="https://img.shields.io/npm/v/use05?color=0f6b47&label=npm" alt="npm"></a>
+  <a href="https://www.npmjs.com/package/@use05/cli"><img src="https://img.shields.io/npm/v/@use05/cli?color=0f6b47&label=npm" alt="npm"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-Apache--2.0-0f6b47" alt="Apache-2.0"></a>
 </p>
 
@@ -43,7 +43,7 @@
 curl -fsSL https://use05.dev/install.sh | sh
 ```
 
-The installer downloads a release for your platform, checks its SHA-256 against `SHA256SUMS`, and refuses to install on a mismatch. Linux and macOS (x86_64 and arm64). With npm: `npm install -g use05`, which installs the same binary for your platform. Or build it: `cargo build --release -p use05` (Rust 1.85+, and `git` at runtime).
+The installer downloads a release for your platform, checks its SHA-256 against `SHA256SUMS`, and refuses to install on a mismatch. Linux and macOS (x86_64 and arm64). With npm: `npm install -g @use05/cli`, which installs the same binary for your platform. Or build it: `cargo build --release -p use05` (Rust 1.85+, and `git` at runtime).
 
 ## Five minutes
 

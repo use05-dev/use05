@@ -1,5 +1,5 @@
 {
-  "name": "use05",
+  "name": "@use05/cli",
   "version": "0.0.0",
   "description": "05: the acceptance layer for AI-written code. Prove and verify what agents did.",
   "license": "Apache-2.0",
