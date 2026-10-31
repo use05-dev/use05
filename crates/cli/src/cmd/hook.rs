@@ -223,8 +223,14 @@ fn pre_tool_use(ctx: &Ctx, task: &Task, cwd: &Path, tool: &str, input: &Value) -
     let top = ctx.top();
     if READ_TOOLS.contains(&tool) {
         let read: Vec<String> = ["file_path", "notebook_path", "path"].iter().filter_map(|k| input.get(*k).and_then(Value::as_str)).filter_map(|p| relative(top, cwd, p)).collect();
-        let output = read.iter().find(|p| unreadable(&ctx.policy, p)).map(|p| deny(&format!("05: {p} is not to be read by agents here. Ask the user if you need something from it.")));
-        return Decision { output, log: Value::Null };
+        // Allowed reads are not recorded; a refused one is, with the path and not its contents.
+        return match read.iter().find(|p| unreadable(&ctx.policy, p)) {
+            Some(p) => Decision {
+                output: Some(deny(&format!("05: {p} is not to be read by agents here. Ask the user if you need something from it."))),
+                log: json!({ "event": "tool", "tool": tool, "paths": [p], "decision": "deny", "why": "do not read" }),
+            },
+            None => Decision { output: None, log: Value::Null },
+        };
     }
     let mut log = json!({ "event": "tool", "tool": tool });
 
@@ -281,6 +287,7 @@ fn pre_tool_use(ctx: &Ctx, task: &Task, cwd: &Path, tool: &str, input: &Value) -
         let covered = ctx.intent_approved() && task.intent.as_ref().is_some_and(|c| protected.iter().all(|p| c.allows(p) && c.has_scope()));
         if !covered {
             log["decision"] = json!("deny");
+            log["why"] = json!("protected path");
             return Decision {
                 output: Some(deny(&format!(
                     "05: {} is protected. A person must approve the intent first: ask the user to run `use05 approve --intent` (it needs their approver passphrase).",
@@ -296,6 +303,7 @@ fn pre_tool_use(ctx: &Ctx, task: &Task, cwd: &Path, tool: &str, input: &Value) -
         let outside: Vec<&String> = touched.iter().filter(|p| !card.allows(p)).collect();
         if let Some(path) = outside.first() {
             let msg = format!("05: {path} is outside the declared scope ({}). Say so to the user, or widen the intent.", card.scope.include.join(", "));
+            log["why"] = json!("outside scope");
             match ctx.policy.drift.scope {
                 Severity::Deny | Severity::Approval => {
                     log["decision"] = json!("deny");
@@ -316,6 +324,7 @@ fn pre_tool_use(ctx: &Ctx, task: &Task, cwd: &Path, tool: &str, input: &Value) -
         if let Some((path, r)) = touched.iter().find_map(|p| use05_core::overlap::reserved(&res, p).map(|r| (p, r))) {
             let msg = format!("05: {}. Stay out of it, or coordinate with the user.", r.describe(path));
             log["overlap"] = json!([format!("{}:{path}", r.task)]);
+            log["why"] = json!("overlap");
             match ctx.policy.drift.overlap {
                 Severity::Deny => {
                     log["decision"] = json!("deny");
@@ -338,6 +347,7 @@ fn pre_tool_use(ctx: &Ctx, task: &Task, cwd: &Path, tool: &str, input: &Value) -
                 first.path, first.minutes_ago, first.task, first.title
             );
             log["overlap"] = json!(overlaps.iter().map(|o| format!("{}:{}", o.task, o.path)).collect::<Vec<_>>());
+            log["why"] = json!("overlap");
             match ctx.policy.drift.overlap {
                 Severity::Deny => {
                     log["decision"] = json!("deny");
@@ -503,7 +513,7 @@ fn tidy(ctx: &Ctx, including_here: bool) {
 }
 
 fn with_context(event: &str, output: Option<Value>, notes: &[String]) -> Option<Value> {
-    if notes.is_empty() || !["PreToolUse", "PostToolUse", "UserPromptSubmit", "SessionStart"].contains(&event) {
+    if notes.is_empty() || !["PreToolUse", "PostToolUse", "UserPromptSubmit", "SessionStart", "SubagentStart"].contains(&event) {
         return output;
     }
     let text = notes.join(" ");
@@ -568,8 +578,17 @@ fn run_inner(agent: &str, event: &str) -> Result<Option<Value>, String> {
     }
     let recording = ctx.policy.record.middle == Middle::Local;
     let state = ctx.store.state_dir();
-    let note = |v: Value| {
+    // A subagent's hook calls carry its id and type; every line they write says which subagent
+    // it was. The main session's lines carry neither.
+    let subagent = payload.get("agent_id").and_then(Value::as_str).filter(|a| !a.is_empty()).map(|id| {
+        (id.to_string(), payload.get("agent_type").and_then(Value::as_str).unwrap_or("").to_string())
+    });
+    let note = |mut v: Value| {
         if recording {
+            if let Some((id, kind)) = &subagent {
+                v["agent_id"] = json!(id);
+                v["agent_type"] = json!(kind);
+            }
             let _ = log::append(&state, &task.id, v);
         }
     };
@@ -590,6 +609,17 @@ fn run_inner(agent: &str, event: &str) -> Result<Option<Value>, String> {
         "SessionStart" => {
             note(json!({ "event": "session_start", "agent": agent }));
             Ok(Some(json!({ "hookSpecificOutput": { "hookEventName": "SessionStart", "additionalContext": session_context(&ctx, &task) } })))
+        }
+        "SubagentStart" => {
+            // A subagent is held to the same rules by the same hooks; tell it what they are
+            // before its first tool call, as the main session is told at its start.
+            note(json!({ "event": "subagent_start" }));
+            Ok(Some(json!({ "hookSpecificOutput": { "hookEventName": "SubagentStart", "additionalContext": session_context(&ctx, &task) } })))
+        }
+        "SubagentStop" => {
+            // The main session's Stop proves the change; a subagent's stop is only recorded.
+            note(json!({ "event": "subagent_stop" }));
+            Ok(None)
         }
         "PreToolUse" => {
             let tool = payload.get("tool_name").and_then(Value::as_str).unwrap_or("");

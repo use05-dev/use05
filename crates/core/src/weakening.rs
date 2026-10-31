@@ -149,6 +149,31 @@ pub fn analyse(top: &Path, base: Option<&str>, target: &str, changes: &[Change])
     let mut tally = (0usize, 0usize);
     // A test file moved elsewhere was not deleted.
     let moved = if changes.iter().any(|c| c.status == 'D') { git::renamed_from(top, base, target) } else { Vec::new() };
+    // Git is asked once for every Rust file's contents and once for the whole diff, never per
+    // file: a change of thousands of files stays fast.
+    let rust: Vec<&Change> = changes.iter().filter(|c| classify(&c.path) == Class::Other && c.path.ends_with(".rs") && c.status != 'D').collect();
+    let mut specs = Vec::new();
+    for c in &rust {
+        specs.push(format!("{target}:{}", c.path));
+        if let (Some(b), false) = (base, c.status == 'A') {
+            specs.push(format!("{b}:{}", c.path));
+        }
+    }
+    let contents: std::collections::HashMap<String, Vec<u8>> = specs.iter().cloned().zip(git::blobs(top, &specs)?).filter_map(|(k, v)| v.map(|v| (k, v))).collect();
+    let test_start_at = |rev: Option<&str>, path: &str| rev.and_then(|r| contents.get(&format!("{r}:{path}"))).and_then(|b| rust_test_start(&String::from_utf8_lossy(b)));
+    let needs_diff = changes.iter().any(|c| c.status != 'D' && matches!(classify(&c.path), Class::Tests | Class::Configuration | Class::Verification))
+        || rust.iter().any(|c| test_start_at(base, &c.path).is_some() || test_start_at(Some(target), &c.path).is_some());
+    let all = if needs_diff { git::hunks_by_path(top, base, target)? } else { std::collections::HashMap::new() };
+    let hunks = |path: &str| -> Result<git::Hunks> {
+        match all.get(path) {
+            Some(h) => Ok(h.clone()),
+            None => git::diff_hunks(top, base, target, path),
+        }
+    };
+    let lines = |path: &str| -> Result<(Vec<String>, Vec<String>)> {
+        let (r, a) = hunks(path)?;
+        Ok((r.into_iter().map(|(_, l)| l).collect(), a.into_iter().map(|(_, l)| l).collect()))
+    };
     for change in changes {
         let path = change.path.as_str();
         let class = classify(path);
@@ -161,7 +186,7 @@ pub fn analyse(top: &Path, base: Option<&str>, target: &str, changes: &[Change])
                 out.push(w("snapshot_changed", format!("snapshot {path} was {}; expected output was rewritten", if change.status == 'D' { "deleted" } else { "changed" })));
             }
             if change.status != 'D' {
-                let (removed, added) = git::diff_lines(top, base, target, path)?;
+                let (removed, added) = lines(path)?;
                 let (r, a) = (removed.iter().filter(|l| has_assertion(l)).count(), added.iter().filter(|l| has_assertion(l)).count());
                 tally = (tally.0 + r, tally.1 + a);
                 if r > a {
@@ -176,10 +201,9 @@ pub fn analyse(top: &Path, base: Option<&str>, target: &str, changes: &[Change])
         // Rust keeps unit tests in the source file, in a `#[cfg(test)]` module: judge only the lines
         // from that point down, on each side of the change.
         if class == Class::Other && path.ends_with(".rs") && change.status != 'D' {
-            let test_start = |rev: Option<&str>| rev.and_then(|r| git::blob_at(top, r, path)).and_then(|b| rust_test_start(&String::from_utf8_lossy(&b)));
-            let (from, to) = (test_start(base), test_start(Some(target)));
+            let (from, to) = (if change.status == 'A' { None } else { test_start_at(base, path) }, test_start_at(Some(target), path));
             if from.is_some() || to.is_some() {
-                let (removed, added) = git::diff_hunks(top, base, target, path)?;
+                let (removed, added) = hunks(path)?;
                 let in_tests = |line: usize, start: Option<usize>| start.is_some_and(|s| line >= s);
                 let r = removed.iter().filter(|(n, l)| in_tests(*n, from) && has_assertion(l)).count();
                 let a = added.iter().filter(|(n, l)| in_tests(*n, to) && has_assertion(l)).count();
@@ -194,7 +218,7 @@ pub fn analyse(top: &Path, base: Option<&str>, target: &str, changes: &[Change])
             }
         }
         if matches!(class, Class::Configuration | Class::Verification) && change.status != 'D' {
-            let (removed, added) = git::diff_lines(top, base, target, path)?;
+            let (removed, added) = lines(path)?;
             let lowered = removed.iter().any(|r| {
                 let (Some(key), Some(from)) = (threshold_key(r), first_number(r)) else { return false };
                 match added.iter().find(|a| threshold_key(a) == Some(key)).and_then(|a| first_number(a)) {

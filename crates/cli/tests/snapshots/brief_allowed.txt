@@ -5,14 +5,16 @@ Intent     no goal written
            scope .05/**
            risk high
 
-Outcome    1 file changed on <TREE12> (staged files)
-           .05 (1)
+Outcome    1 file changed on <TREE12> (staged files) · +2 −0
+           .05/ · 1 file · +2 −0
 
 Evidence   ✓ test passed <TIME> signed by this machine (advisory)
 
 Drift      ✓ nothing differs from the intent
 
 Approvals  ✓ you (approver) approved the outcome: "reviewed the policy edit"
+
+Session    checks during the session: test ran 1, failed 0, passed last time
 
 Log        anchored by this machine at 1 point(s), last at line 1 of 3; not yet sealed by CI
 

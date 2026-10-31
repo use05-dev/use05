@@ -169,6 +169,9 @@ pub struct GateResult {
 pub struct ChangeInfo {
     pub status: char,
     pub path: String,
+    /// Lines added and removed; 0 and 0 for a binary file.
+    pub added: u64,
+    pub removed: u64,
 }
 
 pub struct GateInput<'a> {
@@ -621,7 +624,13 @@ pub fn evaluate(input: &GateInput<'_>) -> Result<GateResult> {
         findings,
         checks,
         claims: claim_status,
-        changed: changes.iter().map(|c| ChangeInfo { status: c.status, path: c.path.clone() }).collect(),
+        changed: {
+            let counts = git::numstat(input.top, input.base_tree, input.target_tree)?;
+            changes.iter().map(|c| {
+                let (added, removed) = counts.get(&c.path).copied().unwrap_or((0, 0));
+                ChangeInfo { status: c.status, path: c.path.clone(), added, removed }
+            }).collect()
+        },
         risk,
         risk_reasons,
         log: input.log.cloned(),

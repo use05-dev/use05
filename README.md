@@ -25,6 +25,7 @@
   <a href="https://use05.dev">Website</a> ·
   <a href="#install">Install</a> ·
   <a href="#five-minutes">Five minutes</a> ·
+  <a href="docs/guide.md">Guide</a> ·
   <a href="docs/turn-on-the-ci-gate.md">CI gate</a> ·
   <a href="docs/extending.md">Extend</a>
 </p>
@@ -43,7 +44,7 @@
 curl -fsSL https://use05.dev/install.sh | sh
 ```
 
-The installer downloads a release for your platform, checks its SHA-256 against `SHA256SUMS`, and refuses to install on a mismatch. Linux and macOS (x86_64 and arm64). With npm: `npm install -g @use05/cli`, which installs the same binary for your platform. Or build it: `cargo build --release -p use05` (Rust 1.85+, and `git` at runtime).
+The installer downloads a release for your platform, checks its SHA-256 against `SHA256SUMS`, and refuses to install on a mismatch. Linux and macOS (x86_64 and arm64). With npm: `npm install -g @use05/cli` for your machine, or `npm install --save-dev @use05/cli` for one project (then run `npx use05 init`); both install the same binary for your platform. Or build it: `cargo build --release -p use05` (Rust 1.85+, and `git` at runtime).
 
 ## Five minutes
 
@@ -59,7 +60,7 @@ use05 land                    # the approved change becomes a commit on its targ
 git push origin main          # no pull request needed; CI gates every pushed branch
 ```
 
-Bare `use05` shows where you stand. `use05 doctor` says how strongly each control is enforced.
+Bare `use05` shows where you stand. `use05 doctor` says how strongly each control is enforced. The [guide](docs/guide.md) covers everything else.
 
 ## What it looks like
 
@@ -93,7 +94,8 @@ Run as many agents as you like on one repository. 05 keeps them orchestrated so 
 - **Folder and file rules.** Under `[protect]`, paths can be `locked` (never changed; no approval clears it), `append_only` (new files only, such as migrations), `no_delete`, or `no_read` (agents may not open them). Agent hooks refuse these before they happen, and the gate and CI gate deny them. A person can bypass a rule for one exact change, with a reason the brief shows, unless the path is `absolute` or `bypass = false`. Unlocking is its own approved change to the policy. `no_read` is advisory: it holds only where the agent's hooks report the read.
 - **The gate is deterministic.** No model judges anything. It compares intent, files changed, evidence on the exact tree, approvals and protected paths, and answers allow, wait, approval required or deny.
 - **Approvals** are signed with a passphrase-protected key, bound to the exact content and the policy, and expire.
-- **Agents.** Hooks for Claude Code and Codex seal each agent's declaration, guard risky commands and protected paths, keep parallel agents out of each other's declared scope, run the checks when the agent stops, and write an `AGENTS.md` block so agents know the rules. Each declaration names the agent and an accountable owner.
+- **Agents.** Hooks for Claude Code and Codex seal each agent's declaration, guard risky commands and protected paths, keep parallel agents out of each other's declared scope, run the checks when the agent stops, and write an `AGENTS.md` block so agents know the rules. Subagents are held to the same rules, and each is told them when it starts. Each declaration names the agent and an accountable owner.
+- **Built for long sessions and large changes.** The brief stays one page however big the change: lines added and removed per area, files outside the plan grouped by area, and a Session section that digests hours of agent work into how long it ran, what 05 refused and why, which checks ran along the way, and which subagents took part.
 - **A record you can prove later.** What the agent did (tools, paths and decisions; never contents or prompts) is a hash-chained log, sealed by signed receipts as the work happens and countersigned by CI. It travels with the receipts, so anyone with the repository and the public keys can check it.
 - **Extensible from outside.** A `use05-<name>` program on your PATH is the command `use05 <name>`; any agent can use the generic hook; programs you list hear what happened; other tools can keep their own signed records next to 05's. None of them can change what the gate decides. See [Extending 05](docs/extending.md).
 - **Land and clean up.** `use05 land` moves an allowed change into its target branch as a fast-forward and removes the agent's finished branch and worktree.
@@ -105,6 +107,7 @@ It is not an agent, an agent runner, a code reviewer powered by a model, a sessi
 
 ## Documentation
 
+- [Using 05](docs/guide.md): install, set up, work with agents, read the brief, approve, configure every setting, all commands
 - [Turn on the CI gate](docs/turn-on-the-ci-gate.md) (the strong control)
 - [Receipt format](docs/receipts.md)
 - [Extending 05](docs/extending.md): commands, any agent's hooks, events, your own record types

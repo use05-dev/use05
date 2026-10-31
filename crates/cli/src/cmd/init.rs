@@ -184,25 +184,43 @@ fn policy_template(checks: &[CheckDef]) -> String {
     text
 }
 
+/// Where a project-level npm install keeps its command: `node_modules/.bin` at the top of the
+/// main work tree, found through git so agents' linked worktrees reach it too. Appended to PATH,
+/// so a use05 installed for the whole machine still wins.
+const LOCAL_BIN_PATH: &str = "PATH=\"$PATH:$(git rev-parse --path-format=absolute --git-common-dir)/../node_modules/.bin\"";
+
+/// How hooks call use05: by name, and when this copy was run from a project's `node_modules`
+/// (`npx use05 init`), with that `node_modules/.bin` added to PATH so the hooks find it.
+fn hook_runner() -> String {
+    let local = std::env::current_exe().ok().and_then(|p| p.canonicalize().ok()).is_some_and(|p| p.components().any(|c| c.as_os_str() == "node_modules"));
+    if local { format!("{LOCAL_BIN_PATH} ") } else { String::new() }
+}
+
 fn claude_hook_json() -> Value {
     // The Stop hook may prove the change before the agent finishes (D65), so it gets longer.
-    let hook = |event: &str| json!({ "type": "command", "command": format!("{AGENT_COMMAND_PREFIX}claude-code {event}"), "timeout": if event == "Stop" { 90 } else { 10 } });
+    let run = hook_runner();
+    let hook = |event: &str| json!({ "type": "command", "command": format!("{run}{AGENT_COMMAND_PREFIX}claude-code {event}"), "timeout": if event == "Stop" { 90 } else { 10 } });
     json!({
         "SessionStart": [ { "hooks": [hook("SessionStart")] } ],
         "UserPromptSubmit": [ { "hooks": [hook("UserPromptSubmit")] } ],
         "PreToolUse":   [ { "matcher": "Write|Edit|MultiEdit|NotebookEdit|Bash|Read|Grep|Glob", "hooks": [hook("PreToolUse")] } ],
         "PostToolUse":  [ { "matcher": "Write|Edit|MultiEdit|NotebookEdit|Bash", "hooks": [hook("PostToolUse")] } ],
         "Stop":         [ { "hooks": [hook("Stop")] } ],
+        "SubagentStart": [ { "hooks": [hook("SubagentStart")] } ],
+        "SubagentStop": [ { "hooks": [hook("SubagentStop")] } ],
         "SessionEnd":   [ { "hooks": [hook("SessionEnd")] } ],
     })
 }
 
 fn codex_hook_json() -> Value {
-    let hook = |event: &str| json!({ "type": "command", "command": format!("{AGENT_COMMAND_PREFIX}codex {event}"), "timeout": if event == "Stop" { 90 } else { 10 } });
+    let run = hook_runner();
+    let hook = |event: &str| json!({ "type": "command", "command": format!("{run}{AGENT_COMMAND_PREFIX}codex {event}"), "timeout": if event == "Stop" { 90 } else { 10 } });
     json!({
         "PreToolUse":  [ { "matcher": "^(Bash|shell|apply_patch|Edit|Write)$", "hooks": [hook("PreToolUse")] } ],
         "PostToolUse": [ { "matcher": "^(Bash|shell|apply_patch|Edit|Write)$", "hooks": [hook("PostToolUse")] } ],
         "Stop":        [ { "hooks": [hook("Stop")] } ],
+        "SubagentStart": [ { "hooks": [hook("SubagentStart")] } ],
+        "SubagentStop": [ { "hooks": [hook("SubagentStop")] } ],
     })
 }
 
@@ -416,7 +434,7 @@ pub fn run(args: Args) -> Report {
             Ok(t) if t.contains(HOOK_MARK) => kept.push("the git pre-push hook is already installed".into()),
             Ok(_) => gaps.push(format!("an existing pre-push hook at {} was left alone, so pushes are not checked by 05", hook.display())),
             Err(_) => {
-                let script = format!("#!/bin/sh\n{HOOK_MARK} (installed by `use05 init`; remove with `use05 uninstall`)\ncommand -v use05 >/dev/null 2>&1 || {{ echo \"05: use05 is not on PATH; this push was not checked\" >&2; exit 0; }}\nexec use05 gate --git-hook pre-push \"$@\"\n");
+                let script = format!("#!/bin/sh\n{HOOK_MARK} (installed by `use05 init`; remove with `use05 uninstall`)\n# A project-level npm install is found too; one on PATH comes first.\nexport {LOCAL_BIN_PATH}\ncommand -v use05 >/dev/null 2>&1 || {{ echo \"05: use05 is not on PATH; this push was not checked\" >&2; exit 0; }}\nexec use05 gate --git-hook pre-push \"$@\"\n");
                 let written = fs::create_dir_all(hook.parent().expect("has parent")).and_then(|_| fs::write(&hook, &script));
                 match written {
                     Ok(()) => {

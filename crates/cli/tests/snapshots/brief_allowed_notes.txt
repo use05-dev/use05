@@ -5,8 +5,8 @@ Intent     no goal written
            scope docs/**
            risk low
 
-Outcome    1 file changed on <TREE12> (staged files)
-           (root) (1)
+Outcome    1 file changed on <TREE12> (staged files) · +1 −1
+           (root) · 1 file · +1 −1
            ! outside scope: main.rs
 
 Evidence   ✓ test passed <TIME> signed by this machine (advisory)

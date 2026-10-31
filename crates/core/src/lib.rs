@@ -20,6 +20,7 @@ pub mod org;
 pub mod overlap;
 pub mod policy;
 pub mod risk;
+pub mod session;
 pub mod store;
 pub mod task;
 pub mod time;

@@ -39,13 +39,75 @@ pub fn run(repo: &Path, task: Option<&str>, tree: Option<&str>, fetch: bool, jso
         }
         None => Vec::new(),
     };
-    let brief = build(ctx.task.as_ref(), gate, &target.oid, &target.label, target.base_commit.as_deref(), target.head_commit.as_deref());
+    let mut brief = build(ctx.task.as_ref(), gate, &target.oid, &target.label, target.base_commit.as_deref(), target.head_commit.as_deref());
+    // The session, digested from the task's log as this machine has it, or as it travelled.
+    brief.session = ctx.task.as_ref().and_then(|t| {
+        let found = use05_core::evidence::classify(&ctx.trust, &use05_core::store::find(ctx.top(), &t.id));
+        use05_core::logseal::copy(ctx.top(), Some(&ctx.store.state_dir()), &found, &t.id)
+    }).map(|text| use05_core::session::digest(&text));
     if json {
         println!("{}", serde_json::to_string_pretty(&serde_json::json!({ "v": 1, "command": "brief", "decision": decision.word(), "label": brief.label, "brief": brief, "overlap": overlaps })).expect("brief serialises"));
     } else {
         print!("{}", render(&Ui::stdout(), &brief, ctx.org.as_deref(), &overlaps));
     }
     ExitCode::from(decision.exit_code())
+}
+
+/// 56602 as "56,602".
+fn thousands(n: u64) -> String {
+    let digits = n.to_string();
+    let mut out = String::new();
+    for (i, c) in digits.chars().enumerate() {
+        if i > 0 && (digits.len() - i) % 3 == 0 {
+            out.push(',');
+        }
+        out.push(c);
+    }
+    out
+}
+
+fn files(n: usize) -> String {
+    format!("{} file{}", thousands(n as u64), if n == 1 { "" } else { "s" })
+}
+
+/// At most four rows, whatever the length of the session: its size, what was refused and why,
+/// how the checks went along the way, and the subagents that took part.
+fn session_items(sn: &use05_core::session::Session) -> Vec<Item> {
+    let plural = |n: usize, one: &str, many: &str| format!("{} {}", thousands(n as u64), if n == 1 { one } else { many });
+    let span = if sn.minutes >= 60 { format!("{} h {} min", sn.minutes / 60, sn.minutes % 60) } else { format!("{} min", sn.minutes) };
+    let mut items = Vec::new();
+    // A task worked by hand from the command line has no agent turns or tool calls to count.
+    if sn.turns + sn.tool_calls > 0 {
+        // Files are counted from edit tools; shell commands log no paths, so a zero says nothing.
+        let touched = if sn.files_touched > 0 { format!(" · {} touched", plural(sn.files_touched, "file", "files")) } else { String::new() };
+        items.push(Item::plain(format!("{span} · {} · {}{touched}", plural(sn.turns, "turn", "turns"), plural(sn.tool_calls, "tool call", "tool calls"))));
+    }
+    let total: usize = sn.refused.iter().map(|(_, n)| n).sum();
+    if total > 0 || sn.asked > 0 {
+        let mut parts = Vec::new();
+        if total > 0 {
+            let reasons: Vec<String> = sn.refused.iter().take(4).map(|(why, n)| format!("{why} {n}")).collect();
+            let more = if sn.refused.len() > 4 { format!(", {} other", sn.refused[4..].iter().map(|(_, n)| n).sum::<usize>()) } else { String::new() };
+            parts.push(format!("refused {total}: {}{more}", reasons.join(", ")));
+        }
+        if sn.asked > 0 {
+            parts.push(format!("asked a person {}", sn.asked));
+        }
+        items.push(Item::new(Glyph::Warn, Tone::Warn, parts.join(" · ")));
+    }
+    if !sn.checks.is_empty() {
+        let clauses: Vec<String> = sn.checks.iter().take(3).map(|c| {
+            format!("{} ran {}, failed {}, {}", c.name, c.runs, c.failed, if c.last_passed { "passed last time" } else { "failed last time" })
+        }).collect();
+        let text = format!("checks during the session: {}", clauses.join("; "));
+        items.push(if sn.checks.iter().all(|c| c.last_passed) { Item::dim(text) } else { Item::new(Glyph::Warn, Tone::Warn, text) });
+    }
+    if !sn.subagents.is_empty() {
+        let total: usize = sn.subagents.iter().map(|(_, n)| n).sum();
+        let kinds: Vec<String> = sn.subagents.iter().take(4).map(|(k, n)| format!("{k} {n}")).collect();
+        items.push(Item::dim(format!("subagents {total}: {}", kinds.join(", "))));
+    }
+    items
 }
 
 fn effect_item(f: &Finding) -> Item {
@@ -112,15 +174,21 @@ pub fn render(ui: &Ui, b: &Brief, org: Option<&str>, overlaps: &[use05_core::ove
 
     // Outcome
     let n = b.gate.changed.len();
-    let mut outcome = vec![Item::plain(format!("{n} file{} changed on {}  ({})", if n == 1 { "" } else { "s" }, &b.tree[..12.min(b.tree.len())], b.tree_label))];
-    if !b.areas.is_empty() {
-        outcome.push(Item::dim(b.areas.iter().take(6).map(|(a, c)| format!("{a} ({c})")).collect::<Vec<_>>().join("  ")));
+    let mut outcome = vec![Item::plain(format!("{n} file{} changed on {} ({}) · +{} −{}", if n == 1 { "" } else { "s" }, &b.tree[..12.min(b.tree.len())], b.tree_label, thousands(b.added), thousands(b.removed)))];
+    // One row per area. The renderer joins words with single spaces, so fields are separated
+    // with " · " rather than padded into columns.
+    for a in &b.area_summary {
+        outcome.push(Item::dim(format!("{} · {} · +{} −{}", a.name, files(a.files), thousands(a.added), thousands(a.removed))));
     }
-    for p in b.outside_scope.iter().take(5) {
-        outcome.push(Item::new(Glyph::Warn, Tone::Warn, format!("outside scope: {p}")));
-    }
-    if b.outside_scope.len() > 5 {
-        outcome.push(Item::dim(format!("…and {} more outside scope", b.outside_scope.len() - 5)));
+    if b.outside_scope.len() <= 5 {
+        for p in &b.outside_scope {
+            outcome.push(Item::new(Glyph::Warn, Tone::Warn, format!("outside scope: {p}")));
+        }
+    } else {
+        let k = b.outside_scope.len();
+        let m = b.outside_scope_areas.len();
+        outcome.push(Item::new(Glyph::Warn, Tone::Warn, format!("{} outside the declared scope, in {m} area{}", files(k), if m == 1 { "" } else { "s" })));
+        outcome.push(Item::dim(b.outside_scope_areas.iter().map(|a| format!("{} {}", a.name, a.files)).collect::<Vec<_>>().join(" · ")));
     }
     out.section("Outcome", outcome);
     out.blank();
@@ -187,6 +255,10 @@ pub fn render(ui: &Ui, b: &Brief, org: Option<&str>, overlaps: &[use05_core::ove
         }
     }).collect();
     out.section("Approvals", if approvals.is_empty() { vec![Item::dim("none")] } else { approvals });
+    if let Some(sn) = b.session.as_ref().filter(|sn| sn.tool_calls + sn.turns + sn.checks.len() > 0) {
+        out.blank();
+        out.section("Session", session_items(sn));
+    }
     if let Some(l) = &b.gate.log {
         out.blank();
         let mut items = vec![match (l.altered_at, l.ci_sealed_at, l.hook_seals) {

@@ -877,6 +877,14 @@ fn rerunning_init_brings_an_older_versions_agent_hooks_up_to_date() {
     assert_eq!(ours.len(), 1, "one 05 group, not two: {pre:?}");
     assert!(ours[0]["matcher"].as_str().unwrap().contains("Read|Grep|Glob"), "{pre:?}");
     assert!(pre.iter().any(|g| g.to_string().contains("other-tool check")), "another tool's hook is kept: {pre:?}");
+    // Subagents are briefed and logged too, in Claude Code and in Codex: one 05 group each.
+    let codex: Value = serde_json::from_str(&fs::read_to_string(s.path(".codex/hooks.json")).unwrap()).unwrap();
+    for (name, hooks) in [("claude", &v["hooks"]), ("codex", &codex["hooks"])] {
+        for event in ["SubagentStart", "SubagentStop"] {
+            let groups = hooks[event].as_array().unwrap_or_else(|| panic!("{name} has no {event} hook: {hooks}"));
+            assert_eq!(groups.iter().filter(|g| g.to_string().contains("use05 hook")).count(), 1, "{name} {event}: {groups:?}");
+        }
+    }
 }
 
 #[test]
@@ -2546,4 +2554,200 @@ fn the_ci_workflow_gates_every_pushed_branch_so_a_change_can_land_without_a_pull
     assert!(wf.contains("  push:\n    branches-ignore: [\"05-receipts/**\"]\n"), "{wf}");
     assert!(!wf.contains("branches: [main]"), "pushes to every branch are gated, not only main: {wf}");
     assert!(wf.contains("  pull_request:\n"), "pull requests still work: {wf}");
+}
+
+/// A sandbox with agent hooks whose session `sess-big0001` has sealed a declaration with this scope.
+fn with_sealed_scope(scope: &str) -> Sandbox {
+    let s = Sandbox::with_agent_hooks();
+    declare(&s, "sess-big0001", "Rewrite billing", scope);
+    assert_eq!(task_json(&s, "sess-big0001")["intent"]["scope"]["include"][0], scope);
+    s
+}
+
+/// `n` files of `lines` lines each under `dir`.
+fn write_many(s: &Sandbox, dir: &str, n: usize, lines: usize) {
+    fs::create_dir_all(s.path(dir)).unwrap();
+    let body: String = (0..lines).map(|i| format!("line {i}\n")).collect();
+    for i in 0..n {
+        s.write(&format!("{dir}/f{i}.rs"), &body);
+    }
+}
+
+#[test]
+fn a_large_change_gets_a_bounded_brief_grouped_by_area() {
+    let s = with_sealed_scope("src/billing/**");
+    write_many(&s, "src/billing", 300, 100);
+    write_many(&s, "src/ui", 120, 10);
+    s.git(&["add", "-A"]);
+    let brief = s.run(&["brief"]);
+    let out = text(&brief);
+    assert!(out.lines().count() < 60, "{out}");
+    assert!(out.contains("src/billing/") && out.contains("src/ui/"), "{out}");
+    assert!(out.contains("120 files outside the declared scope"), "{out}");
+    assert!(out.contains("+31,"), "a comma-grouped total: {out}");
+    let v = json(&s.run(&["brief", "--json"]));
+    assert!(v["brief"]["added"].as_u64().unwrap() > 30_000, "{v}");
+    assert_eq!(v["brief"]["outside_scope_areas"][0]["name"], "src/ui/");
+    // `areas` keeps the shape 0.0.2 printed, [name, files] by top-level folder; the detail is new.
+    assert_eq!(v["brief"]["areas"][0], serde_json::json!(["src", 420]), "{}", v["brief"]["areas"]);
+    assert_eq!(v["brief"]["area_summary"][0]["name"], "src/billing/");
+}
+
+#[test]
+fn every_refusal_in_the_log_says_why() {
+    let s = Sandbox::with_agent_hooks();
+    let policy = fs::read_to_string(s.path(".05/policy.toml")).unwrap();
+    s.write(".05/policy.toml", &policy.replacen("[protect]\n", "[protect]\nno_read = [\".env*\"]\n", 1));
+    s.write(".env", "TOKEN=x\n");
+    s.commit_all("do not read .env");
+    declare(&s, "sess-why0001", "Billing", "src/**");
+    let hook = |tool: &str, input: Value| {
+        let payload = serde_json::json!({ "session_id": "sess-why0001", "cwd": s.dir.path(), "hook_event_name": "PreToolUse", "tool_name": tool, "tool_input": input }).to_string();
+        s.run_with_stdin(&["hook", "claude-code", "PreToolUse"], &payload)
+    };
+    hook("Bash", serde_json::json!({ "command": "git push --force origin main" }));
+    hook("Read", serde_json::json!({ "file_path": s.path(".env") }));
+    hook("Edit", serde_json::json!({ "file_path": s.path(".05/policy.toml"), "old_string": "a", "new_string": "b" }));
+    hook("Edit", serde_json::json!({ "file_path": s.path("docs/x.md"), "old_string": "a", "new_string": "b" }));
+    let whys: Vec<String> = log_text(&s, "sess-why0001")
+        .lines()
+        .filter_map(|l| serde_json::from_str::<Value>(l).ok())
+        .map(|l| l["event"].clone())
+        .filter(|e| e["event"] == "tool" && (e["decision"] == "deny" || e["decision"] == "ask"))
+        .map(|e| e["why"].as_str().unwrap_or("(none)").to_string())
+        .collect();
+    assert_eq!(whys, ["risky command", "do not read", "protected path", "outside scope"]);
+}
+
+fn subagent_hook(s: &Sandbox, event: &str, extra: Value) -> Output {
+    let mut payload = serde_json::json!({ "session_id": "sess-sub0001", "cwd": s.dir.path(), "hook_event_name": event });
+    for (k, v) in extra.as_object().unwrap() {
+        payload[k] = v.clone();
+    }
+    s.run_with_stdin(&["hook", "claude-code", event], &payload.to_string())
+}
+
+#[test]
+fn a_subagent_is_briefed_on_the_rules_when_it_starts() {
+    let s = Sandbox::with_agent_hooks();
+    declare(&s, "sess-sub0001", "Billing", "src/billing/**");
+    let out = subagent_hook(&s, "SubagentStart", serde_json::json!({ "agent_id": "a-1", "agent_type": "Explore" }));
+    let v: Value = serde_json::from_slice(&out.stdout).unwrap_or(Value::Null);
+    assert_eq!(v["hookSpecificOutput"]["hookEventName"], "SubagentStart", "{}", text(&out));
+    let context = v["hookSpecificOutput"]["additionalContext"].as_str().unwrap_or("");
+    assert!(context.contains("Protected paths need a person's approval") && context.contains("src/billing/**"), "{context}");
+}
+
+#[test]
+fn a_codex_subagent_is_briefed_on_the_rules_too() {
+    let s = Sandbox::with_agent_hooks();
+    declare(&s, "sess-sub0001", "Billing", "src/billing/**");
+    let payload = serde_json::json!({ "session_id": "sess-sub0001", "cwd": s.dir.path(), "hook_event_name": "SubagentStart", "agent_id": "c-1", "agent_type": "worker" }).to_string();
+    let out = s.run_with_stdin(&["hook", "codex", "SubagentStart"], &payload);
+    assert!(context_of(&out).contains("src/billing/**"), "{}", text(&out));
+}
+
+#[test]
+fn subagent_actions_are_logged_under_the_parent_task_with_their_agent() {
+    let s = Sandbox::with_agent_hooks();
+    declare(&s, "sess-sub0001", "Billing", "src/**");
+    let edit = |path: &str| serde_json::json!({ "tool_name": "Edit", "tool_input": { "file_path": s.path(path), "old_string": "a", "new_string": "b" } });
+    subagent_hook(&s, "PreToolUse", edit("src/main.rs"));
+    let mut sub = edit("src/lib.rs");
+    sub["agent_id"] = serde_json::json!("a-1");
+    sub["agent_type"] = serde_json::json!("Explore");
+    subagent_hook(&s, "PreToolUse", sub);
+    subagent_hook(&s, "SubagentStop", serde_json::json!({ "agent_id": "a-1", "agent_type": "Explore", "stop_hook_active": false, "last_assistant_message": "listed it" }));
+    assert_eq!(fs::read_dir(s.path(".git/05/tasks")).unwrap().count(), 1, "one task for the session and its subagent");
+    let events: Vec<Value> = log_text(&s, "sess-sub0001").lines().filter_map(|l| serde_json::from_str::<Value>(l).ok()).map(|l| l["event"].clone()).collect();
+    let tool = |path: &str| events.iter().find(|e| e["event"] == "tool" && e["paths"][0] == path).cloned().unwrap_or(Value::Null);
+    assert!(tool("src/main.rs")["agent_id"].is_null(), "{events:?}");
+    assert_eq!(tool("src/lib.rs")["agent_id"], "a-1", "{events:?}");
+    assert_eq!(tool("src/lib.rs")["agent_type"], "Explore", "{events:?}");
+    let stop = events.iter().find(|e| e["event"] == "subagent_stop").unwrap_or_else(|| panic!("no subagent_stop: {events:?}"));
+    assert_eq!(stop["agent_id"], "a-1");
+}
+
+#[test]
+fn the_brief_digests_the_session() {
+    let s = Sandbox::with_agent_hooks();
+    declare(&s, "sess-dig0001", "Billing", "src/**");
+    let hook = |event: &str, extra: Value| {
+        let mut payload = serde_json::json!({ "session_id": "sess-dig0001", "cwd": s.dir.path(), "hook_event_name": event });
+        for (k, v) in extra.as_object().unwrap() {
+            payload[k] = v.clone();
+        }
+        s.run_with_stdin(&["hook", "claude-code", event], &payload.to_string())
+    };
+    hook("PreToolUse", serde_json::json!({ "tool_name": "Bash", "tool_input": { "command": "git push --force origin main" } }));
+    hook("PreToolUse", serde_json::json!({ "tool_name": "Edit", "tool_input": { "file_path": s.path("src/a.rs"), "old_string": "a", "new_string": "b" }, "agent_id": "a-1", "agent_type": "Explore" }));
+    hook("Stop", serde_json::json!({ "stop_hook_active": false, "last_assistant_message": "Done." }));
+    let id = find_task(&s, "sess-dig0001");
+    let brief = s.run(&["brief", "--task", &id]);
+    let out = text(&brief);
+    assert!(out.contains("Session") && out.contains("refused 1: risky command 1") && out.contains("subagents 1: Explore 1"), "{out}");
+    // Work done through the shell has no paths in the log, so "0 files touched" would mislead.
+    assert!(!out.contains("0 files touched"), "{out}");
+    let v = json(&s.run(&["brief", "--task", &id, "--json"]));
+    assert!(v["brief"]["session"]["tool_calls"].as_u64().unwrap_or(0) >= 2, "{v}");
+}
+
+#[test]
+fn a_fifty_thousand_line_change_briefs_in_seconds_and_stays_bounded() {
+    let s = with_sealed_scope("src/billing/**");
+    // 700 files and 50,000 lines over six areas; 150 files land outside the declared scope.
+    for (dir, n) in [("src/billing", 300), ("src/billing/retry", 100), ("src/billing/ledger", 150), ("src/ui", 80), ("src/auth", 40), ("tests", 30)] {
+        write_many(&s, dir, n, 72);
+    }
+    s.git(&["add", "-A"]);
+    let started = std::time::Instant::now();
+    let brief = s.run(&["brief"]);
+    let took = started.elapsed();
+    let out = text(&brief);
+    assert!(took < std::time::Duration::from_secs(5), "took {took:?}");
+    assert!(out.lines().count() < 60, "{} lines:\n{out}", out.lines().count());
+    assert!(out.contains("150 files outside the declared scope"), "{out}");
+    let v = json(&s.run(&["brief", "--json"]));
+    assert!(v["brief"]["added"].as_u64().unwrap() >= 50_000, "{}", v["brief"]["added"]);
+}
+
+#[test]
+fn a_project_level_npm_install_writes_hooks_that_find_it() {
+    let s = Sandbox::new();
+    fs::create_dir_all(s.path(".claude")).unwrap();
+    s.write("package.json", "{\"scripts\":{\"test\":\"./test.sh\"}}\n");
+    // Laid out as npm does: the platform package's binary, linked from node_modules/.bin.
+    let pkg = s.path("node_modules/@use05/cli-test/bin");
+    fs::create_dir_all(&pkg).unwrap();
+    fs::copy(BIN, pkg.join("use05")).unwrap();
+    fs::create_dir_all(s.path("node_modules/.bin")).unwrap();
+    std::os::unix::fs::symlink("../@use05/cli-test/bin/use05", s.path("node_modules/.bin/use05")).unwrap();
+    s.write(".gitignore", "node_modules/\n");
+    s.commit_all("first");
+    // No use05 on PATH: only git and the shell.
+    let git_dir = std::env::var("PATH").unwrap().split(':').find(|d| Path::new(d).join("git").is_file()).unwrap().to_string();
+    let path = format!("/usr/bin:/bin:{git_dir}");
+    let local = |program: &str, args: &[&str]| {
+        let mut cmd = Command::new(program);
+        cmd.current_dir(s.dir.path()).args(args).env_clear().env("PATH", &path).env("HOME", s.home.path()).env("USE05_HOME", s.home.path()).env("LANG", "C.UTF-8");
+        if let Ok(d) = std::env::var("DEVELOPER_DIR") {
+            cmd.env("DEVELOPER_DIR", d);
+        }
+        cmd
+    };
+    let init = local(s.path("node_modules/.bin/use05").to_str().unwrap(), &["init"]).stdin(Stdio::null()).output().unwrap();
+    assert_eq!(code(&init), 0, "{}", text(&init));
+
+    let settings: Value = serde_json::from_str(&fs::read_to_string(s.path(".claude/settings.local.json")).unwrap()).unwrap();
+    let command = settings["hooks"]["PreToolUse"][0]["hooks"][0]["command"].as_str().unwrap().to_string();
+    assert!(command.contains("node_modules/.bin") && command.contains("use05 hook claude-code PreToolUse"), "{command}");
+    // The hook, run the way the agent runs it, finds the project's copy and refuses a force push.
+    let payload = serde_json::json!({ "session_id": "sess-npm0001", "cwd": s.dir.path(), "hook_event_name": "PreToolUse", "tool_name": "Bash", "tool_input": { "command": "git push --force origin main" } }).to_string();
+    let mut child = local("/bin/sh", &["-c", &command]).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().unwrap();
+    std::io::Write::write_all(&mut child.stdin.take().unwrap(), payload.as_bytes()).unwrap();
+    let out = child.wait_with_output().unwrap();
+    assert!(text(&out).contains("\"deny\""), "{}", text(&out));
+    // The pre-push hook finds it too.
+    let pre_push = fs::read_to_string(s.path(".git/hooks/pre-push")).unwrap();
+    assert!(pre_push.contains("node_modules/.bin"), "{pre_push}");
 }
