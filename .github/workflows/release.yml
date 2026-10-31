@@ -1,0 +1,67 @@
+name: release
+
+# Push a tag like v0.1.0 to build static binaries, checksums and a draft release.
+# Run it by hand (Actions, release, Run workflow) to build everything without publishing.
+on:
+  push:
+    tags: ["v*"]
+    branches: [release-check]   # push this branch to build everything without publishing
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: build (${{ matrix.target }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: ubuntu-latest, target: x86_64-unknown-linux-musl }
+          - { os: ubuntu-latest, target: aarch64-unknown-linux-musl, cross: aarch64-linux-gnu-gcc }
+          - { os: macos-latest, target: aarch64-apple-darwin }
+          - { os: macos-latest, target: x86_64-apple-darwin }
+    steps:
+      - uses: actions/checkout@v4
+      - name: Toolchain
+        run: rustup update stable && rustup target add ${{ matrix.target }}
+      - name: Linux tooling
+        if: runner.os == 'Linux'
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq musl-tools gcc-aarch64-linux-gnu
+      - name: Build
+        env:
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER: aarch64-linux-gnu-gcc
+        run: cargo build --release -p use05 --target ${{ matrix.target }}
+      - name: Smoke test
+        if: matrix.target != 'aarch64-unknown-linux-musl' && matrix.target != 'x86_64-apple-darwin'
+        run: target/${{ matrix.target }}/release/use05 --version
+      - name: Package
+        run: |
+          V=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n 1)
+          if [ "$GITHUB_REF_TYPE" = tag ] && [ "${GITHUB_REF_NAME#v}" != "$V" ]; then echo "::error::tag $GITHUB_REF_NAME does not match version $V in Cargo.toml"; exit 1; fi
+          D="use05-$V-${{ matrix.target }}"
+          mkdir "$D" && cp "target/${{ matrix.target }}/release/use05" LICENSE* README.md "$D/" 2>/dev/null || cp "target/${{ matrix.target }}/release/use05" "$D/"
+          tar czf "$D.tar.gz" "$D"
+          (command -v sha256sum >/dev/null && sha256sum "$D.tar.gz" || shasum -a 256 "$D.tar.gz") > "$D.tar.gz.sha256"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.target }}
+          path: use05-*.tar.gz*
+
+  release:
+    needs: build
+    if: github.ref_type == 'tag'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Checksums
+        run: cd dist && cat *.sha256 > SHA256SUMS && ls -l
+      - name: Draft release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "$GITHUB_REF_NAME" dist/* --repo "$GITHUB_REPOSITORY" --draft --title "$GITHUB_REF_NAME" --notes "Static binaries for Linux and macOS. Verify with SHA256SUMS."

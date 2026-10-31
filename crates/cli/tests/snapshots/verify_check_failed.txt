@@ -1,0 +1,8 @@
+✗ Valid receipt, but the check it records did not pass
+  receipt  r.json
+  signed   key <TREE12> (the key you supplied)
+  command  sh -c 'echo broken >&2; exit 3'
+  result   FAILED (exit 3) in <TIME>
+  tree     <TREE12> (not checked)
+  created  <TIMESTAMP> (the signer's clock; not trusted)
+  Pass --tree <revision> to check the receipt against a tree.

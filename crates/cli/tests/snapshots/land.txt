@@ -1,0 +1,6 @@
+✓ Landed: Fix it
+  landed   claude/fix → main (<TREE12>)
+  removed  worktree <WORKTREES>/claude-fix
+  deleted  branch claude/fix
+
+Next: push main when you are ready: git push origin main

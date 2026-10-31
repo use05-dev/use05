@@ -1,0 +1,18 @@
+[package]
+name = "use05-runner"
+description = "Runs a check on an exact git tree and builds the evidence statement."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+use05-receipt = { path = "../receipt" }
+hex = "0.4"
+libc = "0.2"
+sha2 = "0.10"
+tempfile = "3"
+
+[dev-dependencies]
+serde_json = "1"

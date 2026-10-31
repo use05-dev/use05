@@ -1,0 +1,13 @@
+✗ 1 of 1 check did not pass. The receipt says so.
+  command   sh -c 'echo broken >&2; exit 3'
+  result    FAILED (exit 3) in <TIME>
+  tree      <TREE12> (staged files)
+  receipts  branch 05-receipts/<ID>
+  signed    <TREE12> (key file, not in your trusted keys)
+  Advisory: a key on this machine can be used by an agent running as you. Authoritative evidence
+  is produced in CI.
+
+  last output (shown here only; not in the receipt):
+  │ broken
+
+Next: fix what failed, then: use05 prove

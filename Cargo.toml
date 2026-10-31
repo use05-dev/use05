@@ -1,0 +1,10 @@
+[workspace]
+resolver = "3"
+members = ["crates/receipt", "crates/runner", "crates/core", "crates/cli"]
+
+[workspace.package]
+version = "0.0.1"
+edition = "2024"
+license = "Apache-2.0"
+repository = "https://github.com/use05-dev/use05"
+publish = false

@@ -1,0 +1,5 @@
+✓ Created key <ID>
+  secret  me.key (keep this private)
+  public  me.key.pub (share this)
+  For CI: store the secret as USE05_RUNNER_KEY, then trust the public key with role = "runner" in
+  .05/policy.toml.

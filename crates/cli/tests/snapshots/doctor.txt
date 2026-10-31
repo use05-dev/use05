@@ -1,0 +1,26 @@
+Doctor  <REPO>                                                                       use05 0.0.1
+────────────────────────────────────────────────────────────────────────────────────────────────────
+Setup      ✓ git <VERSION>
+           ✓ repository <DIR>
+           ✓ .05/policy.toml is valid (1 check)
+           ✓ no organisation policy pinned on this machine
+
+Keys       ✓ local key <ID>: signs evidence here. Advisory: any process you run can use
+             it
+           ! no approver key; you cannot approve changes from this machine
+
+Controls   ! Claude Code hooks off. Agent sessions are not guarded or recorded. `use05 init` adds
+             them
+           ! Codex hooks off
+           ✓ pre-push hook on. Advisory: `git push --no-verify` skips it
+           ! CI gate none. Without it, nothing here is stronger than advisory. `use05 init --ci
+             github`
+           ✓ evidence policy accepts local and runner receipts. Local ones are advisory
+           ✓ AGENTS.md tells agents how 05 works in this repository
+
+Record     ✓ receipts none stored yet
+           ✓ record 0 tasks, 0 active. Logs are intact. This is a forensic aid, not a seal
+
+────────────────────────────────────────────────────────────────────────────────────────────────────
+✓ working. 4 things are not set up, shown above
+Next: use05 key new --approver

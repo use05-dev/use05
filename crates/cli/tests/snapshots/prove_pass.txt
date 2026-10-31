@@ -1,0 +1,10 @@
+✓ Proved: the check passed
+  command   ./test.sh
+  result    passed in <TIME>
+  tree      <TREE12> (staged files)
+  receipts  branch 05-receipts/<ID>
+  signed    <TREE12> (key file, not in your trusted keys)
+  Advisory: a key on this machine can be used by an agent running as you. Authoritative evidence
+  is produced in CI.
+
+Next: use05 brief

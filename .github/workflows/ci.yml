@@ -1,0 +1,56 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Toolchain
+        run: rustup update stable && rustc --version && git --version
+
+      - name: Tests
+        run: cargo test --workspace --release
+
+      - name: Prove and verify on the CI runner (a different launcher)
+        run: |
+          cargo build --release -p use05
+          U="$PWD/target/release/use05"
+          $U key new "$RUNNER_TEMP/ci.key"
+          $U prove --key "$RUNNER_TEMP/ci.key" --tree HEAD --out "$RUNNER_TEMP/receipt.json" -- sh -c 'test -f Cargo.toml'
+          $U verify "$RUNNER_TEMP/receipt.json" --key "$RUNNER_TEMP/ci.key.pub" --tree HEAD
+
+      - name: An independent DSSE implementation agrees
+        if: runner.os == 'Linux'
+        run: |
+          python3 -m venv "$RUNNER_TEMP/venv"
+          "$RUNNER_TEMP/venv/bin/pip" install -q "securesystemslib[crypto]"
+          USE05_BIN="$PWD/target/release/use05" "$RUNNER_TEMP/venv/bin/python" tools/interop.py
+
+      - name: The installer works against a local release
+        if: runner.os == 'Linux'
+        run: tools/test-install.sh "$PWD/target/release/use05"
+
+      - name: The npm packages install and run
+        run: npm/test.sh "$PWD/target/release/use05"
+
+  static-linux:
+    name: static linux build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup update stable && rustup target add x86_64-unknown-linux-musl && sudo apt-get install -y -qq musl-tools
+      - run: cargo build --release -p use05 --target x86_64-unknown-linux-musl
+      - run: file target/x86_64-unknown-linux-musl/release/use05 | grep -q "statically linked\|static-pie"

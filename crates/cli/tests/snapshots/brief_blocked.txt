@@ -1,0 +1,29 @@
+Brief  Tighten the policy                                                              task <TASK>
+────────────────────────────────────────────────────────────────────────────────────────────────────
+Intent     no goal written
+           owner no owner yet (no approver key when this task started, and nobody has signed)
+           scope .05/**
+           risk high
+
+Outcome    1 file changed on <TREE12> (staged files)
+           .05 (1)
+
+Evidence   ✓ test passed <TIME> signed by this machine (advisory)
+
+Drift      ! PROTECTED_PATH 1 protected file(s) changed; the change edits 05's own rules, which only
+             take effect after it is merged
+
+Approvals  none
+
+Log        anchored by this machine at 1 point(s), last at line 1 of 2; not yet sealed by CI
+
+Unknowns   · 05 shows what was checked. It does not judge whether the change is correct.
+           · every passing check was signed only by a key on this machine, so it is advisory
+
+Undo       git stash push (keeps your work; nothing is deleted)
+
+────────────────────────────────────────────────────────────────────────────────────────────────────
+! APPROVAL REQUIRED  1 thing holds this change back
+  1. 1 protected file(s) changed; the change edits 05's own rules, which only take effect after it
+     is merged
+     → use05 approve --outcome

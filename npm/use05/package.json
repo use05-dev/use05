@@ -1,0 +1,17 @@
+{
+  "name": "use05",
+  "version": "0.0.0",
+  "description": "05: the acceptance layer for AI-written code. Prove and verify what agents did.",
+  "license": "Apache-2.0",
+  "homepage": "https://use05.dev",
+  "repository": { "type": "git", "url": "git+https://github.com/use05-dev/use05.git" },
+  "bin": { "use05": "bin/use05.js" },
+  "files": ["bin/use05.js", "README.md"],
+  "engines": { "node": ">=18" },
+  "optionalDependencies": {
+    "@use05/cli-darwin-arm64": "0.0.0",
+    "@use05/cli-darwin-x64": "0.0.0",
+    "@use05/cli-linux-arm64": "0.0.0",
+    "@use05/cli-linux-x64": "0.0.0"
+  }
+}

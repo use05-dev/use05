@@ -1,0 +1,1 @@
+{"hookSpecificOutput":{"hookEventName":"PreToolUse","permissionDecision":"deny","permissionDecisionReason":"05: .05/policy.toml is protected. A person must approve the intent first: ask the user to run `use05 approve --intent` (it needs their approver passphrase)."}}

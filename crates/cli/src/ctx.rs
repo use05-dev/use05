@@ -1,0 +1,203 @@
+//! What every command needs: the repository, the current task, the rules that apply to it
+//! (read from the change's base), the organisation floor, and the keys we trust.
+
+use std::path::Path;
+
+use use05_core::evidence::Trust;
+use use05_core::gate::{GateInput, GateResult, evaluate};
+use use05_core::policy::{POLICY_PATH, Policy};
+use use05_core::task::{Store, Task};
+use use05_core::time::now_secs;
+use use05_core::{Error, Result, git, org};
+
+pub struct Ctx {
+    pub store: Store,
+    pub task: Option<Task>,
+    /// The repository's own policy, before any organisation floor.
+    pub repo_policy: Policy,
+    /// What actually applies: the repository's policy, tightened by the organisation.
+    pub policy: Policy,
+    pub org: Option<String>,
+    pub trust: Trust,
+}
+
+pub struct Target {
+    pub oid: String,
+    pub digest: String,
+    /// How to describe it to a person.
+    pub label: String,
+    pub base_tree: Option<String>,
+    pub base_commit: Option<String>,
+    pub head_commit: Option<String>,
+}
+
+impl Ctx {
+    pub fn top(&self) -> &Path {
+        &self.store.dirs.top
+    }
+
+    pub fn open(repo: &Path, task_id: Option<&str>) -> Result<Ctx> {
+        Ctx::open_with(repo, task_id, None)
+    }
+
+    /// Like [`Ctx::open`], but read the rules from `policy_rev` (a commit). Gating a push or a
+    /// pull request passes the change's base here, so a change cannot loosen its own rules. In
+    /// that case a base with no policy means defaults, never the change's own file.
+    pub fn open_with(repo: &Path, task_id: Option<&str>, policy_rev: Option<&str>) -> Result<Ctx> {
+        let store = Store::open(repo)?;
+        let task = match task_id {
+            Some(id) => Some(store.load(id)?),
+            None => store.current(),
+        };
+        let top = store.dirs.top.clone();
+        let strict = policy_rev.is_some();
+        let base = policy_rev.map(str::to_string).or_else(|| task.as_ref().and_then(|t| t.base_commit.clone())).or_else(|| git::head_commit(&top));
+        // A change's rules come from its base. If there is no committed policy yet, fall back to
+        // the working file so a fresh `init` works before its first commit.
+        let from_base = match &base {
+            Some(rev) => Policy::load_at(&top, rev)?,
+            None => None,
+        };
+        let repo_policy = match from_base {
+            Some(p) => p,
+            None if strict => Policy::default(),
+            None => Policy::load_file(&top.join(POLICY_PATH))?.unwrap_or_default(),
+        };
+        let mut policy = repo_policy.clone();
+        let org = match org::load()? {
+            Some((name, floor)) => {
+                policy.tighten(&floor);
+                Some(name)
+            }
+            None => None,
+        };
+        let trust = Trust::new(&policy, true);
+        Ok(Ctx { store, task, repo_policy, policy, org, trust })
+    }
+
+    /// Resolve what to look at: `index` (staged files) or any commit or tree.
+    pub fn target(&self, spec: Option<&str>) -> Result<Target> {
+        let top = self.top();
+        let spec = spec.unwrap_or_else(|| git::default_spec(top));
+        let oid = git::resolve_tree(top, spec)?;
+        let digest = tree_digest(top, &oid)?;
+        let head_commit = git::head_commit(top);
+        let (base_tree, base_commit) = match &self.task {
+            Some(t) if !t.base_tree.is_empty() => (Some(t.base_tree.clone()), t.base_commit.clone()),
+            _ => default_base(top, spec),
+        };
+        let label = match spec {
+            "index" => "staged files".to_string(),
+            "worktree" => "working tree".to_string(),
+            other => other.to_string(),
+        };
+        Ok(Target { oid, digest, label, base_tree, base_commit, head_commit })
+    }
+
+    /// Like [`Ctx::target`] for a commit, measured against an explicit base commit.
+    pub fn target_from(&self, spec: &str, base_commit: Option<&str>) -> Result<Target> {
+        let mut t = self.target(Some(spec))?;
+        let top = self.top();
+        t.base_commit = base_commit.map(str::to_string);
+        t.base_tree = base_commit.and_then(|c| git::resolve_tree(top, c).ok());
+        Ok(t)
+    }
+
+    pub fn gate(&self, target: &Target) -> Result<GateResult> {
+        let late = self.task.as_ref().map(|t| use05_core::task::declared_late(&self.store, t)).unwrap_or_default();
+        let log = self.task.as_ref().and_then(|t| {
+            let found = use05_core::evidence::classify(&self.trust, &use05_core::store::find(self.top(), &t.id));
+            use05_core::logseal::check(self.top(), Some(&self.store.state_dir()), &found, &t.id)
+        });
+        let overlaps = match &self.task {
+            Some(t) => {
+                let changed: Vec<String> = git::changed(self.top(), target.base_tree.as_deref(), &target.oid)?.into_iter().map(|c| c.path).collect();
+                let idle = u64::from(self.policy.drift.reservation_idle_hours) * 3600;
+                use05_core::overlap::unmerged(&self.store, self.top(), t, &changed, target.base_commit.as_deref(), idle, now_secs())
+            }
+            None => Vec::new(),
+        };
+        evaluate(&GateInput {
+            top: self.top(),
+            policy: &self.policy,
+            trust: &self.trust,
+            task: self.task.as_ref(),
+            base_tree: target.base_tree.as_deref(),
+            target_tree: &target.oid,
+            target_digest: &target.digest,
+            now: now_secs(),
+            late: &late,
+            overlaps: &overlaps,
+            log: log.as_ref(),
+        })
+    }
+}
+
+/// With no task, what is this change relative to? Staged files: HEAD. A commit: where its branch
+/// forked from upstream, else its parent.
+fn default_base(top: &Path, spec: &str) -> (Option<String>, Option<String>) {
+    let tree = |c: &str| git::resolve_tree(top, c).ok();
+    if spec == "index" || spec == "worktree" {
+        let head = git::head_commit(top);
+        return (head.as_deref().and_then(tree), head);
+    }
+    let Some(commit) = git::resolve_commit(top, spec) else { return (None, None) };
+    let upstream = ["@{upstream}", "origin/HEAD", "origin/main", "origin/master"].iter().find_map(|u| git::resolve_commit(top, u));
+    let base = upstream
+        .and_then(|u| git::merge_base(top, &u, &commit))
+        .filter(|b| *b != commit)
+        .or_else(|| git::resolve_commit(top, &format!("{spec}^")));
+    (base.as_deref().and_then(tree), base)
+}
+
+
+impl Ctx {
+    /// Has a person approved this task's current intent card, under the current rules?
+    pub fn intent_approved(&self) -> bool {
+        use use05_core::evidence::classify;
+        use use05_core::time::{now_secs, parse_rfc3339};
+        use use05_receipt::{ApprovalScope, Decision};
+        let Some(task) = &self.task else { return false };
+        let Some(digest) = &task.intent_sha256 else { return false };
+        let found = classify(&self.trust, &use05_core::store::find(self.top(), digest));
+        let policy = self.policy.digest();
+        let now = now_secs();
+        let mut ids: Vec<&str> = found
+            .approvals
+            .iter()
+            .filter(|a| {
+                let p = &a.statement.predicate;
+                p.scope == ApprovalScope::Intent
+                    && p.decision == Decision::Approve
+                    && a.statement.intent_subject() == Some(digest.as_str())
+                    && p.task == task.id
+                    && p.policy_sha256 == policy
+                    && parse_rfc3339(&p.expires).is_some_and(|t| t > now)
+            })
+            .map(|a| a.signer.key_id.as_str())
+            .collect();
+        ids.sort();
+        ids.dedup();
+        ids.len() as u32 >= self.policy.approvals.min
+    }
+}
+
+/// The SHA-256 of a tree's content. A tree id fixes its content inside one repository (git itself
+/// relies on that), so the digest is computed once per tree and kept in the repository's 05 state,
+/// which makes `brief`, `status` and the gate cost the same on a huge repository as on a small one.
+fn tree_digest(top: &Path, oid: &str) -> Result<String> {
+    let dir = git::dirs(top)?.common.join("05").join("digests");
+    let cached = dir.join(oid);
+    if let Ok(text) = std::fs::read_to_string(&cached) {
+        let text = text.trim();
+        if text.len() == 64 && text.chars().all(|c| c.is_ascii_hexdigit()) {
+            return Ok(text.to_string());
+        }
+    }
+    let identity = use05_runner::identify(top, oid).map_err(|e| Error::new(e.code(), e.to_string()))?;
+    // Best effort: a read-only repository just recomputes next time.
+    if std::fs::create_dir_all(&dir).is_ok() {
+        let _ = std::fs::write(&cached, &identity.sha256);
+    }
+    Ok(identity.sha256)
+}

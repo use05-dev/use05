@@ -1,0 +1,59 @@
+name: npm
+
+# When a release is published (not drafted), put its binaries on npm: one @use05/cli-<os>-<cpu>
+# package per platform, then the use05 package that runs the right one. It publishes with npm
+# trusted publishing (OIDC from this workflow, no stored token) once each package names this
+# repository and workflow as its trusted publisher on npmjs.com. Until then, the very first publish
+# can use an NPM_TOKEN secret. Run it by hand with "dry run" to build and pack without publishing.
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag, like v0.1.0"
+        required: true
+      dry_run:
+        description: "Build and pack only"
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+  id-token: write   # npm provenance: each package says which workflow run built it
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          registry-url: https://registry.npmjs.org
+      - name: npm with trusted publishing
+        run: npm install -g npm@latest
+      - name: Download the release's binaries
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.event.release.tag_name || inputs.tag }}
+        run: gh release download "$TAG" --repo "$GITHUB_REPOSITORY" --pattern 'use05-*.tar.gz*' --dir dist
+      - name: Build the packages
+        env:
+          TAG: ${{ github.event.release.tag_name || inputs.tag }}
+        run: |
+          V="${TAG#v}"
+          npm/build.sh "$V" dist out
+          test -d out/cli-linux-x64 && test -d out/cli-linux-arm64 && test -d out/cli-darwin-arm64 && test -d out/cli-darwin-x64 \
+            || { echo "::error::every platform's binary must be in the release before anything is published"; exit 1; }
+      - name: Publish
+        env:
+          # Only for a first publish before trusted publishing is set up; empty otherwise.
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+          DRY: ${{ github.event_name == 'workflow_dispatch' && inputs.dry_run }}
+        run: |
+          flags="--access public --provenance"
+          [ "$DRY" = true ] && flags="$flags --dry-run"
+          # Platform packages first, so the use05 package never points at one that is not there.
+          for d in out/cli-*; do npm publish "$d" $flags; done
+          npm publish out/use05 $flags

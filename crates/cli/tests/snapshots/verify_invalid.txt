@@ -1,0 +1,4 @@
+✗ Invalid: the signature does not match this receipt and the key you supplied
+  receipt  edited.json
+
+Next: do not trust this receipt; ask for a fresh one, and check you are using the right public key

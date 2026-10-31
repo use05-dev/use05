@@ -1,0 +1,27 @@
+[package]
+name = "use05"
+description = "05: prove and verify what agents did."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "use05"
+path = "src/main.rs"
+
+[dependencies]
+use05-receipt = { path = "../receipt" }
+use05-runner = { path = "../runner" }
+use05-core = { path = "../core" }
+clap = { version = "4", default-features = false, features = ["std", "derive", "help", "usage", "error-context"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+hex = "0.4"
+sha2 = "0.10"
+toml = "0.8"
+
+[dev-dependencies]
+tempfile = "3"
+libc = "0.2"

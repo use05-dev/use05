@@ -1,0 +1,4 @@
+✗ Malformed: the receipt ends too soon; it looks cut short
+  receipt  cut.json
+
+Next: check you passed the receipt file or ref, and that it was not cut short

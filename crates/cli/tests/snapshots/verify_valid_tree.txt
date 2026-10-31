@@ -1,0 +1,7 @@
+✓ Valid: the signature checks out
+  receipt  r.json
+  signed   key <TREE12> (the key you supplied)
+  command  ./test.sh
+  result   passed in <TIME>
+  tree     <TREE12> matches index
+  created  <TIMESTAMP> (the signer's clock; not trusted)

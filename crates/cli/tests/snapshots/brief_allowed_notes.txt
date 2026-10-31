@@ -1,0 +1,27 @@
+Brief  Docs only                                                                       task <TASK>
+────────────────────────────────────────────────────────────────────────────────────────────────────
+Intent     no goal written
+           owner no owner yet (no approver key when this task started, and nobody has signed)
+           scope docs/**
+           risk low
+
+Outcome    1 file changed on <TREE12> (staged files)
+           (root) (1)
+           ! outside scope: main.rs
+
+Evidence   ✓ test passed <TIME> signed by this machine (advisory)
+
+Drift      ! SCOPE_EXCEEDED 1 file(s) changed outside the declared scope
+
+Approvals  none
+
+Log        anchored by this machine at 1 point(s), last at line 1 of 1; not yet sealed by CI
+
+Unknowns   · 05 shows what was checked. It does not judge whether the change is correct.
+           · every passing check was signed only by a key on this machine, so it is advisory
+
+Undo       git stash push (keeps your work; nothing is deleted)
+
+────────────────────────────────────────────────────────────────────────────────────────────────────
+✓ ALLOW  read the notes: 1
+  1. 1 file(s) changed outside the declared scope

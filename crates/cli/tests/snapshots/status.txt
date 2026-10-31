@@ -1,0 +1,12 @@
+05  <REPO>                                                                                  main
+────────────────────────────────────────────────────────────────────────────────────────────────────
+Task       none. `use05 start "what you are about to do"` begins one
+
+Change     nothing staged. `git add` what you want 05 to look at
+
+Controls   ○ agent hooks off
+           ✓ pre-push on · advisory (--no-verify skips it)
+           ○ CI gate off
+
+────────────────────────────────────────────────────────────────────────────────────────────────────
+Next: use05 start "what you are about to do"

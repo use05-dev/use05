@@ -1,0 +1,7 @@
+! Stale: the signature is good, but it is for a different tree
+  receipt   r.json
+  covers    <TREE12>
+  you have  <TREE12> (index)
+  result    passed in <TIME>
+
+Next: use05 prove to prove the tree you have
