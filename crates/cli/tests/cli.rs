@@ -2062,6 +2062,10 @@ fn every_ci_run_can_push_its_seal_not_only_the_first() {
     let first = ci_in_fresh_clone(remote.path(), &secret);
     assert!(!String::from_utf8_lossy(&first.stderr).contains("could not be pushed"), "{}", text(&first));
     let after_first = runner_head();
+    // A seal names the second it was made, and signatures are deterministic: within the same
+    // second the second run's seal is the first one again, already on the remote. Wait, so this
+    // run makes a new one that must reach the remote. (The identical case is a store unit test.)
+    std::thread::sleep(std::time::Duration::from_millis(1100));
     let second = ci_in_fresh_clone(remote.path(), &secret);
     assert!(!String::from_utf8_lossy(&second.stderr).contains("could not be pushed"), "{}", text(&second));
     assert_ne!(runner_head(), after_first, "the second run's seal reached the remote too: {}", text(&second));

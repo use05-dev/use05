@@ -90,7 +90,12 @@ fn commit_file(top: &Path, name: &str, bytes: &[u8], signer_id: &str) -> Result<
         if let Some(parent) = &parent {
             let parent_tree = git::text(top, &["rev-parse", &format!("{parent}^{{tree}}")])?;
             if parent_tree == tree {
-                return Ok(branch.clone()); // this exact receipt is already there
+                // This exact record is already there. A fresh clone still needs the local branch,
+                // at the remote's commit, or the push that follows has nothing to send.
+                if local.is_none() {
+                    git::run(top, &["update-ref", full.as_str(), parent.as_str(), "0000000000000000000000000000000000000000"])?;
+                }
+                return Ok(branch.clone());
             }
         }
         let commit_env = [
@@ -126,6 +131,25 @@ mod file_tests {
         put_file(dir.path(), "logs/9ce9a1e4.jsonl", b"one\ntwo\n", "ab12").unwrap();
         assert_eq!(read_file(dir.path(), "logs/9ce9a1e4.jsonl").as_deref(), Some("one\ntwo\n"));
         assert!(put_file(dir.path(), "../escape", b"x", "ab12").is_err(), "only paths under logs/ are written");
+    }
+
+    #[test]
+    fn a_record_already_on_the_remote_copy_still_leaves_a_local_branch_to_push() {
+        let git = |dir: &Path, args: &[&str]| assert!(std::process::Command::new("git").arg("-C").arg(dir).args(args).status().unwrap().success(), "git {args:?}");
+        let origin = tempfile::tempdir().unwrap();
+        assert!(std::process::Command::new("git").args(["init", "-q", "--bare"]).arg(origin.path()).status().unwrap().success());
+        let first = tempfile::tempdir().unwrap();
+        git(first.path(), &["init", "-q"]);
+        git(first.path(), &["remote", "add", "origin", origin.path().to_str().unwrap()]);
+        put(first.path(), "abcd", b"the same signed record", "ab12").unwrap();
+        push(first.path(), "05-receipts/ab12").unwrap();
+        // A fresh clone (the next CI job) files the identical record: nothing new to commit, but
+        // the branch must still exist locally, or the push that follows has nothing to send.
+        let second = tempfile::tempdir().unwrap();
+        assert!(std::process::Command::new("git").args(["clone", "-q"]).arg(origin.path()).arg(second.path().join("r")).status().unwrap().success());
+        let clone = second.path().join("r");
+        put(&clone, "abcd", b"the same signed record", "ab12").unwrap();
+        push(&clone, "05-receipts/ab12").expect("the branch is there to push");
     }
 }
 
