@@ -72,6 +72,20 @@ Real output from the `use05` binary on a demo repository.
 | <img src="docs/assets/land-and-clean-up.png" alt="use05 land fast-forwards an agent's branch onto main, removes its worktree and deletes the branch."> | <img src="docs/assets/hook-denied.png" alt="A Claude Code hook refuses an agent's edit to 05's own policy file until a person approves."> |
 | **Land it**, and the agent's branch and worktree are cleaned up. | **Agents are held to the rules** by their own hooks. |
 
+## Several agents, one codebase
+
+Run as many agents as you like on one repository. 05 keeps them orchestrated so they do not overwrite each other's work:
+
+1. **Each agent claims an area.** It declares a scope (`use05 start "Cap retries" --scope "src/billing/**"`) before its first edit; 05 seals it as that session's reservation.
+2. **A clash is caught at the plan.** An overlapping scope is told which task holds the area, which agent declared it and what it is doing, so it narrows its plan or waits.
+3. **And again at every edit.** The agent's hook checks each file it is about to write: inside another task's area, it is told to stay out; changed by another session in the last 30 minutes, it is told to read that change first.
+4. **Each agent works apart**, on its own branch and git worktree.
+5. **Shared files are flagged.** The brief reports `OVERLAP` while another task's change to the same file is not in this change's base.
+6. **Changes land one at a time.** `use05 land` only fast-forwards exactly what was checked; if the target moved, it refuses and says to rebase.
+7. **Nothing is left behind.** A landed change's branch and worktree are removed; kept branches, unmerged work and anything uncommitted never are.
+
+`overlap = "warn"` (the default), `"approval"` or `"deny"` under `[drift]` in `.05/policy.toml` sets how strict this is, and `reservation_idle_hours` (default 2) frees an idle session's area. Only file paths are compared, never contents. Live warnings cover every agent and worktree on one machine; across machines, git still refuses a push that is not a fast-forward.
+
 ## How it works
 
 - **Receipts.** `prove` runs a check on an exact git tree and signs the result as an in-toto statement inside a DSSE envelope (Ed25519). Anyone can verify it offline with `use05 verify`, with no account or network. Receipts live on ordinary `05-receipts/<key>` branches.
