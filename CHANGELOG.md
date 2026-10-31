@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.0.5
+
+- **A better-looking setup.** `use05 init` and `use05 policy --edit` now walk through seven numbered steps with bold questions, the default highlighted, clear prompts and a summary table before anything is written.
+- **More than one environment per level, and any branch.** Two dev environments on their own branches (`dev` and `dev-eu`, say) can sit on the same level; the setup asks you to name the second one. Any branch can be added as an environment by name, and an environment can have any name with a `level` of dev, uat, pre-prod or prod. As a flag: `--env dev-eu=eu-main:dev`. `use05` shows environments on one level side by side. A policy using `level` needs use05 0.0.5 or newer; older versions are told to upgrade.
+- **Clearer strictness choices.** The questions now say what happens: for work outside the plan, "let it, but ask me before each edit outside the plan", "stop the agent; a person approves a wider plan", or "stop the agent and refuse the change".
+- A landing branch that does not exist (a typo) is questioned before it is used. Rails' `db/migrate` is suggested as add-only. A session shorter than a minute reads "under a minute".
+- Scripts that pipe answers into `use05 init --guided` get one more question after the environments ("Add another branch as an environment"); answer it with an empty line. `--env staging=uat` still works: a common name gives its own level.
+- The README and site lead with the five principles behind the name: policy, gates, intent, evidence and review.
+
 ## 0.0.4
 
 - **Guided setup.** On a terminal, `use05 init` now asks a few plain questions before it writes anything: who works in the repository (setting how strict the rules start), which branch changes land on, which long-lived branch is dev, uat, pre-prod or prod, the checks, folder and file rules, how strict to be, and how changes land. It shows a summary and asks before writing. The same answers work as flags (`--team`, `--target`, `--env dev=main`); `--defaults` skips the questions.

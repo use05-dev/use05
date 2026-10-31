@@ -365,7 +365,7 @@ pub fn run(args: Args) -> Report {
     let mut after = Vec::new();
     if policy_path.exists() {
         let wanted = if args.interactive {
-            let mut a = crate::prompt::Asker::new(std::io::stdin().lock(), std::io::stderr());
+            let mut a = crate::prompt::Asker::styled(std::io::stdin().lock(), std::io::stderr(), crate::ui::Ui::stderr());
             match a.yes("05 is already set up here. Change your settings?", false) {
                 None => return stopped(),
                 Some(yes) => yes,

@@ -108,7 +108,7 @@ struct InitCli {
     /// The branch finished changes land on
     #[arg(long, value_name = "BRANCH")]
     target: Option<String>,
-    /// An environment and its branch, lowest first (repeatable): dev=main, prod=production
+    /// An environment and its branch, lowest first (repeatable): dev=main, prod=production, or NAME=BRANCH:LEVEL for another name: dev-eu=eu-main:dev
     #[arg(long = "env", value_name = "NAME=BRANCH")]
     envs: Vec<String>,
     #[command(flatten)]
@@ -251,7 +251,7 @@ struct PolicyCli {
     /// The branch finished changes land on
     #[arg(long, requires = "edit", value_name = "BRANCH")]
     target: Option<String>,
-    /// An environment and its branch, lowest first (repeatable): dev=main, prod=production
+    /// An environment and its branch, lowest first (repeatable): dev=main, prod=production, or NAME=BRANCH:LEVEL for another name: dev-eu=eu-main:dev
     #[arg(long = "env", requires = "edit", value_name = "NAME=BRANCH")]
     envs: Vec<String>,
     #[command(flatten)]

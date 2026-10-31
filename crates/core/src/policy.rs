@@ -139,12 +139,64 @@ pub struct Policy {
     pub environment: Vec<Environment>,
 }
 
-/// One environment: a name and the branch it lives on.
+/// One environment: a name, the branch it lives on, and its level on the ladder.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct Environment {
     pub name: String,
     pub branch: String,
+    /// `dev`, `uat`, `pre-prod` or `prod`. Unset when the name is one of those; needed for any
+    /// other name. Several environments may share a level (two dev environments, say).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub level: Option<String>,
+}
+
+/// Environments grouped into the rungs of the ladder, lowest first; one rung's environments in
+/// the order the policy lists them. An environment with no level stands on its own rung just
+/// above the one listed before it.
+pub fn ladder(envs: &[Environment]) -> Vec<Vec<&Environment>> {
+    let keys = ladder_keys(envs);
+    let mut order: Vec<usize> = (0..envs.len()).collect();
+    order.sort_by_key(|&i| keys[i]);
+    let mut rungs: Vec<(usize, Vec<&Environment>)> = Vec::new();
+    for i in order {
+        match rungs.last_mut() {
+            Some((k, list)) if *k == keys[i] => list.push(&envs[i]),
+            _ => rungs.push((keys[i], vec![&envs[i]])),
+        }
+    }
+    rungs.into_iter().map(|(_, l)| l).collect()
+}
+
+/// Each environment's place for sorting: 2, 4, 6, 8 for dev to prod; one more than the
+/// environment before it for one with no level.
+pub fn ladder_keys(envs: &[Environment]) -> Vec<usize> {
+    let mut prev = 0;
+    envs.iter()
+        .map(|e| {
+            let key = match e.level().and_then(|l| LEVELS.iter().position(|x| *x == l)) {
+                Some(r) => 2 * (r + 1),
+                None => prev + 1,
+            };
+            prev = key;
+            key
+        })
+        .collect()
+}
+
+/// The levels of the environment ladder, lowest first.
+pub const LEVELS: [&str; 4] = ["dev", "uat", "pre-prod", "prod"];
+
+impl Environment {
+    /// The level: as written, or the name when the name is a level.
+    pub fn level(&self) -> Option<&str> {
+        self.level.as_deref().or_else(|| LEVELS.iter().copied().find(|l| *l == self.name))
+    }
+
+    /// Where on the ladder: 0 for dev up to 3 for prod; 4 when the level is unknown.
+    pub fn rank(&self) -> usize {
+        self.level().and_then(|l| LEVELS.iter().position(|x| *x == l)).unwrap_or(LEVELS.len())
+    }
 }
 
 /// About the policy file itself (D78).
@@ -561,6 +613,11 @@ impl Policy {
             if e.name.trim().is_empty() || e.branch.trim().is_empty() {
                 return Err(Error::new("POLICY_INVALID", "every [[environment]] needs a name and a branch"));
             }
+            if let Some(level) = &e.level {
+                if !LEVELS.contains(&level.as_str()) {
+                    return Err(Error::new("POLICY_INVALID", format!("the environment {:?} has level {level:?}; a level is one of dev, uat, pre-prod, prod", e.name)));
+                }
+            }
             if self.environment[..i].iter().any(|o| o.name == e.name || o.branch == e.branch) {
                 return Err(Error::new("POLICY_INVALID", format!("the environment {:?} or its branch {:?} is listed twice", e.name, e.branch)));
             }
@@ -635,7 +692,8 @@ fn envs(p: &Policy) -> String {
     if p.environment.is_empty() {
         return "none".to_string();
     }
-    p.environment.iter().map(|e| format!("{}: {}", e.name, e.branch)).collect::<Vec<_>>().join(" → ")
+    // Environments on one level side by side, the levels in ladder order.
+    ladder(&p.environment).iter().map(|rung| rung.iter().map(|e| format!("{}: {}", e.name, e.branch)).collect::<Vec<_>>().join(", ")).collect::<Vec<_>>().join(" → ")
 }
 
 pub fn explain(repo: &Policy, effective: &Policy) -> Vec<Row> {
@@ -940,6 +998,17 @@ mod tests {
         ] {
             assert_eq!(Policy::parse(bad).unwrap_err().code, "POLICY_INVALID", "{bad}");
         }
+    }
+
+
+    #[test]
+    fn several_environments_can_share_a_level() {
+        let p = Policy::parse("[[environment]]\nname = \"dev\"\nbranch = \"main\"\n\n[[environment]]\nname = \"dev-eu\"\nbranch = \"eu-main\"\nlevel = \"dev\"\n\n[[environment]]\nname = \"prod\"\nbranch = \"production\"\n").unwrap();
+        let levels: Vec<Option<&str>> = p.environment.iter().map(|e| e.level()).collect();
+        assert_eq!(levels, [Some("dev"), Some("dev"), Some("prod")]);
+        let row = explain(&p, &p).into_iter().find(|r| r.key == "environments").unwrap();
+        assert_eq!(row.value, "dev: main, dev-eu: eu-main → prod: production");
+        assert_eq!(Policy::parse("[[environment]]\nname = \"x\"\nbranch = \"y\"\nlevel = \"staging\"\n").unwrap_err().code, "POLICY_INVALID", "a level is one of dev, uat, pre-prod, prod");
     }
 
 }

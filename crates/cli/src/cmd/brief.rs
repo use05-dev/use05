@@ -78,7 +78,11 @@ fn files(n: usize) -> String {
 /// how the checks went along the way, and the subagents that took part.
 fn session_items(sn: &use05_core::session::Session) -> Vec<Item> {
     let plural = |n: usize, one: &str, many: &str| format!("{} {}", thousands(n as u64), if n == 1 { one } else { many });
-    let span = if sn.minutes >= 60 { format!("{} h {} min", sn.minutes / 60, sn.minutes % 60) } else { format!("{} min", sn.minutes) };
+    let span = match sn.minutes {
+        0 => "under a minute".to_string(),
+        m if m >= 60 => format!("{} h {} min", m / 60, m % 60),
+        m => format!("{m} min"),
+    };
     let mut items = Vec::new();
     // A task worked by hand from the command line has no agent turns or tool calls to count.
     if sn.turns + sn.tool_calls > 0 {

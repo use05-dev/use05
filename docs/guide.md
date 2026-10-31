@@ -56,7 +56,7 @@ On a terminal, `init` first asks a few questions, each with a default you accept
 
 1. **Who works in this repository:** just you, a small team, or a larger or regulated team. This sets how strict the rules start; you can change each one afterwards.
 2. **Which branch finished changes land on.**
-3. **Which environment each long-lived branch is:** dev, uat, pre-prod, prod, or not an environment. 05 suggests a role from the branch's name (`main` is dev, `staging` is uat, `production` is prod). 05 records the environments and shows them; rules for promoting between them come in a later version.
+3. **Which environment each long-lived branch is:** dev, uat, pre-prod, prod, another environment you name, or not an environment. 05 suggests a level from the branch's name (`main` is dev, `staging` is uat, `production` is prod). A level can hold several environments: pick dev for a second branch and you name it, for example `dev-eu`. Then you can add any other branch as an environment. 05 records the environments and shows them; rules for promoting between them come in a later version.
 4. **The checks that must pass**, and any you want to add (`lint: npm run lint`).
 5. **Folder and file rules:** what needs a person's approval, what is locked, where only new files may be added (it suggests migration folders it finds), and what agents may not read (it suggests `.env*` if you have one).
 6. **How strict to be** when an agent works outside its plan, and when a change weakens tests.
@@ -64,7 +64,7 @@ On a terminal, `init` first asks a few questions, each with a default you accept
 
 It then shows a summary and asks before writing anything. To change your settings later, run `use05 init` again or `use05 policy --edit`: the same questions, with your current settings as the defaults. Your comments and any settings the questions don't cover are kept.
 
-The answers can also be flags, for scripts: `use05 init --team small --target main --env dev=main --env uat=staging --env prod=production`. `--defaults` skips the questions; `--guided` asks them even without a terminal, reading the answers from stdin.
+The answers can also be flags, for scripts: `use05 init --team small --target main --env dev=main --env uat=staging --env prod=production`. An environment whose name is not a level gives its level after a colon: `--env dev-eu=eu-main:dev`. `--defaults` skips the questions; `--guided` asks them even without a terminal, reading the answers from stdin.
 
 Then `init` lists exactly what it changed, and what is still not covered. It:
 
@@ -220,7 +220,7 @@ Run as many agents as you like on one repository:
 | `[enforce] on_error` | `"open"` | If 05 itself fails: `open` lets the change through and says so loudly; `closed` refuses it. |
 | `[env] allow` | unrestricted | If set, the only environment variables any check may be passed. |
 | `[[trust.key]]` | none | Public keys whose receipts count, e.g. your CI runner's. See the CI gate guide. |
-| `[[environment]]` `name`, `branch` | none | Which branch is which environment, lowest first, e.g. `name = "dev"`, `branch = "main"`. Shown by `use05` and the brief; environment branches are never deleted. |
+| `[[environment]]` `name`, `branch`, `level` | none | Which branch is which environment, e.g. `name = "dev"`, `branch = "main"`. `level` (`dev`, `uat`, `pre-prod` or `prod`) is needed only when the name is not a level, such as a second dev environment `dev-eu`. Shown by `use05` and the brief, levels side by side; environment branches are never deleted. |
 
 An organisation can add a signed layer of rules on top. Repositories can tighten that layer, but never loosen it. `use05 policy` shows which settings came from it.
 

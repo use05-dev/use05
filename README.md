@@ -38,6 +38,18 @@
 
 05 is an acceptance layer for AI-written code that takes the place of pull-request review. The agent declares what it will do before it starts, and 05 seals that plan where the agent cannot change it. When it finishes, 05 proves what was checked on the exact files and compares the result to the plan. When everything matched, you approve, the change lands as a commit and you push it: no pull request to review. When something did not match, you read one page instead of the diff. With several agents in one repository, 05 keeps them out of each other's way. Everything runs on your machine: no account, no telemetry, nothing uploaded.
 
+## Five principles, hence the name
+
+05 is built on five principles, and they give it its name. Together they are the building blocks of trust in code written by AI, without people getting bogged down in pull-request reviews. An agent can ship a large amount of code in a few hours; nobody can review it at that pace, and sometimes reviewing takes longer than writing the code by hand. So developers go back to writing it themselves, approve pull requests without really reading them, or spend hours working out what a pull request does. 05 establishes the trust that lets developers, engineers and their teams use AI to the full.
+
+| # | Principle | | What it means |
+|---|---|---|---|
+| 01 | **Policy** | configurable per project | Your rules in `.05/policy.toml`: required checks, protected, locked and append-only folders, how strict to be. Set by answering a few questions in `use05 init`. An organisation can add a minimum that teams can tighten, never loosen. |
+| 02 | **Gates** | configurable per project | Where the rules hold: the agent's hooks while it works, a git pre-push gate, and a required CI check that enforces. Each says how strongly it enforces. |
+| 03 | **Intent** | core | The agent declares what it will do and where before it starts; 05 seals that plan and holds the agent and its subagents to it, however many files the change touches. No AI decides whether a change passes. |
+| 04 | **Evidence** | core | Checks run on the change itself and the result is signed. "Tests pass" counts only with a receipt, and anyone can verify one offline. |
+| 05 | **Review** | optional | When everything matched, there is nothing to read. When something did not, one brief with the intent, the outcome and the critical details, never the 50,000-line diff. |
+
 ## Install
 
 ```sh
@@ -64,7 +76,13 @@ Bare `use05` shows where you stand. `use05 doctor` says how strongly each contro
 
 ## What it looks like
 
-Real output from the `use05` binary on a demo repository.
+Real output from the `use05` binary on demo repositories.
+
+**A feature build: 497 files, +52,475 lines, one page.** An agent and two subagents built a checkout feature. The brief groups the change into areas with line counts, shows the 26 files changed outside the plan, what 05 refused during the session and why, how the checks went along the way, and the subagents that took part. (The session's hook calls were replayed against a demo repository, so it ran in about a minute; a real build runs for hours, and the brief stays this size.)
+
+<p align="center"><img src="docs/assets/brief-large.png" alt="use05 brief on a 497-file, 52,475-line feature build: areas with line counts, 26 files outside the declared scope, six refusals by reason, the test check failed twice then passed during the session, two subagents, and the verdict approval required." width="820"></p>
+
+**And a one-file change**, where everything matched, ends in one line: `ALLOW, nothing to read` (top of this page).
 
 | | |
 |---|---|

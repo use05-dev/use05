@@ -24,11 +24,26 @@ impl Flags {
         self.team.is_some() || self.target.is_some() || !self.envs.is_empty()
     }
 
-    /// `--env dev=main` into an environment.
+    /// `--env dev=main`, or `--env dev-eu=eu-main:dev` for a name that is not a level.
     pub fn parse_env(text: &str) -> Result<Environment, String> {
-        match text.split_once('=') {
-            Some((name, branch)) if !name.trim().is_empty() && !branch.trim().is_empty() => Ok(Environment { name: name.trim().to_string(), branch: branch.trim().to_string() }),
-            _ => Err(format!("--env takes NAME=BRANCH, e.g. dev=main or prod=production (got {text:?})")),
+        let usage = format!("--env takes NAME=BRANCH, or NAME=BRANCH:LEVEL for a name that is not a level: dev=main, prod=production, dev-eu=eu-main:dev (got {text:?})");
+        let (name, rest) = text.split_once('=').ok_or_else(|| usage.clone())?;
+        let (branch, level) = match rest.rsplit_once(':') {
+            Some((b, l)) => (b, Some(l.trim().to_string())),
+            None => (rest, None),
+        };
+        let (name, branch) = (name.trim(), branch.trim());
+        if name.is_empty() || branch.is_empty() {
+            return Err(usage);
+        }
+        match &level {
+            Some(l) if Role::from_name(l).is_none() => Err(format!("{l:?} is not a level; use dev, uat, pre-prod or prod")),
+            // A common name (staging, production) says its level, as 0.0.4 accepted.
+            None if Role::from_name(name).is_none() => match suggest_role(name) {
+                Some(r) => Ok(Environment { name: name.to_string(), branch: branch.to_string(), level: Some(r.name().to_string()) }),
+                None => Err(format!("{name:?} is not a level, so give one: --env {name}={branch}:dev (or uat, pre-prod, prod)")),
+            },
+            _ => Ok(Environment { name: name.to_string(), branch: branch.to_string(), level: level.filter(|l| l != name) }),
         }
     }
 }
@@ -58,7 +73,27 @@ pub fn from_flags(current: &Policy, flags: &Flags) -> Settings {
     s
 }
 
-const SEVERITY: [(&str, Severity); 4] = [("let it", Severity::Allow), ("warn the agent", Severity::Warn), ("ask a person", Severity::Approval), ("refuse", Severity::Deny)];
+/// The steps of the setup, for the `n/7` headings.
+const STEPS: usize = 7;
+
+/// How a strictness reads in notes.
+const SEVERITY: [(&str, Severity); 4] = [("let it", Severity::Allow), ("note it in the brief", Severity::Warn), ("a person approves", Severity::Approval), ("refuse", Severity::Deny)];
+
+/// Outside the plan, each strictness also changes what the agent's hook does at the edit.
+const SCOPE_OPTIONS: [(&str, Severity); 4] = [
+    ("let it", Severity::Allow),
+    ("let it, but ask me before each edit outside the plan", Severity::Warn),
+    ("stop the agent; a person approves a wider plan", Severity::Approval),
+    ("stop the agent and refuse the change", Severity::Deny),
+];
+
+/// Weakened tests are found in the finished change, so no hook is involved.
+const TESTS_OPTIONS: [(&str, Severity); 4] = [
+    ("let it", Severity::Allow),
+    ("let it, and note it in the brief", Severity::Warn),
+    ("hold the change until a person approves", Severity::Approval),
+    ("refuse the change", Severity::Deny),
+];
 
 fn severity_choice<R: BufRead, W: Write>(a: &mut Asker<R, W>, question: &str, options: &[(&str, Severity)], current: Severity) -> Option<Severity> {
     let labels: Vec<&str> = options.iter().map(|(l, _)| *l).collect();
@@ -85,13 +120,67 @@ fn migration_dirs(top: &Path) -> Vec<String> {
         .lines()
         .filter_map(|f| {
             let parts: Vec<&str> = f.split('/').collect();
-            let at = parts.iter().position(|p| *p == "migrations")?;
+            let at = parts.iter().enumerate().position(|(i, p)| *p == "migrations" || (*p == "migrate" && i > 0 && parts[i - 1] == "db"))?;
             (at + 1 < parts.len()).then(|| format!("{}/**", parts[..=at].join("/")))
         })
         .collect();
     dirs.sort();
     dirs.dedup();
     dirs
+}
+
+/// A name for a new environment that no chosen one has: `wanted`, or with `-2`, `-3` added.
+fn unique_name(wanted: &str, chosen: &[Environment]) -> String {
+    let mut name = wanted.to_string();
+    let mut n = 2;
+    while chosen.iter().any(|e| e.name == name) {
+        name = format!("{wanted}-{n}");
+        n += 1;
+    }
+    name
+}
+
+/// An environment for `branch` at `level`: named after the level when that is free, otherwise
+/// named by the person (a second dev environment, say).
+fn at_level<R: BufRead, W: Write>(a: &mut Asker<R, W>, chosen: &[Environment], branch: &str, level: &str) -> Option<Environment> {
+    if !chosen.iter().any(|e| e.name == level) {
+        return Some(Environment { name: level.to_string(), branch: branch.to_string(), level: None });
+    }
+    let suggestion = unique_name(&format!("{level}-{}", branch.replace('/', "-")), chosen);
+    let name = a.text(&format!("There is already a {level} environment. What should this one, on {branch}, be called?"), &suggestion)?;
+    Some(Environment { name: unique_name(&name, chosen), branch: branch.to_string(), level: Some(level.to_string()) })
+}
+
+/// An environment the person names, then places on a level.
+fn named_env<R: BufRead, W: Write>(a: &mut Asker<R, W>, chosen: &[Environment], branch: &str) -> Option<Environment> {
+    let name = a.text(&format!("What is the environment on {branch} called?"), &unique_name(&branch.replace('/', "-"), chosen))?;
+    let name = unique_name(&name, chosen);
+    let levels: Vec<&str> = Role::ALL.iter().map(|r| r.name()).collect();
+    let default = Role::from_name(&name).or_else(|| suggest_role(branch)).map_or(0, |r| r as usize);
+    let level = levels[a.choice(&format!("Which level is {name} on?"), &levels, default)?];
+    Some(Environment { level: (name != level).then(|| level.to_string()), name, branch: branch.to_string() })
+}
+
+/// The branch exists here or on `origin`.
+fn branch_exists(top: &Path, name: &str) -> bool {
+    use05_core::git::resolve_commit(top, &format!("refs/heads/{name}")).is_some() || use05_core::git::resolve_commit(top, &format!("refs/remotes/origin/{name}")).is_some()
+}
+
+/// The landing branch, questioned when no such branch exists (a typo, most likely). A repository
+/// with no commits yet has no branches to check against.
+fn ask_landing<R: BufRead, W: Write>(a: &mut Asker<R, W>, top: &Path, default: &str) -> Option<String> {
+    let has_commits = use05_core::git::head_commit(top).is_some();
+    for _ in 0..3 {
+        let answer = a.text("Which branch do finished changes land on?", default)?;
+        if !has_commits || branch_exists(top, &answer) {
+            return Some(answer);
+        }
+        a.say(&format!("  There is no branch {answer} here or on origin."));
+        if a.yes("Use it anyway?", false)? {
+            return Some(answer);
+        }
+    }
+    Some(default.to_string())
 }
 
 /// The landing branch to suggest, and whether it is the remote's default (followed, so not
@@ -107,32 +196,42 @@ fn landing_default(top: &Path, current: &Policy) -> (String, bool) {
     }
 }
 
-fn summary(s: &Settings) -> Vec<String> {
-    let sev = |v: Severity| SEVERITY.iter().find(|(_, x)| *x == v).map(|(l, _)| *l).unwrap_or("warn the agent");
+/// The words a question used for an answer.
+fn option(options: &[(&str, Severity)], v: Severity) -> String {
+    options.iter().find(|(_, x)| *x == v).map(|(l, _)| l.to_string()).unwrap_or_default()
+}
+
+fn summary(s: &Settings) -> Vec<(&'static str, String)> {
+    let sev = |v: Severity| SEVERITY.iter().find(|(_, x)| *x == v).map(|(l, _)| *l).unwrap_or("note it in the brief").to_string();
     let list = |l: &[String]| if l.is_empty() { "none".to_string() } else { l.join(", ") };
     let plan = match s.intent {
         IntentMode::Inferred => "inferred from the work",
         IntentMode::Risky => "written down for risky changes",
         IntentMode::Always => "written down for every change",
     };
+    let envs = if s.environments.is_empty() {
+        "none".to_string()
+    } else {
+        s.environments.iter().map(|e| match &e.level {
+            Some(l) => format!("{} = {} ({l})", e.name, e.branch),
+            None => format!("{} = {}", e.name, e.branch),
+        }).collect::<Vec<_>>().join(", ")
+    };
     vec![
-        format!("Changes land on:          {}", s.target.as_deref().unwrap_or("the remote's default branch")),
-        format!(
-            "Environments:             {}",
-            if s.environments.is_empty() { "none".to_string() } else { s.environments.iter().map(|e| format!("{} = {}", e.name, e.branch)).collect::<Vec<_>>().join(", ") }
-        ),
-        format!("Checks:                   {}", if s.checks.is_empty() { "none".to_string() } else { s.checks.iter().map(|c| format!("{} ({})", c.name, c.run.join(" "))).collect::<Vec<_>>().join(", ") }),
-        format!("A plan is:                {plan}"),
-        format!("Need approval:            {}", list(&s.protect_paths)),
-        format!("Locked:                   {}", list(&s.locked)),
-        format!("Add new files only:       {}", list(&s.append_only)),
-        format!("Agents may not read:      {}", list(&s.no_read)),
-        format!("Outside the plan:         {}", sev(s.scope)),
-        format!("Weakened tests:           {}", sev(s.tests)),
-        format!("Dependency changes:       {}", sev(s.dependencies)),
-        format!("Two agents, same files:   {}", sev(s.overlap)),
-        format!("Approvals needed:         {}", s.approvals_min),
-        format!("Finished changes land:    {}", if s.land == LandMode::Auto { "automatically when 05 allows it" } else { "when you run use05 land" }),
+        ("Changes land on", s.target.clone().unwrap_or_else(|| "the remote's default branch".into())),
+        ("Environments", envs),
+        ("Checks", if s.checks.is_empty() { "none".into() } else { s.checks.iter().map(|c| format!("{} ({})", c.name, c.run.join(" "))).collect::<Vec<_>>().join(", ") }),
+        ("A plan is", plan.into()),
+        ("Need approval", list(&s.protect_paths)),
+        ("Locked", list(&s.locked)),
+        ("New files only", list(&s.append_only)),
+        ("Agents may not read", list(&s.no_read)),
+        ("Outside the plan", option(&SCOPE_OPTIONS, s.scope)),
+        ("Weakened tests", option(&TESTS_OPTIONS, s.tests)),
+        ("Dependency changes", sev(s.dependencies)),
+        ("Two agents, one file", sev(s.overlap)),
+        ("Approvals needed", s.approvals_min.to_string()),
+        ("Finished changes", if s.land == LandMode::Auto { "automatically when 05 allows it".into() } else { "when you run use05 land".into() }),
     ]
 }
 
@@ -140,9 +239,14 @@ fn summary(s: &Settings) -> Vec<String> {
 /// its values are the defaults. `None` when the input ended or the person chose not to write.
 pub fn ask<R: BufRead, W: Write>(a: &mut Asker<R, W>, top: &Path, current: &Policy, editing: bool, flags: &Flags) -> Option<Settings> {
     let mut s = Settings::from_policy(current);
-    a.say(if editing { "Let's go through your 05 settings. Press Enter to keep what is shown." } else { "Let's set up 05 for this repository. Press Enter to take what is shown." });
+    if editing {
+        a.banner("Change your 05 settings", "Your current settings are the defaults: press Enter to keep each one. Nothing is written until you say so.");
+    } else {
+        a.banner("Set up 05 for this repository", "Each question has a default: press Enter to take it. Nothing is written until you say so.");
+    }
 
     // 1. The team, and so how strict to start.
+    a.step(1, STEPS, "Who works here");
     match flags.team {
         Some(team) => apply_team(&mut s, team),
         None => {
@@ -160,11 +264,12 @@ pub fn ask<R: BufRead, W: Write>(a: &mut Asker<R, W>, top: &Path, current: &Poli
     }
 
     // 2. Where finished changes land.
+    a.step(2, STEPS, "Where changes land");
     match &flags.target {
         Some(t) => s.target = Some(t.clone()),
         None => {
             let (default, follows_remote) = landing_default(top, current);
-            let answer = a.text("Which branch do finished changes land on?", &default)?;
+            let answer = ask_landing(a, top, &default)?;
             // Accepting a default the policy does not state keeps it unstated: it goes on
             // following the remote, and an edit changes nothing.
             if !(answer == default && current.branches.target.is_none() && (follows_remote || editing)) {
@@ -174,89 +279,105 @@ pub fn ask<R: BufRead, W: Write>(a: &mut Asker<R, W>, top: &Path, current: &Poli
     }
 
     // 3. Which branch is which environment.
+    a.step(3, STEPS, "Environments");
     if !flags.envs.is_empty() {
         s.environments = flags.envs.clone();
+        a.say("Set with --env.");
     } else {
-        // Ask about branches that look long-lived: a name that suggests a role, a branch the
-        // policy keeps by name, the landing branch, and the environments already set. Feature
-        // branches and the like are counted, not asked about.
+        // Ask about branches that look long-lived: a name that suggests a level, a branch the
+        // policy keeps by name, the landing branch, and the environments already set. Any other
+        // branch can be added afterwards.
         let landing = s.target.clone().unwrap_or_else(|| use05_core::branches::target_for(current, None, top));
         let kept_by_name = |b: &str| current.branches.keep.iter().any(|k| k == b);
-        let (mut branches, others): (Vec<String>, Vec<String>) = scan(top, current)
+        let (scanned, others): (Vec<String>, Vec<String>) = scan(top, current)
             .into_iter()
             .map(|b| b.name)
             .partition(|b| suggest_role(b).is_some() || kept_by_name(b) || *b == landing || current.environment.iter().any(|e| &e.branch == b));
-        for e in &current.environment {
-            if !branches.contains(&e.branch) {
-                branches.push(e.branch.clone());
-            }
+        // The environments already set come first, in the order the policy lists them.
+        let mut branches: Vec<String> = current.environment.iter().map(|e| e.branch.clone()).collect();
+        branches.extend(scanned.into_iter().filter(|b| !current.environment.iter().any(|e| &e.branch == b)));
+        a.say("Which branch is dev, uat, pre-prod and prod. A level can hold several environments, such as two dev environments on their own branches. 05 records them and shows them; rules for promoting between them come later.");
+        if !others.is_empty() {
+            a.say(&match others.len() {
+                1 => "1 other branch is not asked about; you can add it at the end.".to_string(),
+                n => format!("{n} other branches (feature branches and the like) are not asked about; you can add any of them at the end."),
+            });
         }
-        if branches.is_empty() {
-            a.say("\nNo long-lived branches yet, so no environments to set. Run this again once you have them.");
-        } else {
-            a.say("\nEnvironments: which branch is dev, uat, pre-prod and prod. 05 records them and shows them; rules for promoting between them come later.");
-            if !others.is_empty() {
-                a.say(&format!("{} other branches (feature branches and the like) are left out.", others.len()));
-            }
-            // Each environment's rank on the ladder: a standard role's place, and for a name the
-            // person wrote by hand, just above the standard one listed before it.
-            let rank_of = |name: &str| -> i32 {
-                if let Some(r) = Role::from_name(name) {
-                    return 2 * r as i32;
-                }
-                let before = current.environment.iter().take_while(|e| e.name != name).filter_map(|e| Role::from_name(&e.name)).last();
-                before.map_or(-1, |r| 2 * r as i32 + 1)
-            };
-            let mut chosen: Vec<(i32, Environment)> = Vec::new();
-            for b in &branches {
-                let existing = current.environment.iter().find(|e| &e.branch == b);
-                let custom = existing.map(|e| e.name.clone()).filter(|n| Role::from_name(n).is_none());
-                let mut names: Vec<String> = Role::ALL.iter().map(|r| r.name().to_string()).collect();
-                if let Some(c) = &custom {
-                    names.push(c.clone());
-                }
-                let none = names.len();
-                let taken = |n: &str, chosen: &[(i32, Environment)]| chosen.iter().find(|(_, e)| e.name == n).map(|(_, e)| e.branch.clone());
-                let default = match existing {
-                    Some(e) => names.iter().position(|n| *n == e.name).unwrap_or(none),
-                    None if editing && !current.environment.is_empty() => none,
-                    None => match suggest_role(b) {
-                        Some(r) => match taken(r.name(), &chosen) {
-                            Some(holder) => {
-                                a.say(&format!("{} is already {holder}, so {b} is not suggested as {}.", r.name(), r.name()));
-                                none
-                            }
-                            None => r as usize,
-                        },
-                        None => none,
-                    },
-                };
-                let mut labels: Vec<String> = names.clone();
-                if let Some(c) = &custom {
-                    labels[names.len() - 1] = format!("keep it as {c}");
-                }
-                labels.push("not an environment".to_string());
-                let labels: Vec<&str> = labels.iter().map(String::as_str).collect();
-                let mut pick = a.choice(&format!("Which environment is the branch {b}?"), &labels, default)?;
-                for _ in 0..3 {
-                    match names.get(pick).and_then(|n| taken(n, &chosen).map(|h| (n.clone(), h))) {
-                        Some((n, holder)) => {
-                            a.say(&format!("  {n} is already {holder}. Choose another, or not an environment."));
-                            pick = a.choice(&format!("Which environment is the branch {b}?"), &labels, none)?;
+        let mut chosen: Vec<Environment> = Vec::new();
+        for b in &branches {
+            let existing = current.environment.iter().find(|e| &e.branch == b);
+            let custom = existing.filter(|e| Role::from_name(&e.name).is_none() || e.level.is_some());
+            let mut labels: Vec<String> = Role::ALL.iter().map(|r| r.name().to_string()).collect();
+            let keep_at = custom.map(|e| {
+                labels.push(format!("keep it as {} ({})", e.name, e.level().unwrap_or("no level")));
+                labels.len() - 1
+            });
+            labels.push("another environment, named by you".to_string());
+            let named = labels.len() - 1;
+            labels.push("not an environment".to_string());
+            let none = labels.len() - 1;
+            let holder = |level: &str, chosen: &[Environment]| chosen.iter().find(|e| e.level() == Some(level)).map(|e| e.branch.clone());
+            let default = match existing {
+                Some(_) if keep_at.is_some() => keep_at.unwrap_or(none),
+                Some(e) => e.level().and_then(Role::from_name).map_or(none, |r| r as usize),
+                None if editing => none,
+                None => match suggest_role(b) {
+                    Some(r) => match holder(r.name(), &chosen) {
+                        Some(h) => {
+                            a.say(&format!("{} is already {h}. Choose {} again to add a second {} environment.", r.name(), r.name(), r.name()));
+                            none
                         }
-                        None => break,
-                    }
-                }
-                if let Some(name) = names.get(pick).filter(|n| taken(n, &chosen).is_none()) {
-                    chosen.push((rank_of(name), Environment { name: name.clone(), branch: b.clone() }));
-                }
+                        None => r as usize,
+                    },
+                    None => none,
+                },
+            };
+            let refs: Vec<&str> = labels.iter().map(String::as_str).collect();
+            let pick = a.choice(&format!("Which environment is the branch {b}?"), &refs, default)?;
+            // Names already given, and the names of environments not asked about yet.
+            let taken: Vec<Environment> = chosen.iter().cloned().chain(current.environment.iter().filter(|e| &e.branch != b && !chosen.iter().any(|c| c.branch == e.branch)).cloned()).collect();
+            let env = if let Some(role) = Role::ALL.get(pick) {
+                Some(at_level(a, &taken, b, role.name())?)
+            } else if Some(pick) == keep_at {
+                custom.cloned()
+            } else if pick == named {
+                Some(named_env(a, &taken, b)?)
+            } else {
+                None
+            };
+            chosen.extend(env);
+        }
+        // Any other branch, by name.
+        loop {
+            let b = a.text("Add another branch as an environment: type its name, or press Enter to go on.", "")?;
+            if b.is_empty() {
+                break;
             }
-            chosen.sort_by_key(|(rank, _)| *rank);
-            s.environments = chosen.into_iter().map(|(_, e)| e).collect();
+            if chosen.iter().any(|e| e.branch == b) {
+                a.say(&format!("  {b} is already an environment."));
+                continue;
+            }
+            if !branch_exists(top, &b) {
+                a.say(&format!("  There is no branch {b} here or on origin."));
+                continue;
+            }
+            let env = named_env(a, &chosen, &b)?;
+            chosen.push(env);
+        }
+        // The same environments as before keep the policy's order; otherwise new ones take their
+        // place on the ladder, after those already on their level.
+        if chosen.len() == current.environment.len() && chosen.iter().all(|e| current.environment.contains(e)) {
+            s.environments = current.environment.clone();
+        } else {
+            let keys = use05_core::policy::ladder_keys(&chosen);
+            let mut order: Vec<usize> = (0..chosen.len()).collect();
+            order.sort_by_key(|&i| keys[i]);
+            s.environments = order.into_iter().map(|i| chosen[i].clone()).collect();
         }
     }
 
     // 4. Checks.
+    a.step(4, STEPS, "Checks");
     if !s.checks.is_empty() {
         let names: Vec<String> = s.checks.iter().map(|c| format!("{} ({})", c.name, c.run.join(" "))).collect();
         if !a.yes(&format!("These checks run on every change: {}. Keep them?", names.join(", ")), true)? {
@@ -276,6 +397,7 @@ pub fn ask<R: BufRead, W: Write>(a: &mut Asker<R, W>, top: &Path, current: &Poli
     }
 
     // 5. Folder and file rules.
+    a.step(5, STEPS, "Folder and file rules");
     s.protect_paths = a.list("Folders or files that need a person's approval before they change (for example infra/**).", &s.protect_paths)?;
     s.locked = a.list("Folders or files that must never change (locked).", &s.locked)?;
     let append_default = if s.append_only.is_empty() && !editing { migration_dirs(top) } else { s.append_only.clone() };
@@ -285,17 +407,20 @@ pub fn ask<R: BufRead, W: Write>(a: &mut Asker<R, W>, top: &Path, current: &Poli
     s.no_read = a.list("Files agents may not read, like secrets.", &read_default)?;
 
     // 6. How strict.
-    s.scope = severity_choice(a, "When an agent changes files outside its plan:", &SEVERITY, s.scope)?;
-    s.tests = severity_choice(a, "When a change weakens or removes tests:", &SEVERITY, s.tests)?;
+    a.step(6, STEPS, "How strict, and how changes land");
+    s.scope = severity_choice(a, "When an agent changes files outside its plan:", &SCOPE_OPTIONS, s.scope)?;
+    s.tests = severity_choice(a, "When a change weakens or removes tests:", &TESTS_OPTIONS, s.tests)?;
     let land = a.choice("How should a finished change land?", &["I run use05 land", "Automatically, when 05 allows it"], usize::from(s.land == LandMode::Auto))?;
     s.land = if land == 1 { LandMode::Auto } else { LandMode::Manual };
 
     // 7. Confirm.
-    a.say("\nYour settings:");
-    for line in summary(&s) {
-        a.say(&format!("  {line}"));
-    }
-    a.confirm("Write this to .05/policy.toml?")?.then_some(s)
+    a.step(7, STEPS, "Review");
+    let rows = summary(&s);
+    let rows: Vec<(&str, String)> = rows.iter().map(|(k, v)| (*k, v.clone())).collect();
+    a.table(&rows);
+    let write = a.confirm("Write this to .05/policy.toml?")?;
+    a.say("");
+    write.then_some(s)
 }
 
 /// What a run of the setup came to.
@@ -314,7 +439,7 @@ pub enum Outcome {
 pub fn run_on(text: &str, top: &Path, editing: bool, interactive: bool, flags: &Flags) -> Result<(Outcome, Vec<String>), String> {
     let current = Policy::parse(text).map_err(|e| e.message)?;
     let settings = if interactive {
-        let mut a = Asker::new(std::io::stdin().lock(), std::io::stderr());
+        let mut a = Asker::styled(std::io::stdin().lock(), std::io::stderr(), crate::ui::Ui::stderr());
         match ask(&mut a, top, &current, editing, flags) {
             Some(s) => s,
             None => return Ok((Outcome::Stopped, Vec::new())),
@@ -366,5 +491,46 @@ mod tests {
         assert_eq!(parse_check("test: FOO=1 npm test").unwrap().run, ["sh", "-c", "FOO=1 npm test"]);
         assert_eq!(parse_check("lint: npm run lint").unwrap().run, ["npm", "run", "lint"]);
         assert!(parse_check("no colon here").is_none() && parse_check("two words: x").is_none());
+    }
+}
+
+#[cfg(test)]
+mod more_tests {
+    use super::*;
+
+    #[test]
+    fn rails_migrations_are_suggested_too() {
+        let dir = tempfile::tempdir().unwrap();
+        let top = dir.path();
+        let git = |args: &[&str]| assert!(std::process::Command::new("git").arg("-C").arg(top).args(["-c", "user.name=t", "-c", "user.email=t@t"]).args(args).output().unwrap().status.success());
+        git(&["init", "-q"]);
+        std::fs::create_dir_all(top.join("db/migrate")).unwrap();
+        std::fs::create_dir_all(top.join("api/migrations")).unwrap();
+        std::fs::write(top.join("db/migrate/001_init.rb"), "x").unwrap();
+        std::fs::write(top.join("api/migrations/0001.sql"), "x").unwrap();
+        git(&["add", "-A"]);
+        assert_eq!(migration_dirs(top), ["api/migrations/**", "db/migrate/**"]);
+    }
+
+    #[test]
+    fn strictness_options_say_what_happens_for_each_question() {
+        let scope: Vec<&str> = SCOPE_OPTIONS.iter().map(|(l, _)| *l).collect();
+        assert!(scope.iter().any(|l| l.contains("ask me")) && scope.iter().any(|l| l.contains("stop the agent")), "{scope:?}");
+        let tests: Vec<&str> = TESTS_OPTIONS.iter().map(|(l, _)| *l).collect();
+        assert!(!tests.iter().any(|l| l.contains("agent")), "no hook is involved for tests: {tests:?}");
+    }
+
+    #[test]
+    fn a_landing_branch_that_does_not_exist_is_questioned() {
+        let dir = tempfile::tempdir().unwrap();
+        let top = dir.path();
+        let git = |args: &[&str]| assert!(std::process::Command::new("git").arg("-C").arg(top).args(["-c", "user.name=t", "-c", "user.email=t@t"]).args(args).output().unwrap().status.success());
+        git(&["init", "-q", "-b", "main"]);
+        git(&["commit", "-q", "--allow-empty", "-m", "first"]);
+        // A typo, then "no, ask again", then the real branch.
+        let mut a = Asker::new(std::io::Cursor::new(b"mian\nn\nmain\n".to_vec()), Vec::new());
+        assert_eq!(ask_landing(&mut a, top, "main").as_deref(), Some("main"));
+        let shown = String::from_utf8(a.output().clone()).unwrap();
+        assert!(shown.contains("There is no branch mian"), "{shown}");
     }
 }

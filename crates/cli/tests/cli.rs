@@ -2686,6 +2686,7 @@ fn the_brief_digests_the_session() {
     let brief = s.run(&["brief", "--task", &id]);
     let out = text(&brief);
     assert!(out.contains("Session") && out.contains("refused 1: risky command 1") && out.contains("subagents 1: Explore 1"), "{out}");
+    assert!(out.contains("under a minute") && !out.contains("0 min"), "{out}");
     // Work done through the shell has no paths in the log, so "0 files touched" would mislead.
     assert!(!out.contains("0 files touched"), "{out}");
     let v = json(&s.run(&["brief", "--task", &id, "--json"]));
@@ -2790,7 +2791,7 @@ fn guided_init_asks_about_the_team_branches_and_rules_and_writes_the_answers() {
     // team: small; lands on: main; main=dev, uat=uat, production=prod; keep checks; add lint;
     // protected: none; locked: LICENSE; append-only: none; do-not-read: none; outside plan,
     // weakened tests, landing: defaults; write: yes.
-    let answers = "2\n\n\n\n\n\nlint: npm run lint\n\n\nLICENSE\n\n\n\n\n\n\n";
+    let answers = "2\n\n\n\n\n\n\nlint: npm run lint\n\n\nLICENSE\n\n\n\n\n\n\n";
     let out = s.run_with_stdin(&["init", "--guided"], answers);
     assert_eq!(code(&out), 0, "{}", text(&out));
     let shown = text(&out);
@@ -2814,7 +2815,7 @@ fn policy_edit_changes_an_existing_setup_and_says_how_the_change_takes_effect() 
     s.commit_all("05");
     // keep the current rules; lands on main; environments: defaults; checks kept, none added;
     // paths: defaults; outside plan: refuse; tests: default; landing: automatic; write: yes.
-    let answers = "\n\n\n\n\n\n\n\n\n\n\n4\n\n2\n\n";
+    let answers = "\n\n\n\n\n\n\n\n\n\n\n\n4\n\n2\n\n";
     let out = s.run_with_stdin(&["policy", "--edit", "--guided"], answers);
     assert_eq!(code(&out), 0, "{}", text(&out));
     let p = policy_of(&s);
@@ -2941,8 +2942,126 @@ fn policy_answer_flags_need_edit() {
 #[test]
 fn bad_answers_to_write_this_do_not_write() {
     let s = with_environment_branches();
-    let mut answers = "\n".repeat(14);
+    let mut answers = "\n".repeat(15);
     answers.push_str("quit\nquit\nquit\n");
     let out = s.run_with_stdin(&["init", "--guided"], &answers);
     assert!(!s.path(".05/policy.toml").exists(), "{}", text(&out));
+}
+
+#[test]
+fn a_level_can_hold_several_environments_and_any_branch_can_be_one() {
+    let s = with_environment_branches();
+    s.git(&["branch", "dev"]);
+    s.git(&["branch", "eu-main"]);
+    // team; landing main; dev=dev (suggested); main: dev again, named dev-main by default;
+    // uat=uat; production=prod; add eu-main: name dev-eu, level dev; finish; the rest defaults.
+    let answers = "\n\n\n1\n\n\n\neu-main\ndev-eu\n1\n\n".to_string() + &"\n".repeat(12);
+    let out = s.run_with_stdin(&["init", "--guided"], &answers);
+    assert_eq!(code(&out), 0, "{}", text(&out));
+    let p = policy_of(&s);
+    let envs: Vec<(String, String, Option<&str>)> = p.environment.iter().map(|e| (e.name.clone(), e.branch.clone(), e.level())).collect();
+    assert_eq!(envs, [
+        ("dev".into(), "dev".into(), Some("dev")),
+        ("dev-main".into(), "main".into(), Some("dev")),
+        ("dev-eu".into(), "eu-main".into(), Some("dev")),
+        ("uat".into(), "uat".into(), Some("uat")),
+        ("prod".into(), "production".into(), Some("prod")),
+    ], "{}", text(&out));
+    assert!(fs::read_to_string(s.path(".05/policy.toml")).unwrap().contains("min_version = \"0.0.5\""));
+    let status = text(&s.run(&[]));
+    assert!(status.contains("dev: dev (") && status.contains(", dev-eu: eu-main (") && status.contains("→ uat: uat"), "{status}");
+}
+
+#[test]
+fn env_flags_take_a_level_for_names_that_are_not_one() {
+    let s = with_environment_branches();
+    assert_ne!(code(&s.run(&["init", "--env", "dev-eu=main"])), 0, "a name that is not a level needs one");
+    let out = s.run(&["init", "--env", "dev=main", "--env", "dev-eu=uat:dev", "--env", "prod=production"]);
+    assert_eq!(code(&out), 0, "{}", text(&out));
+    assert_eq!(policy_of(&s).environment[1].level.as_deref(), Some("dev"));
+}
+
+/// Press Enter through `policy --edit` and assert the file did not change.
+fn enter_through_edit_keeps(s: &Sandbox) {
+    let before = fs::read_to_string(s.path(".05/policy.toml")).unwrap();
+    let out = s.run_with_stdin(&["policy", "--edit", "--guided"], &"\n".repeat(60));
+    assert_eq!(code(&out), 0, "{}", text(&out));
+    assert_eq!(fs::read_to_string(s.path(".05/policy.toml")).unwrap(), before, "{}", text(&out));
+}
+
+#[test]
+fn an_edit_keeps_environments_that_share_a_level_in_their_order() {
+    let s = with_environment_branches();
+    for b in ["zeta", "alpha", "dev"] {
+        s.git(&["branch", b]);
+    }
+    assert_eq!(code(&s.run(&["init", "--env", "dev=dev", "--env", "zeta=zeta:dev", "--env", "alpha=alpha:dev", "--env", "prod=production"])), 0);
+    enter_through_edit_keeps(&s);
+}
+
+#[test]
+fn an_edit_keeps_a_0_0_4_environment_with_a_custom_name_and_no_level() {
+    let s = with_environment_branches();
+    assert_eq!(code(&s.run(&["init", "--defaults"])), 0);
+    let p = fs::read_to_string(s.path(".05/policy.toml")).unwrap();
+    s.write(".05/policy.toml", &format!("{p}\n[[environment]]\nname = \"dev\"\nbranch = \"main\"\n\n[[environment]]\nname = \"staging\"\nbranch = \"uat\"\n\n[[environment]]\nname = \"prod\"\nbranch = \"production\"\n"));
+    enter_through_edit_keeps(&s);
+    s.commit_all("envs");
+    let status = text(&s.run(&[]));
+    let (dev, staging, prod) = (status.find("dev: main").unwrap(), status.find("staging: uat").unwrap(), status.find("prod: production").unwrap());
+    assert!(dev < staging && staging < prod, "file order for a name with no level: {status}");
+}
+
+#[test]
+fn an_edit_of_a_policy_without_environments_adds_none() {
+    let s = with_environment_branches();
+    assert_eq!(code(&s.run(&["init", "--defaults"])), 0);
+    enter_through_edit_keeps(&s);
+}
+
+#[test]
+fn a_suggested_name_never_collides_with_an_environment_asked_about_later() {
+    let s = with_environment_branches();
+    s.git(&["branch", "dev"]);
+    s.git(&["branch", "release"]);
+    assert_eq!(code(&s.run(&["init", "--env", "dev=dev", "--env", "dev-main=release:dev"])), 0);
+    // main: dev (a second dev environment, suggested name), then Enter everywhere.
+    let mut answers = String::new();
+    let out = s.run_with_stdin(&["policy", "--edit", "--guided"], &{
+        // team, landing, then the branches in file order: dev, release; then main (new).
+        answers.push_str("\n\n\n\n1\n");
+        answers.push_str(&"\n".repeat(55));
+        answers
+    });
+    assert_eq!(code(&out), 0, "{}", text(&out));
+    let names: Vec<String> = policy_of(&s).environment.iter().map(|e| e.name.clone()).collect();
+    let mut unique = names.clone();
+    unique.sort();
+    unique.dedup();
+    assert_eq!(unique.len(), names.len(), "{names:?}");
+}
+
+#[test]
+fn the_review_says_what_the_scope_choice_does_and_long_paths_are_not_cut() {
+    let s = with_environment_branches();
+    let long = "infra/terraform/environments/production-europe-west/customer-facing/**";
+    // team, landing, envs x3, add none, keep checks, add none, protected = long, locked, append,
+    // no-read, scope = 2 (ask me), tests, land, write.
+    let answers = format!("\n\n\n\n\n\n\n\n{long}\n\n\n\n2\n\n\n\n");
+    let out = s.run_with_stdin(&["init", "--guided"], &answers);
+    assert_eq!(code(&out), 0, "{}", text(&out));
+    let review = text(&out);
+    let review = &review[review.find("7/7").unwrap()..];
+    let words = review.split_whitespace().collect::<Vec<_>>().join(" ");
+    assert!(words.contains("let it, but ask me before each edit outside the plan"), "{review}");
+    let joined: String = review.split_whitespace().collect();
+    assert!(joined.contains(&long.replace(' ', "")) && !review.contains('…') && !review.contains('~'), "{review}");
+}
+
+#[test]
+fn env_flags_infer_a_level_from_a_common_name() {
+    let s = with_environment_branches();
+    let out = s.run(&["init", "--env", "dev=main", "--env", "staging=uat", "--env", "prod=production"]);
+    assert_eq!(code(&out), 0, "{}", text(&out));
+    assert_eq!(policy_of(&s).environment[1].level(), Some("uat"));
 }

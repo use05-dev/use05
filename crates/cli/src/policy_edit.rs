@@ -7,6 +7,9 @@ use use05_core::policy::{CheckDef, Environment, IntentMode, LandMode, Policy, Se
 /// The first use05 that reads `[[environment]]`.
 const ENVIRONMENTS_SINCE: &str = "0.0.4";
 
+/// The first use05 that reads an environment's `level`.
+const LEVELS_SINCE: &str = "0.0.5";
+
 /// Everything the guided setup asks about.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Settings {
@@ -121,6 +124,9 @@ pub fn apply(text: &str, s: &Settings) -> Result<String, String> {
                 let mut t = Table::new();
                 t.insert("name", Item::Value(e.name.as_str().into()));
                 t.insert("branch", Item::Value(e.branch.as_str().into()));
+                if let Some(l) = &e.level {
+                    t.insert("level", Item::Value(l.as_str().into()));
+                }
                 envs.push(t);
             }
             doc.insert("environment", Item::ArrayOfTables(envs));
@@ -154,10 +160,17 @@ pub fn apply(text: &str, s: &Settings) -> Result<String, String> {
     }
     // Environments need 0.0.4 to be read. Raise the minimum so an older use05 is told to
     // upgrade instead of failing on a section it does not know.
-    if !s.environments.is_empty() {
+    let needs = if s.environments.iter().any(|e| e.level.is_some()) {
+        Some(LEVELS_SINCE)
+    } else if !s.environments.is_empty() {
+        Some(ENVIRONMENTS_SINCE)
+    } else {
+        None
+    };
+    if let Some(needs) = needs {
         let min = doc.get("use05").and_then(|t| t.get("min_version")).and_then(Item::as_str).unwrap_or("0.0.0").to_string();
-        if use05_core::policy::version_below(&min, ENVIRONMENTS_SINCE) {
-            set(table(&mut doc, "use05"), "min_version", ENVIRONMENTS_SINCE.into());
+        if use05_core::policy::version_below(&min, needs) {
+            set(table(&mut doc, "use05"), "min_version", needs.into());
         }
     }
     let out = doc.to_string();
@@ -188,7 +201,7 @@ mod tests {
         s.approvals_min = 2;
         s.target = Some("main".into());
         s.land = LandMode::Auto;
-        s.environments = vec![Environment { name: "dev".into(), branch: "main".into() }, Environment { name: "prod".into(), branch: "production".into() }];
+        s.environments = vec![Environment { name: "dev".into(), branch: "main".into(), level: None }, Environment { name: "prod".into(), branch: "production".into(), level: None }];
         s.checks.push(check("lint", &["npm", "run", "lint"]));
         s.locked = vec!["LICENSE".into()];
         s.append_only = vec!["migrations/**".into()];
@@ -219,7 +232,7 @@ mod tests {
     fn a_result_that_would_not_parse_is_refused() {
         let text = template();
         let mut s = Settings::from_policy(&Policy::parse(&text).unwrap());
-        s.environments = vec![Environment { name: "dev".into(), branch: "main".into() }, Environment { name: "dev".into(), branch: "uat".into() }];
+        s.environments = vec![Environment { name: "dev".into(), branch: "main".into(), level: None }, Environment { name: "dev".into(), branch: "uat".into(), level: None }];
         assert!(apply(&text, &s).is_err());
     }
 }

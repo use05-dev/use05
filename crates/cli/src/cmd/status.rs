@@ -123,7 +123,12 @@ fn gather(ui: &Ui, repo: &Path) -> Status {
                 .or_else(|| use05_core::git::resolve_commit(ctx.top(), &format!("refs/remotes/origin/{b}")))
                 .map_or_else(|| "no such branch yet".to_string(), |c| c.chars().take(7).collect())
         };
-        let ladder = ctx.policy.environment.iter().map(|e| format!("{}: {} ({})", e.name, e.branch, head(&e.branch))).collect::<Vec<_>>().join(" → ");
+        // Environments on one level side by side, the levels in ladder order.
+        let ladder = use05_core::policy::ladder(&ctx.policy.environment)
+            .iter()
+            .map(|rung| rung.iter().map(|e| format!("{}: {} ({})", e.name, e.branch, head(&e.branch))).collect::<Vec<_>>().join(", "))
+            .collect::<Vec<_>>()
+            .join(" → ");
         out.section("Environments", vec![Item::dim(ladder)]);
         out.blank();
     }
