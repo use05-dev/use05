@@ -29,4 +29,6 @@ got=$("$tmp/prefix/bin/use05" --version)
 [ "$got" = "use05 $V" ] || { echo "npm test: expected \"use05 $V\", got \"$got\"" >&2; exit 1; }
 set +e; "$tmp/prefix/bin/use05" no-such-command 2>/dev/null; code=$?; set -e
 [ "$code" = 6 ] || { echo "npm test: the exit code was not passed through (got $code, want 6)" >&2; exit 1; }
-echo "npm test: installed from packed packages, ran $got, exit codes pass through"
+# The publish step the workflow runs, as a dry run: nothing is sent.
+"$ROOT/npm/publish.sh" "$tmp/out" --dry-run >/dev/null 2>&1 || { echo "npm test: npm/publish.sh --dry-run failed" >&2; exit 1; }
+echo "npm test: installed from packed packages, ran $got, exit codes pass through, publish dry run ok"

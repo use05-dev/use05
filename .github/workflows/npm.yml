@@ -54,6 +54,4 @@ jobs:
         run: |
           flags="--access public --provenance"
           [ "$DRY" = true ] && flags="$flags --dry-run"
-          # Platform packages first, so the use05 package never points at one that is not there.
-          for d in out/cli-*; do npm publish "$d" $flags; done
-          npm publish out/use05 $flags
+          npm/publish.sh out $flags
