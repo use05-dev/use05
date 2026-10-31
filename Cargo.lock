@@ -676,7 +676,7 @@ dependencies = [
 
 [[package]]
 name = "use05"
-version = "0.0.1"
+version = "0.0.2"
 dependencies = [
  "clap",
  "hex",
@@ -693,7 +693,7 @@ dependencies = [
 
 [[package]]
 name = "use05-core"
-version = "0.0.1"
+version = "0.0.2"
 dependencies = [
  "base64",
  "chacha20poly1305",
@@ -711,7 +711,7 @@ dependencies = [
 
 [[package]]
 name = "use05-receipt"
-version = "0.0.1"
+version = "0.0.2"
 dependencies = [
  "base64",
  "ed25519-dalek",
@@ -723,7 +723,7 @@ dependencies = [
 
 [[package]]
 name = "use05-runner"
-version = "0.0.1"
+version = "0.0.2"
 dependencies = [
  "hex",
  "libc",

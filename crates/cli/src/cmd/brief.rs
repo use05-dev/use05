@@ -151,7 +151,7 @@ pub fn render(ui: &Ui, b: &Brief, org: Option<&str>, overlaps: &[use05_core::ove
     out.blank();
 
     // Drift and findings
-    let findings: Vec<Item> = b.gate.findings.iter().filter(|f| !f.code.starts_with("CHECK_") && !f.code.starts_with("EVIDENCE_") && f.effect != Effect::Info || f.code == "SCOPE_UNDECLARED").map(effect_item).collect();
+    let findings: Vec<Item> = b.gate.findings.iter().filter(|f| !f.code.starts_with("CHECK_") && !f.code.starts_with("EVIDENCE_") && f.effect != Effect::Info || ["SCOPE_UNDECLARED", "BYPASS_NOT_ALLOWED"].contains(&f.code)).map(effect_item).collect();
     out.section("Drift", if findings.is_empty() { vec![Item::new(Glyph::Ok, Tone::Good, "nothing differs from the intent")] } else { findings });
     out.blank();
 

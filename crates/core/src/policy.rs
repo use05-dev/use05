@@ -117,6 +117,9 @@ impl Default for TrustKey {
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields, default)]
 pub struct Policy {
+    /// Unset in a policy that does not say; then it is not written out, so existing digests hold.
+    #[serde(skip_serializing_if = "Use05Policy::is_unset")]
+    pub use05: Use05Policy,
     pub intent: IntentPolicy,
     pub check: Vec<CheckDef>,
     pub protect: Protect,
@@ -129,6 +132,49 @@ pub struct Policy {
     pub trust: TrustPolicy,
     pub risk: RiskPolicy,
     pub branches: BranchPolicy,
+}
+
+/// About the policy file itself (D78).
+#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq)]
+#[serde(deny_unknown_fields, default)]
+pub struct Use05Policy {
+    /// The oldest use05 that understands this file. Read before anything else in it, so an older
+    /// CLI asks to be upgraded instead of failing on a section it does not know.
+    pub min_version: Option<String>,
+}
+
+impl Use05Policy {
+    fn is_unset(&self) -> bool {
+        self.min_version.is_none()
+    }
+}
+
+fn parse_version(text: &str) -> Option<(u64, u64, u64)> {
+    // A pre-release or build suffix (`0.1.0-ci`) counts as its version.
+    let core = text.trim().split(['-', '+']).next()?;
+    let mut parts = core.split('.').map(|p| p.parse::<u64>().ok());
+    let v = (parts.next()??, parts.next()??, parts.next()??);
+    parts.next().is_none().then_some(v)
+}
+
+/// Whether version `a` is older than `b`. Unreadable versions compare as not older.
+pub fn version_below(a: &str, b: &str) -> bool {
+    matches!((parse_version(a), parse_version(b)), (Some(a), Some(b)) if a < b)
+}
+
+/// Refuse a policy written for a newer use05, before reading any section this version may not know.
+fn check_min_version(text: &str) -> Result<()> {
+    let Ok(table) = toml::from_str::<toml::Table>(text) else { return Ok(()) };
+    let Some(min) = table.get("use05").and_then(|t| t.get("min_version")) else { return Ok(()) };
+    let invalid = || Error::new("POLICY_INVALID", format!("use05.min_version must be a version such as \"{}\"", env!("CARGO_PKG_VERSION")));
+    let min = min.as_str().ok_or_else(invalid)?;
+    parse_version(min).ok_or_else(invalid)?;
+    let this = env!("CARGO_PKG_VERSION");
+    if version_below(this, min) {
+        return Err(Error::new("POLICY_NEEDS_NEWER", format!("this repository's policy needs use05 {min} or newer; this is use05 {this}"))
+            .with_next("upgrade: npm i -g @use05/cli, or curl -fsSL https://use05.dev/install.sh | sh"));
+    }
+    Ok(())
 }
 
 /// Which branches are real, which are agents' working space, and where work lands (D69).
@@ -184,10 +230,63 @@ pub struct IntentPolicy {
     pub mode: IntentMode,
 }
 
-#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq)]
+/// Path rules (D79). Unset rules are not written out, so a policy that uses none of them keeps
+/// its digest, and approvals bound to it still count.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 #[serde(deny_unknown_fields, default)]
 pub struct Protect {
+    /// A change here needs a person's approval.
     pub paths: Vec<String>,
+    /// Never changed: no approval clears it; a person's bypass can, unless `bypass` is off.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub locked: Vec<String>,
+    /// Locks no bypass can clear.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub absolute: Vec<String>,
+    /// New files only: existing ones are never edited, renamed or deleted.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub append_only: Vec<String>,
+    /// May be edited, never deleted.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub no_delete: Vec<String>,
+    /// Agents may not open these. Only an agent's own hooks can see a read, so this is advisory.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub no_read: Vec<String>,
+    /// Whether a person's bypass can let a change through the rules above.
+    #[serde(skip_serializing_if = "is_true")]
+    pub bypass: bool,
+}
+
+fn is_true(b: &bool) -> bool {
+    *b
+}
+
+impl Default for Protect {
+    fn default() -> Self {
+        Protect { paths: Vec::new(), locked: Vec::new(), absolute: Vec::new(), append_only: Vec::new(), no_delete: Vec::new(), no_read: Vec::new(), bypass: true }
+    }
+}
+
+impl Protect {
+    fn any(patterns: &[String], path: &str) -> bool {
+        patterns.iter().any(|p| crate::glob::matches(p, path))
+    }
+    pub fn is_locked(&self, path: &str) -> bool {
+        Protect::any(&self.locked, path) || Protect::any(&self.absolute, path)
+    }
+    /// A lock no bypass can clear: listed as absolute, or any lock when bypass is off.
+    pub fn is_absolute(&self, path: &str) -> bool {
+        Protect::any(&self.absolute, path) || (!self.bypass && self.is_locked(path))
+    }
+    pub fn is_append_only(&self, path: &str) -> bool {
+        Protect::any(&self.append_only, path)
+    }
+    pub fn is_no_delete(&self, path: &str) -> bool {
+        Protect::any(&self.no_delete, path)
+    }
+    pub fn is_no_read(&self, path: &str) -> bool {
+        Protect::any(&self.no_read, path)
+    }
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
@@ -284,6 +383,7 @@ impl Default for EnforcePolicy {
 impl Default for Policy {
     fn default() -> Self {
         Policy {
+            use05: Use05Policy::default(),
             intent: IntentPolicy::default(),
             check: Vec::new(),
             protect: Protect::default(),
@@ -325,6 +425,20 @@ pub struct Floor {
     pub risk_rules: Vec<crate::risk::Rule>,
     /// `false` forbids repositories from exempting paths.
     pub risk_exempt_allowed: Option<bool>,
+    /// Path rules every repository gets (D79). Unset ones are not written, so signed floors keep their bytes.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub protect_locked: Vec<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub protect_absolute: Vec<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub protect_append_only: Vec<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub protect_no_delete: Vec<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub protect_no_read: Vec<String>,
+    /// `false` forbids bypassing path rules.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub protect_bypass: Option<bool>,
 }
 
 impl Policy {
@@ -387,9 +501,25 @@ impl Policy {
         if floor.risk_exempt_allowed == Some(false) {
             self.risk.exempt_allowed = false;
         }
+        let add = |mine: &mut Vec<String>, theirs: &[String]| {
+            for p in theirs {
+                if !mine.contains(p) {
+                    mine.push(p.clone());
+                }
+            }
+        };
+        add(&mut self.protect.locked, &floor.protect_locked);
+        add(&mut self.protect.absolute, &floor.protect_absolute);
+        add(&mut self.protect.append_only, &floor.protect_append_only);
+        add(&mut self.protect.no_delete, &floor.protect_no_delete);
+        add(&mut self.protect.no_read, &floor.protect_no_read);
+        if floor.protect_bypass == Some(false) {
+            self.protect.bypass = false;
+        }
     }
 
     pub fn parse(text: &str) -> Result<Policy> {
+        check_min_version(text)?;
         let policy: Policy = toml::from_str(text).map_err(|e| {
             Error::new("POLICY_INVALID", format!("the policy is not valid: {}", e.to_string().trim_end()))
                 .with_next("fix the file, or run: use05 policy")
@@ -408,6 +538,10 @@ impl Policy {
                 return Err(Error::new("POLICY_INVALID", format!("the check {:?} is defined twice", check.name)));
             }
             seen.push(&check.name);
+        }
+        if self.protect.is_absolute(POLICY_PATH) {
+            return Err(Error::new("POLICY_INVALID", format!("a lock no bypass can clear covers {POLICY_PATH}, so the policy could never be changed again"))
+                .with_next("leave the policy file out of `absolute`, or turn `bypass` back on"));
         }
         if self.approvals.min == 0 {
             return Err(Error::new("POLICY_INVALID", "approvals.min must be at least 1"));
@@ -486,6 +620,8 @@ pub fn explain(repo: &Policy, effective: &Policy) -> Vec<Row> {
     let roles = |p: &Policy| p.evidence.accept.iter().map(|r| r.word()).collect::<Vec<_>>().join(", ");
     let names = |p: &Policy| p.check.iter().map(|c| format!("{}{}", c.name, if c.required { "" } else { "?" })).collect::<Vec<_>>().join(", ");
     let paths = |p: &Policy| p.protect.paths.join(", ");
+    let list = |v: &Vec<String>| if v.is_empty() { "none".to_string() } else { v.join(", ") };
+    let yes = |b: bool| if b { "a person may".to_string() } else { "never".to_string() };
     let keys = |p: &Policy| p.trust.key.iter().map(|k| format!("{} ({})", k.name, k.role.word())).collect::<Vec<_>>().join(", ");
     let env = |p: &Policy| p.env.allow.as_ref().map_or("unrestricted".to_string(), |a| a.join(", "));
     let target = |p: &Policy| p.branches.target.clone().unwrap_or_else(|| "the remote's default branch".to_string());
@@ -496,7 +632,9 @@ pub fn explain(repo: &Policy, effective: &Policy) -> Vec<Row> {
         (true, true) => "none".to_string(),
         (false, true) => p.risk.exempt.join(", "),
     };
+    let min = |p: &Policy| p.use05.min_version.clone().unwrap_or_else(|| "not set".to_string());
     vec![
+        row("use05.min_version", min(&default), min(repo), min(effective)),
         row("intent.mode", format!("{:?}", default.intent.mode).to_lowercase(), format!("{:?}", repo.intent.mode).to_lowercase(), format!("{:?}", effective.intent.mode).to_lowercase()),
         row("drift.scope", word(default.drift.scope), word(repo.drift.scope), word(effective.drift.scope)),
         row("drift.dependencies", word(default.drift.dependencies), word(repo.drift.dependencies), word(effective.drift.dependencies)),
@@ -509,6 +647,12 @@ pub fn explain(repo: &Policy, effective: &Policy) -> Vec<Row> {
         row("record.middle", format!("{:?}", default.record.middle).to_lowercase(), format!("{:?}", repo.record.middle).to_lowercase(), format!("{:?}", effective.record.middle).to_lowercase()),
         row("enforce.on_error", format!("{:?}", default.enforce.on_error).to_lowercase(), format!("{:?}", repo.enforce.on_error).to_lowercase(), format!("{:?}", effective.enforce.on_error).to_lowercase()),
         row("protect.paths", paths(&default), paths(repo), paths(effective)),
+        row("protect.locked", list(&default.protect.locked), list(&repo.protect.locked), list(&effective.protect.locked)),
+        row("protect.absolute", list(&default.protect.absolute), list(&repo.protect.absolute), list(&effective.protect.absolute)),
+        row("protect.append_only", list(&default.protect.append_only), list(&repo.protect.append_only), list(&effective.protect.append_only)),
+        row("protect.no_delete", list(&default.protect.no_delete), list(&repo.protect.no_delete), list(&effective.protect.no_delete)),
+        row("protect.no_read", list(&default.protect.no_read), list(&repo.protect.no_read), list(&effective.protect.no_read)),
+        row("protect.bypass", yes(default.protect.bypass), yes(repo.protect.bypass), yes(effective.protect.bypass)),
         row("checks", names(&default), names(repo), names(effective)),
         row("env.allow", env(&default), env(repo), env(effective)),
         row("trusted keys", keys(&default), keys(repo), keys(effective)),
@@ -587,6 +731,66 @@ mod tests {
         assert!(Policy::parse("[intent]\nmode = \"sometimes\"").is_err());
         assert!(Policy::parse("[[check]]\nname = \"t\"").is_err(), "a check needs a command");
         assert!(Policy::parse("[approvals]\nmin = 0").is_err());
+    }
+
+    #[test]
+    fn a_policy_for_a_newer_use05_says_so_before_reading_sections_it_does_not_know() {
+        let e = Policy::parse("[use05]\nmin_version = \"99.0.0\"\n\n[[env]]\nname = \"prod\"\n").unwrap_err();
+        assert_eq!(e.code, "POLICY_NEEDS_NEWER");
+        assert!(e.message.contains("99.0.0") && e.message.contains(env!("CARGO_PKG_VERSION")), "{}", e.message);
+        assert!(e.next.as_deref().is_some_and(|n| n.contains("npm i -g @use05/cli")), "{:?}", e.next);
+    }
+
+    #[test]
+    fn a_policy_this_version_meets_is_read_and_keeps_its_minimum() {
+        let p = parse(&format!("[use05]\nmin_version = \"{}\"\n", env!("CARGO_PKG_VERSION")));
+        assert_eq!(p.use05.min_version.as_deref(), Some(env!("CARGO_PKG_VERSION")));
+        assert!(parse("[use05]\nmin_version = \"0.0.0\"").use05.min_version.is_some());
+        assert!(!Policy::default().to_toml().contains("[use05]"), "an unset minimum is not written out");
+    }
+
+    #[test]
+    fn a_minimum_version_that_is_not_a_version_is_an_error() {
+        assert_eq!(Policy::parse("[use05]\nmin_version = \"soon\"").unwrap_err().code, "POLICY_INVALID");
+        assert_eq!(Policy::parse("[use05]\nmin_version = 2").unwrap_err().code, "POLICY_INVALID");
+    }
+
+    #[test]
+    fn versions_compare_by_number_not_by_text() {
+        assert!(version_below("0.0.9", "0.0.10"));
+        assert!(version_below("0.9.0", "1.0.0"));
+        assert!(!version_below("0.1.0", "0.1.0"));
+        assert!(!version_below("0.1.0-ci", "0.1.0"), "a pre-release build counts as its version");
+    }
+
+    #[test]
+    fn path_rules_are_read_and_an_unset_rule_changes_no_existing_digest() {
+        let p = parse("[protect]\nlocked = [\"LICENSE\"]\nappend_only = [\"migrations/**\"]\nno_delete = [\"docs/**\"]\nno_read = [\".env*\"]\nabsolute = [\"NOTICE\"]\nbypass = false");
+        assert!(p.protect.is_locked("LICENSE") && p.protect.is_locked("NOTICE"), "an absolute lock is a lock");
+        assert!(p.protect.is_absolute("NOTICE") && p.protect.is_absolute("LICENSE"), "with bypass off, every lock is absolute");
+        assert!(p.protect.is_append_only("migrations/001.sql") && p.protect.is_no_delete("docs/a.md") && p.protect.is_no_read(".env.local"));
+        let open = parse("[protect]\nlocked = [\"LICENSE\"]");
+        assert!(open.protect.is_locked("LICENSE") && !open.protect.is_absolute("LICENSE"), "a lock is bypassable by default");
+        let text = Policy::default().to_toml();
+        assert!(!text.contains("locked") && !text.contains("bypass") && !text.contains("no_read"), "unset rules are not written, so digests and approvals hold:\n{text}");
+    }
+
+    #[test]
+    fn a_lock_that_would_freeze_the_policy_itself_is_refused() {
+        assert_eq!(Policy::parse("[protect]\nabsolute = [\".05/**\"]").unwrap_err().code, "POLICY_INVALID");
+        assert_eq!(Policy::parse("[protect]\nlocked = [\".05/policy.toml\"]\nbypass = false").unwrap_err().code, "POLICY_INVALID");
+        assert!(Policy::parse("[protect]\nlocked = [\".05/policy.toml\"]").is_ok(), "a bypassable lock on the policy is the developer's choice");
+    }
+
+    #[test]
+    fn a_floor_adds_path_rules_and_can_turn_bypass_off_but_never_on() {
+        let mut repo = parse("[protect]\nlocked = [\"LICENSE\"]");
+        repo.tighten(&Floor { protect_locked: vec!["vendor/**".into()], protect_no_read: vec!["secrets/**".into()], protect_bypass: Some(false), ..Floor::default() });
+        assert!(repo.protect.is_locked("LICENSE") && repo.protect.is_locked("vendor/x.rs") && repo.protect.is_no_read("secrets/k"));
+        assert!(!repo.protect.bypass);
+        let mut strict = parse("[protect]\nbypass = false");
+        strict.tighten(&Floor { protect_bypass: Some(true), ..Floor::default() });
+        assert!(!strict.protect.bypass, "a floor never loosens");
     }
 
     #[test]

@@ -708,6 +708,177 @@ fn break_glass_lets_a_change_through_and_says_so_in_the_brief() {
     assert!(text(&brief).contains("break-glass") && text(&brief).contains("production is down"), "{}", text(&brief));
 }
 
+// ---------------------------------------------------------------- path rules (D79)
+
+/// A repository whose committed policy carries these `[protect]` settings, with `LICENSE`,
+/// `notes/001.md` and `docs/guide.md` committed.
+fn with_path_rules(rules: &str) -> Sandbox {
+    let s = Sandbox::initialised();
+    let policy = fs::read_to_string(s.path(".05/policy.toml")).unwrap();
+    s.write(".05/policy.toml", &policy.replacen("[protect]\n", &format!("[protect]\n{rules}\n"), 1));
+    s.write("LICENSE", "Apache-2.0\n");
+    fs::create_dir_all(s.path("notes")).unwrap();
+    fs::create_dir_all(s.path("docs")).unwrap();
+    s.write("notes/001.md", "first\n");
+    s.write("docs/guide.md", "guide\n");
+    s.commit_all("path rules");
+    s
+}
+
+fn decision_of(out: &Output) -> String {
+    json(out)["decision"].as_str().unwrap_or("").to_string()
+}
+
+fn finding_codes(out: &Output) -> Vec<String> {
+    json(out)["brief"]["gate"]["findings"].as_array().unwrap().iter().map(|f| f["code"].as_str().unwrap().to_string()).collect()
+}
+
+#[test]
+fn a_locked_file_cannot_be_changed_and_no_approval_clears_it() {
+    let s = with_path_rules("locked = [\"LICENSE\"]");
+    s.write("LICENSE", "MIT\n");
+    s.git(&["add", "-A"]);
+    let out = s.run(&["brief", "--json"]);
+    assert_eq!(decision_of(&out), "deny", "{}", text(&out));
+    assert!(finding_codes(&out).contains(&"LOCKED_PATH".to_string()), "{:?}", finding_codes(&out));
+    assert!(!finding_codes(&out).contains(&"PROTECTED_PATH".to_string()), "a locked file is reported once, as locked");
+
+    s.approver();
+    s.run_with_stdin(&["approve", "--reason", "fine by me", "--passphrase-stdin"], "correct horse\n");
+    assert_eq!(decision_of(&s.run(&["brief", "--json"])), "deny", "an approval never clears a lock");
+}
+
+#[test]
+fn a_person_can_bypass_a_lock_and_the_brief_says_so() {
+    let s = with_path_rules("locked = [\"LICENSE\"]");
+    s.write("LICENSE", "MIT\n");
+    s.git(&["add", "-A"]);
+    s.approver();
+    let out = s.run_with_stdin(&["bypass", "--reason", "relicensing, agreed by everyone", "--passphrase-stdin"], "correct horse\n");
+    assert_eq!(code(&out), 0, "{}", text(&out));
+    let brief = s.run(&["brief"]);
+    assert_eq!(code(&brief), 0, "{}", text(&brief));
+    assert!(text(&brief).contains("break-glass") && text(&brief).contains("relicensing"), "{}", text(&brief));
+}
+
+#[test]
+fn an_absolute_lock_and_a_policy_without_bypass_cannot_be_bypassed() {
+    for rules in ["absolute = [\"LICENSE\"]", "locked = [\"LICENSE\"]\nbypass = false"] {
+        let s = with_path_rules(rules);
+        s.write("LICENSE", "MIT\n");
+        s.git(&["add", "-A"]);
+        s.approver();
+        s.run_with_stdin(&["bypass", "--reason", "relicensing, agreed by everyone", "--passphrase-stdin"], "correct horse\n");
+        let out = s.run(&["brief", "--json"]);
+        assert_eq!(decision_of(&out), "deny", "{rules}: {}", text(&out));
+        let brief = s.run(&["brief"]);
+        assert!(text(&brief).contains("no bypass"), "{rules}: the brief says why the bypass did not count:\n{}", text(&brief));
+    }
+}
+
+#[test]
+fn unlocking_a_file_and_changing_it_in_one_change_is_still_denied() {
+    let s = with_path_rules("locked = [\"LICENSE\"]");
+    let policy = fs::read_to_string(s.path(".05/policy.toml")).unwrap();
+    s.write(".05/policy.toml", &policy.replace("locked = [\"LICENSE\"]\n", ""));
+    s.write("LICENSE", "MIT\n");
+    s.git(&["add", "-A"]);
+    let out = s.run(&["brief", "--json"]);
+    assert_eq!(decision_of(&out), "deny", "the base's lock still holds: {}", text(&out));
+    assert!(finding_codes(&out).contains(&"LOCKED_PATH".to_string()));
+}
+
+#[test]
+fn an_append_only_area_takes_new_files_and_refuses_edits_renames_and_deletions() {
+    let s = with_path_rules("append_only = [\"notes/**\"]");
+    s.write("notes/002.md", "second\n");
+    s.git(&["add", "-A"]);
+    let fine = s.run(&["brief", "--json"]);
+    assert!(decision_of(&fine) != "deny" && !finding_codes(&fine).contains(&"APPEND_ONLY".to_string()), "a new file is fine: {}", text(&fine));
+    s.git(&["reset", "-q"]);
+    fs::remove_file(s.path("notes/002.md")).unwrap();
+
+    for change in [&["edit"][..], &["rename"][..], &["delete"][..]] {
+        match change[0] {
+            "edit" => s.write("notes/001.md", "rewritten\n"),
+            "rename" => {
+                s.git(&["mv", "notes/001.md", "notes/001-old.md"]);
+            }
+            _ => fs::remove_file(s.path("notes/001.md")).unwrap(),
+        }
+        s.git(&["add", "-A"]);
+        let out = s.run(&["brief", "--json"]);
+        assert_eq!(decision_of(&out), "deny", "{change:?}: {}", text(&out));
+        assert!(finding_codes(&out).contains(&"APPEND_ONLY".to_string()), "{change:?}: {:?}", finding_codes(&out));
+        s.git(&["reset", "-q", "--hard"]);
+    }
+}
+
+#[test]
+fn a_no_delete_file_can_be_edited_but_not_deleted() {
+    let s = with_path_rules("no_delete = [\"docs/**\"]");
+    s.write("docs/guide.md", "better guide\n");
+    s.git(&["add", "-A"]);
+    let edited = s.run(&["brief", "--json"]);
+    assert!(decision_of(&edited) != "deny" && !finding_codes(&edited).contains(&"NO_DELETE".to_string()), "an edit is fine: {}", text(&edited));
+    s.git(&["reset", "-q", "--hard"]);
+    fs::remove_file(s.path("docs/guide.md")).unwrap();
+    s.git(&["add", "-A"]);
+    let out = s.run(&["brief", "--json"]);
+    assert_eq!(decision_of(&out), "deny", "{}", text(&out));
+    assert!(finding_codes(&out).contains(&"NO_DELETE".to_string()));
+}
+
+#[test]
+fn agent_hooks_refuse_locked_and_append_only_edits_deletions_and_reads_of_no_read_files() {
+    let s = with_path_rules("locked = [\"LICENSE\"]\nappend_only = [\"notes/**\"]\nno_delete = [\"docs/**\"]\nno_read = [\".env*\"]");
+    s.write(".env", "TOKEN=x\n");
+    let hook = |tool: &str, input: Value| {
+        let payload = serde_json::json!({ "session_id": "sess-1234abcd", "cwd": s.dir.path(), "hook_event_name": "PreToolUse", "tool_name": tool, "tool_input": input }).to_string();
+        let out = s.run_with_stdin(&["hook", "claude-code", "PreToolUse"], &payload);
+        let v: Value = serde_json::from_slice(&out.stdout).unwrap_or(Value::Null);
+        (v["hookSpecificOutput"]["permissionDecision"].as_str().map(str::to_string), text(&out))
+    };
+    let (d, why) = hook("Edit", serde_json::json!({ "file_path": s.path("LICENSE"), "old_string": "a", "new_string": "b" }));
+    assert_eq!(d.as_deref(), Some("deny"), "{why}");
+    assert!(why.contains("locked") && !why.contains("approve --intent"), "a lock offers no approval route: {why}");
+
+    assert_eq!(hook("Edit", serde_json::json!({ "file_path": s.path("notes/001.md"), "old_string": "a", "new_string": "b" })).0.as_deref(), Some("deny"));
+    assert_eq!(hook("Write", serde_json::json!({ "file_path": s.path("notes/002.md"), "content": "new" })).0, None, "a new file in an append-only area is fine");
+    assert_eq!(hook("Bash", serde_json::json!({ "command": "rm docs/guide.md" })).0.as_deref(), Some("deny"));
+    assert_eq!(hook("Bash", serde_json::json!({ "command": "sed -i '' s/a/b/ LICENSE" })).0.as_deref(), Some("deny"));
+    assert_eq!(hook("Read", serde_json::json!({ "file_path": s.path(".env") })).0.as_deref(), Some("deny"));
+    assert_eq!(hook("Bash", serde_json::json!({ "command": "cat .env" })).0.as_deref(), Some("deny"));
+    assert_eq!(hook("Read", serde_json::json!({ "file_path": s.path("LICENSE") })).0, None, "reading a locked file is fine");
+    assert_eq!(hook("Edit", serde_json::json!({ "file_path": s.path("docs/guide.md"), "old_string": "a", "new_string": "b" })).0, None, "editing a no-delete file is fine");
+}
+
+#[test]
+fn claude_code_hooks_see_reads_so_no_read_can_hold() {
+    let s = Sandbox::with_agent_hooks();
+    let settings = fs::read_to_string(s.path(".claude/settings.local.json")).unwrap();
+    assert!(settings.contains("Read|Grep|Glob"), "{settings}");
+}
+
+#[test]
+fn rerunning_init_brings_an_older_versions_agent_hooks_up_to_date() {
+    let s = Sandbox::with_agent_hooks();
+    let path = s.path(".claude/settings.local.json");
+    // What an older use05 installed, next to another tool's hook that must be kept.
+    let mut v: Value = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+    v["hooks"]["PreToolUse"][0]["matcher"] = serde_json::json!("Write|Edit|MultiEdit|NotebookEdit|Bash");
+    v["hooks"]["PreToolUse"].as_array_mut().unwrap().push(serde_json::json!({ "matcher": "Bash", "hooks": [{ "type": "command", "command": "other-tool check" }] }));
+    fs::write(&path, serde_json::to_string_pretty(&v).unwrap()).unwrap();
+
+    assert_eq!(code(&s.run(&["init"])), 0);
+    let v: Value = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+    let pre = v["hooks"]["PreToolUse"].as_array().unwrap();
+    let ours: Vec<&Value> = pre.iter().filter(|g| g.to_string().contains("use05 hook")).collect();
+    assert_eq!(ours.len(), 1, "one 05 group, not two: {pre:?}");
+    assert!(ours[0]["matcher"].as_str().unwrap().contains("Read|Grep|Glob"), "{pre:?}");
+    assert!(pre.iter().any(|g| g.to_string().contains("other-tool check")), "another tool's hook is kept: {pre:?}");
+}
+
 #[test]
 fn the_pre_push_hook_stops_a_push_the_gate_denies_and_no_verify_is_the_stated_way_around() {
     let s = Sandbox::initialised();
@@ -803,6 +974,26 @@ fn doctor_reports_problems_with_a_nonzero_exit_and_never_changes_anything() {
     s.commit_all("break the policy");
     let out = s.run(&["doctor", "--json"]);
     assert_ne!(code(&out), 0);
+}
+
+#[test]
+fn a_repository_needing_a_newer_use05_asks_for_an_upgrade_instead_of_a_parse_error() {
+    let s = Sandbox::initialised();
+    let policy = fs::read_to_string(s.path(".05/policy.toml")).unwrap();
+    assert!(policy.contains(&format!("min_version = \"{}\"", env!("CARGO_PKG_VERSION"))), "init records the version that wrote the policy:\n{policy}");
+
+    // A teammate's newer policy, with a section this version has never heard of.
+    s.write(".05/policy.toml", &policy.replace(&format!("min_version = \"{}\"", env!("CARGO_PKG_VERSION")), "min_version = \"99.0.0\"").replace("[intent]", "[[env]]\nname = \"prod\"\n\n[intent]"));
+    s.commit_all("a policy from the future");
+    for args in [&["policy"][..], &[][..], &["doctor"][..]] {
+        let out = s.run(args);
+        // Bare `use05` is the status screen: it always exits 0 and shows the problem with its next step.
+        if !args.is_empty() {
+            assert_ne!(code(&out), 0, "{args:?}: {}", text(&out));
+        }
+        assert!(text(&out).contains("needs use05 99.0.0 or newer"), "{args:?}: {}", text(&out));
+        assert!(text(&out).contains("npm i -g @use05/cli"), "{args:?}: {}", text(&out));
+    }
 }
 
 #[test]

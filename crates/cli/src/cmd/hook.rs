@@ -177,11 +177,55 @@ fn risky(command: &str) -> Option<String> {
 
 struct Decision {
     output: Option<Value>,
+    /// What to record in the action log; `Null` records nothing (reads are not logged).
     log: Value,
+}
+
+const READ_TOOLS: [&str; 4] = ["Read", "Grep", "Glob", "NotebookRead"];
+
+/// A path a no-read rule covers, including the folder a `dir/**` rule names.
+fn unreadable(policy: &use05_core::policy::Policy, path: &str) -> bool {
+    policy.protect.is_no_read(path) || policy.protect.no_read.iter().any(|p| p.strip_suffix("/**") == Some(path))
+}
+
+/// Path rules (D79) broken by a shell command: reading a no-read file, changing a locked one,
+/// rewriting an existing append-only one, or deleting a no-delete one. Word-based and
+/// conservative, like `risky`: a guard against mistakes, not a sandbox.
+fn path_rule_in_command(ctx: &Ctx, cwd: &Path, command: &str) -> Option<String> {
+    let rules = &ctx.policy.protect;
+    let top = ctx.top();
+    for w in words(command) {
+        let program = w.first().map(String::as_str).unwrap_or("");
+        let (program, args) = if program == "git" { (w.get(1).map(String::as_str).unwrap_or(""), &w[w.len().min(2)..]) } else { (program, &w[w.len().min(1)..]) };
+        let reads = ["cat", "head", "tail", "less", "more", "grep", "rg", "awk", "sed", "cp", "base64", "xxd", "strings", "source", ".", "open"].contains(&program);
+        let deletes = ["rm", "mv", "unlink"].contains(&program);
+        let writes = deletes || ["cp", "tee", "sed", "truncate", "chmod", "ln", "touch"].contains(&program) || command.contains('>');
+        for arg in args.iter().filter(|a| !a.starts_with('-')) {
+            let Some(rel) = relative(top, cwd, arg.trim_start_matches('>')) else { continue };
+            if reads && unreadable(&ctx.policy, &rel) {
+                return Some(format!("{rel} is not to be read by agents here. Ask the user if you need something from it."));
+            }
+            if writes && rules.is_locked(&rel) {
+                return Some(format!("{rel} is locked: it is never changed here. Leave it as it is; unlocking is a change to .05/policy.toml that a person approves first."));
+            }
+            if writes && rules.is_append_only(&rel) && top.join(&rel).exists() {
+                return Some(format!("{rel} is in an append-only area: existing files are never edited, renamed or deleted. Add a new file instead."));
+            }
+            if deletes && rules.is_no_delete(&rel) {
+                return Some(format!("{rel} may be edited but never deleted."));
+            }
+        }
+    }
+    None
 }
 
 fn pre_tool_use(ctx: &Ctx, task: &Task, cwd: &Path, tool: &str, input: &Value) -> Decision {
     let top = ctx.top();
+    if READ_TOOLS.contains(&tool) {
+        let read: Vec<String> = ["file_path", "notebook_path", "path"].iter().filter_map(|k| input.get(*k).and_then(Value::as_str)).filter_map(|p| relative(top, cwd, p)).collect();
+        let output = read.iter().find(|p| unreadable(&ctx.policy, p)).map(|p| deny(&format!("05: {p} is not to be read by agents here. Ask the user if you need something from it.")));
+        return Decision { output, log: Value::Null };
+    }
     let mut log = json!({ "event": "tool", "tool": tool });
 
     if let Some(command) = input.get("command").and_then(Value::as_str) {
@@ -190,12 +234,45 @@ fn pre_tool_use(ctx: &Ctx, task: &Task, cwd: &Path, tool: &str, input: &Value) -
             log["why"] = json!("risky command");
             return Decision { output: Some(deny(&format!("05: {reason}"))), log };
         }
+        if let Some(reason) = path_rule_in_command(ctx, cwd, command) {
+            log["decision"] = json!("deny");
+            log["why"] = json!("path rule");
+            return Decision { output: Some(deny(&format!("05: {reason}"))), log };
+        }
     }
 
     let touched: Vec<String> = paths_in(input).iter().filter_map(|p| relative(top, cwd, p)).collect();
     log["paths"] = json!(touched);
     if touched.is_empty() {
         return Decision { output: None, log };
+    }
+
+    // Path rules (D79): locks, append-only areas and files that may not be deleted. No approval
+    // route is offered: a lock is lifted by changing the policy, not by asking.
+    if input.get("command").is_none() {
+        let rules = &ctx.policy.protect;
+        let deleted: Vec<String> = ["input", "patch"]
+            .iter()
+            .filter_map(|k| input.get(*k).and_then(Value::as_str))
+            .flat_map(|t| t.lines().filter_map(|l| l.strip_prefix("*** Delete File: ")).map(|p| p.trim().to_string()).collect::<Vec<_>>())
+            .filter_map(|p| relative(top, cwd, &p))
+            .collect();
+        let refusal = touched.iter().find_map(|p| {
+            if rules.is_locked(p) {
+                Some(format!("05: {p} is locked: it is never changed here. Leave it as it is; unlocking is a change to .05/policy.toml that a person approves first."))
+            } else if rules.is_append_only(p) && top.join(p).exists() {
+                Some(format!("05: {p} is in an append-only area: existing files are never edited, renamed or deleted. Add a new file instead."))
+            } else if rules.is_no_delete(p) && deleted.contains(p) {
+                Some(format!("05: {p} may be edited but never deleted."))
+            } else {
+                None
+            }
+        });
+        if let Some(reason) = refusal {
+            log["decision"] = json!("deny");
+            log["why"] = json!("path rule");
+            return Decision { output: Some(deny(&reason)), log };
+        }
     }
 
     // Protected paths need an approved intent that covers them.
@@ -292,6 +369,19 @@ fn session_context(ctx: &Ctx, task: &Task) -> String {
     let mut protected = ctx.policy.protect.paths.clone();
     protected.push(".05/**".into());
     lines.push(format!("Protected paths need a person's approval: {}.", protected.join(", ")));
+    let rules = &ctx.policy.protect;
+    let mut locked = rules.locked.clone();
+    locked.extend(rules.absolute.iter().cloned());
+    for (list, what) in [
+        (&locked, "Locked (never change these)"),
+        (&rules.append_only, "Append-only (add new files; never edit, rename or delete existing ones)"),
+        (&rules.no_delete, "Never delete"),
+        (&rules.no_read, "Do not read"),
+    ] {
+        if !list.is_empty() {
+            lines.push(format!("{what}: {}.", list.join(", ")));
+        }
+    }
     let names: Vec<&str> = ctx.policy.check.iter().map(|c| c.name.as_str()).collect();
     if !names.is_empty() {
         lines.push(format!("Checks you can name with --check: {}.", names.join(", ")));
@@ -505,7 +595,9 @@ fn run_inner(agent: &str, event: &str) -> Result<Option<Value>, String> {
             let tool = payload.get("tool_name").and_then(Value::as_str).unwrap_or("");
             let input = payload.get("tool_input").cloned().unwrap_or(Value::Null);
             let d = pre_tool_use(&ctx, &task, &cwd, tool, &input);
-            note(d.log);
+            if !d.log.is_null() {
+                note(d.log);
+            }
             Ok(d.output)
         }
         "PostToolUse" => {

@@ -114,12 +114,16 @@ pub fn inspect(top: &Path) -> Setup {
 // ----------------------------------------------------------------------------- init
 
 fn policy_template(checks: &[CheckDef]) -> String {
-    let mut text = String::from(
+    let mut text = format!(
         "# 05 policy. A change is held to the rules at its base, so editing this file needs a person's approval.\n\
+         \n\
+         [use05]\n\
+         min_version = \"{}\"     # the oldest use05 that reads this file; older ones ask to be upgraded\n\
          \n\
          [intent]\n\
          mode = \"inferred\"        # inferred: no card needed | risky: a card for risky changes | always\n\
          \n",
+        env!("CARGO_PKG_VERSION")
     );
     if checks.is_empty() {
         text.push_str("# No checks were detected. Add the commands that decide whether a change is good:\n# [[check]]\n# name = \"test\"\n# run = [\"npm\", \"test\"]\n\n");
@@ -135,7 +139,12 @@ fn policy_template(checks: &[CheckDef]) -> String {
     }
     text.push_str(
         "[protect]\n\
-         paths = []                 # e.g. [\"migrations/**\", \"infra/**\"]. .05/** is always protected.\n\
+         paths = []                 # a change here needs a person's approval, e.g. [\"infra/**\"]. .05/** is always protected.\n\
+         # locked = []              # never changed; no approval clears it, a person's bypass can (absolute = [] for locks no bypass clears)\n\
+         # append_only = []         # new files only, e.g. [\"migrations/**\"]: existing ones are never edited, renamed or deleted\n\
+         # no_delete = []           # may be edited, never deleted\n\
+         # no_read = []             # agents may not open these, e.g. [\".env*\"] (agent hooks only: advisory)\n\
+         # bypass = true            # false: no bypass clears any of the above\n\
          \n\
          [branches]\n\
          keep = [\"main\", \"master\", \"develop\", \"release/*\"]   # real branches: never deleted\n\
@@ -181,7 +190,7 @@ fn claude_hook_json() -> Value {
     json!({
         "SessionStart": [ { "hooks": [hook("SessionStart")] } ],
         "UserPromptSubmit": [ { "hooks": [hook("UserPromptSubmit")] } ],
-        "PreToolUse":   [ { "matcher": "Write|Edit|MultiEdit|NotebookEdit|Bash", "hooks": [hook("PreToolUse")] } ],
+        "PreToolUse":   [ { "matcher": "Write|Edit|MultiEdit|NotebookEdit|Bash|Read|Grep|Glob", "hooks": [hook("PreToolUse")] } ],
         "PostToolUse":  [ { "matcher": "Write|Edit|MultiEdit|NotebookEdit|Bash", "hooks": [hook("PostToolUse")] } ],
         "Stop":         [ { "hooks": [hook("Stop")] } ],
         "SessionEnd":   [ { "hooks": [hook("SessionEnd")] } ],
@@ -217,10 +226,12 @@ fn merge_agent_hooks(path: &Path, ours: &Value, allow: &[String]) -> Result<(), 
     for (event, groups) in ours.as_object().expect("object") {
         let list = hooks.entry(event.clone()).or_insert_with(|| json!([]));
         let list = list.as_array_mut().ok_or("a hook event is not a list")?;
-        let already = list.iter().any(|g| g.to_string().contains(AGENT_COMMAND_PREFIX));
-        if !already {
-            list.extend(groups.as_array().expect("array").iter().cloned());
-        }
+        // Our groups replace what an older use05 installed, in the same place, so an upgrade gets
+        // the new matchers. Other tools' groups are never touched.
+        let at = list.iter().position(|g| g.to_string().contains(AGENT_COMMAND_PREFIX)).unwrap_or(list.len());
+        list.retain(|g| !g.to_string().contains(AGENT_COMMAND_PREFIX));
+        let at = at.min(list.len());
+        list.splice(at..at, groups.as_array().expect("array").iter().cloned());
     }
     if !allow.is_empty() {
         let permissions = root.as_object_mut().expect("object").entry("permissions").or_insert_with(|| json!({}));

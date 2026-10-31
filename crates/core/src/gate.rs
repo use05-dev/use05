@@ -406,7 +406,32 @@ pub fn evaluate(input: &GateInput<'_>) -> Result<GateResult> {
     }
 
     // ------------------------------------------------------------- protected paths and dependencies
-    let protected: Vec<String> = paths.iter().filter(|p| is_protected(policy, p)).cloned().collect();
+    // Path rules (D79): no approval clears these; a person's bypass can, unless it is absolute.
+    let rules = &policy.protect;
+    let locked: Vec<String> = paths.iter().filter(|p| rules.is_locked(p)).cloned().collect();
+    if !locked.is_empty() {
+        findings.push(
+            Finding::new("LOCKED_PATH", Effect::Deny, format!("{} locked file(s) changed; locked files are never changed here", locked.len()))
+                .paths(locked.clone())
+                .next("undo the change to them; unlocking is its own change to .05/policy.toml, approved by a person and landed first"),
+        );
+    }
+    let rewritten: Vec<String> = changes.iter().filter(|c| c.status != 'A' && rules.is_append_only(&c.path) && !locked.contains(&c.path)).map(|c| c.path.clone()).collect();
+    if !rewritten.is_empty() {
+        findings.push(
+            Finding::new("APPEND_ONLY", Effect::Deny, format!("{} file(s) in an append-only area were edited, renamed or deleted; only new files may be added there", rewritten.len()))
+                .paths(rewritten.clone())
+                .next("put the change in a new file instead"),
+        );
+    }
+    let deleted: Vec<String> = changes.iter().filter(|c| c.status == 'D' && rules.is_no_delete(&c.path) && !locked.contains(&c.path) && !rewritten.contains(&c.path)).map(|c| c.path.clone()).collect();
+    if !deleted.is_empty() {
+        findings.push(Finding::new("NO_DELETE", Effect::Deny, format!("{} file(s) that may not be deleted were deleted", deleted.len())).paths(deleted).next("restore them"));
+    }
+    let absolute: Vec<String> = locked.iter().filter(|p| rules.is_absolute(p)).cloned().collect();
+    let path_rule_unbypassable = !absolute.is_empty() || (!rules.bypass && findings.iter().any(|f| ["APPEND_ONLY", "NO_DELETE"].contains(&f.code)));
+
+    let protected: Vec<String> = paths.iter().filter(|p| is_protected(policy, p) && !locked.contains(p)).cloned().collect();
     if !protected.is_empty() {
         let own_rules = protected.iter().any(|p| p.starts_with(".05/"));
         let mut message = format!("{} protected file(s) changed", protected.len());
@@ -573,7 +598,13 @@ pub fn evaluate(input: &GateInput<'_>) -> Result<GateResult> {
         let valid = at_tree.bypasses.iter().find(|b| {
             b.statement.tree_subject().is_some_and(|(oid, d)| oid == input.target_tree && d == input.target_digest) && !expired(&b.statement.predicate.expires, input.now)
         });
-        if let Some(b) = valid {
+        if valid.is_some() && path_rule_unbypassable {
+            findings.push(Finding::new(
+                "BYPASS_NOT_ALLOWED",
+                Effect::Info,
+                if absolute.is_empty() { "a person bypassed this tree, but policy allows no bypass of its path rules".to_string() } else { format!("a person bypassed this tree, but no bypass can clear {}: its lock is absolute", absolute.join(", ")) },
+            ));
+        } else if let Some(b) = valid {
             bypass = Some(BypassInfo {
                 by: b.signer.clone(),
                 reason: b.statement.predicate.reason.clone(),
