@@ -56,7 +56,7 @@ p { margin: 0; }
 .nav .count { margin-left: auto; background: var(--coral); color: #fff; border-radius: 999px; font-size: 12px; font-weight: 700; padding: 1px 7px; }
 .nav a[aria-current="page"] .count { background: var(--lime); color: var(--ink); }
 .rail .foot { margin-top: auto; padding: 10px; font-size: 13px; color: var(--muted); }
-main { padding: 28px clamp(18px, 4vw, 48px) 120px; max-width: 1120px; width: 100%; min-width: 0; overflow-wrap: break-word; }
+main { padding: 28px clamp(18px, 4vw, 48px) 120px; max-width: 1120px; width: 100%; min-width: 0; overflow-wrap: anywhere; }
 
 @media (max-width: 760px) {
   .shell { grid-template-columns: minmax(0, 1fr); }
@@ -111,6 +111,7 @@ textarea { font-family: var(--mono); font-size: 13px; }
 
 .hd { display: flex; gap: 14px; align-items: flex-end; justify-content: space-between; flex-wrap: wrap; margin-bottom: 22px; }
 .hd .muted { margin-top: 6px; }
+.hd > div { min-width: 0; }
 .section-title { display: flex; justify-content: space-between; align-items: baseline; margin: 30px 0 10px; }
 .empty { padding: 26px 20px; text-align: left; color: var(--muted); }
 .error { color: var(--coral-ink); background: var(--coral-soft); padding: 10px 14px; border-radius: 10px; }
@@ -155,7 +156,7 @@ textarea { font-family: var(--mono); font-size: 13px; }
 .tree .node button.toggle { border: 0; background: none; width: 18px; cursor: pointer; padding: 0; color: var(--muted); }
 .tree .node .label { flex: 1; min-width: 0; overflow-wrap: anywhere; }
 .tree .node.picked { background: var(--green-soft); }
-.chips { display: flex; flex-wrap: wrap; gap: 6px; }
+.chips { display: flex; flex-wrap: wrap; gap: 6px; min-width: 0; max-width: 100%; }
 .chip { display: inline-flex; align-items: center; gap: 6px; font-family: var(--mono); font-size: 13px; background: var(--tint); border: 1px solid var(--line); border-radius: 8px; padding: 3px 4px 3px 9px; }
 .chip button { border: 0; background: none; cursor: pointer; padding: 0 4px; font-size: 15px; line-height: 1; color: var(--muted); }
 .rule-tabs { display: flex; gap: 6px; flex-wrap: wrap; margin-bottom: 10px; }
@@ -227,14 +228,19 @@ details > summary { cursor: pointer; font-weight: 600; }
 .list.tight .title { font-size: 15px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .list.tight .sub { font-size: 13px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .list.tight .verdict { font-size: 12px; padding: 1px 8px; }
-.list.attention { border-color: var(--coral); box-shadow: inset 4px 0 0 var(--coral); }
-.pane { display: grid; gap: 22px; }
+.list.attention { border-color: var(--coral); background: var(--coral-soft); }
+.list.attention > a:hover, .list.attention > div.item:hover { background: #ffdcd1; }
+.list.attention > a, .list.attention > div.item { border-top-color: rgba(179, 38, 10, 0.18); }
+.pane { display: grid; grid-template-columns: minmax(0, 1fr); gap: 22px; }
+.pane > * { min-width: 0; }
 .pane h2 { font-size: 16px; }
 .pane .section-title { margin: 0 0 8px; }
 .pane .count-pill { color: var(--muted); font-weight: 500; font-size: 14px; margin-left: 6px; }
 .chips { display: flex; flex-wrap: wrap; gap: 6px; }
-.chips a { display: inline-flex; gap: 8px; align-items: center; padding: 3px 10px; border: 1px solid var(--line-2); border-radius: 999px; font-size: 13px; color: var(--ink); text-decoration: none; background: var(--paper); }
+.chips a { display: inline-flex; gap: 8px; align-items: center; max-width: 100%; min-width: 0; padding: 3px 10px; border: 1px solid var(--line-2); border-radius: 999px; font-size: 13px; color: var(--ink); text-decoration: none; background: var(--paper); }
 .chips a:hover { background: var(--tint); }
+.chips .nm { min-width: 0; max-width: 26ch; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.chips .n, .chips .w { flex: none; white-space: nowrap; }
 .chips .n { font-weight: 700; color: var(--coral-ink); }
 .chips .w { color: var(--green-deep); font-weight: 600; }
 @media (max-width: 520px) { .list.tight .title, .list.tight .sub { white-space: normal; } }

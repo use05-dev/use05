@@ -2,6 +2,7 @@
 // are verified, opened and put back together into the views the pages show (D86). The console
 // itself only knows who must approve what, and which machines and repositories exist.
 
+import { currentRequests } from "./requests";
 import { useCallback, useEffect, useState } from "react";
 import { get, post } from "./api";
 import { b64, lock, openBaseWith, reread, sealBaseWith, unb64, unlocked } from "./keys";
@@ -152,6 +153,8 @@ export async function view(path: string): Promise<any> {
   const p = path.split("?")[0].split("/").filter(Boolean);
   const titleOf = (repo: string, task: string) => w.records.find((r) => r.kind === "task" && r.repo === repo && r.body.id === task)?.body.title;
   const approvals = w.approvals.map((a) => ({ ...a, repo: repoName(w, a.repo_id), title: titleOf(a.repo_id, a.task_id) ?? (a.from === "ci" ? "Work CI holds for a person" : undefined) }));
+  const current = currentRequests(approvals);
+  const isCurrent = (a: any) => current.has(a);
   if (p[0] === "overview") {
     const all = tasks(w);
     const repos = w.records.filter((r) => r.kind === "repo").map((r) => ({
@@ -159,7 +162,9 @@ export async function view(path: string): Promise<any> {
       active: all.filter((t) => t.repo_id === r.repo && t.status === "active").length,
       last_task: all.find((t) => t.repo_id === r.repo)?.updated_at ?? null,
     }));
-    const open = approvals.filter((a) => ["waiting", "signed", "failed"].includes(a.status));
+    // Work already in the landing branch has nothing left to approve, whatever was asked before.
+    const landedTask = (a: any) => all.some((t) => t.repo_id === a.repo_id && t.id === a.task_id && t.landed);
+    const open = approvals.filter((a) => ["waiting", "signed", "failed"].includes(a.status) && isCurrent(a) && !(a.status === "waiting" && landedTask(a)));
     const yours = (t: any) => w.overview.machines.some((m: any) => m.id === t.machine_id && m.member_id === w.overview.me);
     // Work whose last check says a person must approve it, but whose machine has not asked here
     // (the session ended before it finished, say): it needs you all the same.
@@ -213,7 +218,7 @@ export async function view(path: string): Promise<any> {
     if (!t) throw new Error("There is no such task, or its record could not be verified.");
     return {
       task: t,
-      approvals: approvals.filter((a) => a.repo_id === p[1] && a.task_id === p[2]),
+      approvals: approvals.filter((a) => a.repo_id === p[1] && a.task_id === p[2] && isCurrent(a)),
       events: w.records.filter((r) => r.kind === "event" && r.repo === p[1] && r.body.task === p[2]).map((r) => ({ kind: r.body.kind, data: r.body.data ?? {}, at: r.at, machine: machineName(w, r.machine) })).sort((a, b) => (a.at < b.at ? 1 : -1)),
       me: w.overview.me,
       // Whether this repository asks for testing before a push, and may skip it (D87).

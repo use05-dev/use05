@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.0.12
+
+- **Fixed: Home scrolled sideways.** A repository with a long name made its chip refuse to shrink, and the whole page grew with it. Chips now truncate and wrap, and long strings break everywhere in the content area. Checked on every page at widths from 1440 down to 320.
+- **Fixed: Home listed finished work as needing you.** The machine asks again each time work changes, and every ask stayed in the console, so one long task could show eight times. Only the newest request for a piece of work is current, and work already in the landing branch asks for nothing.
+- **Fixed: the same list in a different order on Linux and macOS.** Tasks touched in the same second now keep a fixed order (newest made first, then by id), and repositories tie-break by path.
+- **The console image is built on its own.** It no longer waits for every platform's binary, so a macOS runner that never arrives cannot stop it. The version tag is pushed at once; `latest` moves once the release is published.
+- The npm workflow runs only when started by hand. Publishing is staged with your security key, so a published release no longer starts a run that fails for want of credentials.
+- The needs-you list on Home has a full border and a soft tint instead of a thick side stripe.
+
 ## 0.0.11
 
 - **The console is one pane.** Home lists what needs you first, then what is working, then what finished lately, in tight rows, with your repositories and machines in a line each. Every inner page has breadcrumbs, so there is always a way back.

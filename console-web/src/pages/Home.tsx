@@ -81,21 +81,22 @@ export function Home() {
             {working.length > 0 && `, ${working.length} agent task${working.length === 1 ? "" : "s"} working`}
           </p>
         </div>
-        {data.repos.length > 0 && (
-          <div className="chips" aria-label="Repositories">
-            {data.repos.map((r: any) => {
-              const c = perRepo(r.id);
-              return (
-                <Link key={r.id} to={`/repos/${r.id}`}>
-                  {r.name}
-                  {c.needs > 0 && <span className="n">{c.needs} need you</span>}
-                  {c.working > 0 && <span className="w">{c.working} working</span>}
-                </Link>
-              );
-            })}
-          </div>
-        )}
       </div>
+
+      {data.repos.length > 0 && (
+        <div className="chips" aria-label="Repositories">
+          {data.repos.map((r: any) => {
+            const c = perRepo(r.id);
+            return (
+              <Link key={r.id} to={`/repos/${r.id}`} title={r.name}>
+                <span className="nm">{r.name}</span>
+                {c.needs > 0 && <span className="n">{c.needs} need you</span>}
+                {c.working > 0 && <span className="w">{c.working} working</span>}
+              </Link>
+            );
+          })}
+        </div>
+      )}
 
       {data.machines.length === 0 && (
         <div className="panel stack">

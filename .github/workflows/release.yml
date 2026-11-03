@@ -57,12 +57,13 @@ jobs:
           path: use05-*.tar.gz*
 
   # The console, for anyone who hosts their own: one image, its data one SQLite file on a volume.
-  # Built on release-check too, so a broken image shows before a tag; pushed only for a tag, and
-  # tagged latest only once the release itself was made.
+  # Built on release-check too, so a broken image shows before a tag; pushed only for a tag. It
+  # builds from source and needs none of the binaries, so a macOS runner that never comes (they
+  # are scarce at times) cannot hold it back. The version tag is pushed at once; latest moves only
+  # once the release itself is published, and a re-run of this job after publishing moves it.
   image:
     name: console image
-    needs: [build, release]
-    if: always() && needs.build.result == 'success' && (github.ref_type == 'tag' || github.ref_name == 'release-check')
+    if: github.ref_type == 'tag' || github.ref_name == 'release-check'
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -78,12 +79,19 @@ jobs:
       - name: Build
         run: docker build -f crates/console/Dockerfile -t use05-console .
       - name: Push
-        if: github.ref_type == 'tag' && needs.release.result == 'success'
+        if: github.ref_type == 'tag'
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           V="${GITHUB_REF_NAME#v}"
           IMG="ghcr.io/${GITHUB_REPOSITORY_OWNER}/use05-console"
           docker tag use05-console "$IMG:$V" && docker push "$IMG:$V"
-          docker tag use05-console "$IMG:latest" && docker push "$IMG:latest"
+          draft=$(gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --json isDraft --jq .isDraft 2>/dev/null || echo true)
+          if [ "$draft" = false ]; then
+            docker tag use05-console "$IMG:latest" && docker push "$IMG:latest"
+          else
+            echo "The release is not published yet, so latest stays where it was. Re-run this job once it is."
+          fi
 
   release:
     needs: build
