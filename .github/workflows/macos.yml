@@ -1,0 +1,32 @@
+name: macos
+
+# The tests and both macOS builds (with Touch ID) on GitHub's macOS runners. Run by hand
+# (Actions, macos, Run workflow): those runners are too often not given to this repository to
+# hold every push or release to them. Releases build macOS with tools/release-macos.sh.
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: test and build (macos)
+    runs-on: macos-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - name: Toolchain
+        run: rustup update stable && rustup target add aarch64-apple-darwin x86_64-apple-darwin && rustc --version
+      - name: Tests
+        run: cargo test --workspace --release
+      - name: Both macOS builds have Touch ID
+        env:
+          USE05_REQUIRE_TOUCH_ID: "1"
+        run: |
+          for t in aarch64-apple-darwin x86_64-apple-darwin; do
+            cargo build --release -p use05 -p use05-cloud --target "$t"
+            otool -L "target/$t/release/use05" | grep -q CryptoKit
+          done
+      - name: The npm packages install and run
+        run: npm/test.sh "$PWD/target/release/use05"

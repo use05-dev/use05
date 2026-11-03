@@ -8,13 +8,15 @@ permissions:
   contents: read
 
 jobs:
+  # macOS is tested on a Mac before each release and, when GitHub has runners for it, by the
+  # macos workflow (run it by hand): its runners are too often never given to this repository.
   test:
     name: test (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest]
+        os: [ubuntu-latest]
     steps:
       - uses: actions/checkout@v4
 

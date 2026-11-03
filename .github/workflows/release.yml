@@ -1,6 +1,8 @@
 name: release
 
-# Push a tag like v0.1.0 to build static binaries, checksums and a draft release.
+# Push a tag like v0.1.0 to build the Linux binaries, the console image and a draft release.
+# GitHub's macOS runners are too often not given to this repository, so the macOS binaries are
+# built on a Mac: tools/release-macos.sh vX.Y.Z --publish attaches them and publishes the release.
 # Run it by hand (Actions, release, Run workflow) to build everything without publishing.
 on:
   push:
@@ -21,8 +23,6 @@ jobs:
         include:
           - { os: ubuntu-latest, target: x86_64-unknown-linux-musl }
           - { os: ubuntu-latest, target: aarch64-unknown-linux-musl, cross: aarch64-linux-gnu-gcc }
-          - { os: macos-latest, target: aarch64-apple-darwin }
-          - { os: macos-latest, target: x86_64-apple-darwin }
     steps:
       - uses: actions/checkout@v4
       - name: Toolchain
@@ -34,14 +34,7 @@ jobs:
         env:
           CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER: aarch64-linux-gnu-gcc
           CC_aarch64_unknown_linux_musl: aarch64-linux-gnu-gcc
-          # A macOS release must have the Touch ID approver key (D91): fail rather than ship without it.
-          USE05_REQUIRE_TOUCH_ID: ${{ runner.os == 'macOS' && '1' || '' }}
-        run: |
-          [ -n "$USE05_REQUIRE_TOUCH_ID" ] || unset USE05_REQUIRE_TOUCH_ID
-          cargo build --release -p use05 -p use05-cloud --target ${{ matrix.target }}
-      - name: Touch ID is in the macOS build
-        if: runner.os == 'macOS'
-        run: otool -L target/${{ matrix.target }}/release/use05 | grep -q CryptoKit
+        run: cargo build --release -p use05 -p use05-cloud --target ${{ matrix.target }}
       - name: Smoke test
         if: matrix.target != 'x86_64-apple-darwin'
         run: |
@@ -115,3 +108,5 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: gh release create "$GITHUB_REF_NAME" dist/* --repo "$GITHUB_REPOSITORY" --draft --title "$GITHUB_REF_NAME" --notes "Static binaries for Linux and macOS. Verify with SHA256SUMS."
+      - name: Next
+        run: echo "Draft ready with the Linux binaries. On a Mac, attach the macOS ones and publish with tools/release-macos.sh $GITHUB_REF_NAME --publish" >> "$GITHUB_STEP_SUMMARY"

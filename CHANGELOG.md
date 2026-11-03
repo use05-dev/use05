@@ -1,5 +1,9 @@
 # Changelog
 
+## Unreleased
+
+- **CI stays green when GitHub has no Mac for it.** Pushes run the Linux tests and static build only. Releases build Linux and the console image in CI; the macOS binaries are built on a Mac with `tools/release-macos.sh vX.Y.Z --publish`, which builds both from a fresh clone of the tag (Touch ID required), adds them and a SHA256SUMS for every platform to the draft, publishes it and moves the console image's `latest`. The macOS tests run by hand in the new `macos` workflow.
+
 ## 0.0.13
 
 05 now asks for less than a pull request did: nothing when the work matches its plan and its checks pass, and one action, where you already are, when it does not.
