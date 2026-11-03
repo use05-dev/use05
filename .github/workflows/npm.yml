@@ -1,13 +1,13 @@
 name: npm
 
-# When a release is published (not drafted), put its binaries on npm: one @use05/cli-<os>-<cpu>
-# package per platform, then @use05/cli, which runs the right one (its command is use05). It publishes with npm
-# trusted publishing (OIDC from this workflow, no stored token) once each package names this
-# repository and workflow as its trusted publisher on npmjs.com. Until then, the very first publish
-# can use an NPM_TOKEN secret. Run it by hand with "dry run" to build and pack without publishing.
+# Put a release's binaries on npm: one @use05/cli-<os>-<cpu> package per platform, then @use05/cli,
+# which runs the right one (its command is use05). Run it by hand (Actions, npm, Run workflow).
+# With "dry run" it only builds and packs, which checks that a release's packages build. Publishing
+# for real works with npm trusted publishing (OIDC from this workflow, no stored token) once each
+# package names this repository and workflow as its trusted publisher on npmjs.com. Until then it
+# does not run when a release is published: the account's two-factor is a security key, so each
+# release is staged by hand (npm stage publish) and approved on npmjs.com (see npm/publish.sh).
 on:
-  release:
-    types: [published]
   workflow_dispatch:
     inputs:
       tag:
