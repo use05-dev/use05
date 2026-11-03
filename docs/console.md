@@ -1,8 +1,8 @@
 # Your own console
 
-The console is a web app you host yourself. Open it on your phone or laptop to see what every agent on your machines is doing, approve the work that waits for you with a passkey (Face ID, a fingerprint, a security key), sign off that you tested a change, throw away work an agent left behind, tighten a policy, and get an email when something needs you. Pages update as things happen.
+The console is a web app you host yourself. Open it on your phone or laptop to see what every agent on your machines is doing, approve the work that waits for you with a passkey (Face ID, a fingerprint, a security key), sign off that you tested a change, throw away work an agent left behind, tighten a policy, and get an email when something needs you.
 
-It is optional: everything else in 05 works without it. There is no hosted version: nobody runs a console for you, and 05 never sends anything anywhere else. Your console runs where you put it, holds your activity and nobody else's, and is encrypted end to end, so even the host it runs on cannot read your work.
+It is optional: everything else in 05 works without it. There is no hosted version, and it is encrypted end to end, so even the host it runs on cannot read your work.
 
 - [What it can and cannot do](#what-it-can-and-cannot-do)
 - [Run it](#run-it)
@@ -30,9 +30,7 @@ It is optional: everything else in 05 works without it. There is no hosted versi
 - Tighten a repository's policy, one rule at a time, and keep a base policy to start new repositories from.
 - Allow a second machine to report a repository, pair machines, add and remove passkeys.
 
-**What it never does.** Machines connect out to the console; it never reaches into a machine. A machine runs nothing it is sent. When the console asks, the helper on your machine does only these things: send the repository's folder tree (names only), prepare a statement for you to sign (an approval, a testing sign-off, a discard), file what you signed if it is exactly what it prepared, prepare and apply a policy edit that only tightens, and take a new console key you confirmed with your passkey. So someone who took over the console could not read your work, run anything on your machines, loosen a rule, or approve anything a machine did not ask for. The [honest limit](#the-honest-limit) says what they could do.
-
-**What never leaves your machine.** Code, diffs, prompts and the agent's messages. What a machine reports (plans, file and folder names, checks and verdicts, the policy) is sealed before it leaves.
+**What it never does.** Machines connect out to the console; it never reaches into a machine, and a machine runs nothing it is sent. When the console asks, the helper on your machine does only these things: send the repository's folder tree (names only), prepare a statement for you to sign (an approval, a testing sign-off, a discard), file what you signed if it is exactly what it prepared, apply a policy edit that only tightens, and take a new console key you confirmed with your passkey. Code, diffs, prompts and the agent's messages never leave your machine; what a machine does report is sealed before it leaves. [Encryption and what the server sees](#encryption-and-what-the-server-sees) has the full table, including the [honest limit](#the-honest-limit).
 
 ## Run it
 
@@ -121,9 +119,7 @@ When an agent's work needs a person (a protected file, a risky change, a plan yo
 
 If the work changes after you approve, the approval stops counting and 05 asks again. To reject a change, tell the agent, or run `use05 approve --reject --reason "…"` at a terminal.
 
-**Why a phone approval is safe to count.** A passkey approval counts only with a trusted machine's (or CI runner's) co-signature on the same statement, and only when the passkey belongs to the person who owns the work: you approve your own agents' work, not someone else's. A page holding a passkey can be made to sign anything; this way, what it signs counts only for what a machine prepared.
-
-**For phone approvals to count in CI too,** list each passkey under `[[trust.key]]` with `role = "approver"` and its `person`, and the machine that prepares the approvals with `role = "local"` and the same `person`. That is a change to the policy you approve at a terminal; see [Turn on the CI gate](turn-on-the-ci-gate.md).
+**Why a phone approval is safe to count.** A page holding a passkey can be made to sign anything, so a passkey approval counts only with a trusted machine's (or CI runner's) co-signature on the same statement, and only when the passkey belongs to the person who owns the work. For it to count in CI too, both keys go in the policy: [Phone approvals in CI](turn-on-the-ci-gate.md#phone-approvals-in-ci).
 
 ## Testing, discarding and policy edits
 
@@ -154,31 +150,7 @@ and `ALERT_FROM`, an address on that domain. Then, under **Settings**, set your 
 
 A session's token reports for that one repository, as you, and is sent nothing to run. What it reports shows as coming from the cloud session and never replaces what a machine paired at a terminal reported. The agent can read the token, so treat what a session reports as the session's word. Codex cloud runs its agent offline by default; there, the work's receipts travel in the repository and CI reports for it.
 
-**CI.** Make a token the same way and store it as the CI secret `USE05_CI`, next to `USE05_RUNNER_KEY` (see [Turn on the CI gate](turn-on-the-ci-gate.md)). The installer the workflow already runs puts `use05-cloud` next to `use05`. In `.github/workflows/05.yml`, around the gate step `use05 init --ci github` wrote:
-
-```yaml
-      - name: File approvals signed on the console
-        env:
-          USE05_CI: ${{ secrets.USE05_CI }}
-          USE05_RUNNER_KEY: ${{ secrets.USE05_RUNNER_KEY }}
-          USE05_PUSH_TOKEN: ${{ github.token }}
-        run: use05-cloud ci collect
-      - name: Prove and gate
-        env:
-          USE05_RUNNER_KEY: ${{ secrets.USE05_RUNNER_KEY }}
-          USE05_PUSH_TOKEN: ${{ github.token }}
-        run: use05 gate --ci --push --json > gate.json
-      - name: Tell the console
-        if: always()
-        env:
-          USE05_CI: ${{ secrets.USE05_CI }}
-          USE05_RUNNER_KEY: ${{ secrets.USE05_RUNNER_KEY }}
-        run: use05-cloud ci report gate.json
-```
-
-The gate step still fails the job when the gate holds the change; the last step runs either way. `collect` co-signs what it files with the runner key, and `report` uses it to prepare an approval CI is held for.
-
-The repository's page then shows CI's latest verdict, or "CI gate not seen" until one arrives. When CI holds work for a person and no machine can prepare the approval (a cloud session that has ended, work done without 05), `report` prepares it for the person who made the token, co-signed by the runner key, and asks on the console; they approve with their passkey, and the next run's `collect` files it. It asks only when an approval would clear something; a missing testing sign-off is given at a terminal. For it to count, the policy lists their passkey with their `person` and the runner key with `role = "runner"`. Only the token's person is asked.
+**CI.** Make a token the same way and store it as the CI secret `USE05_CI`. Two steps around the gate, `use05-cloud ci collect` and `use05-cloud ci report`, file approvals signed on a phone and send CI's verdict back; the workflow lines are in [Phone approvals in CI](turn-on-the-ci-gate.md#phone-approvals-in-ci). The repository's page then shows CI's latest verdict, or "CI gate not seen" until one arrives, and when CI holds work that no machine can prepare an approval for, the console asks the person who made the token. A missing testing sign-off is given at a terminal.
 
 When the console's key changes (someone was removed), every token made before stops working, and **Machines** says which: make new ones.
 

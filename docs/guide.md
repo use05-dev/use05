@@ -26,7 +26,7 @@ How to install 05, set it up in a repository, work with it day to day, and confi
 - **A gate of fixed rules.** No model judges anything. The gate compares the plan, the files changed, the evidence on the exact tree, approvals and protected paths, and answers allow, wait, approval required or deny. A change is held to the rules at its base, never its own, so it cannot loosen them.
 - **A record you can check later.** What the agent did (tools, paths and decisions; never contents or prompts) is a hash-chained log, sealed by signed receipts as the work happens and countersigned by CI. Anyone with the repository and the public keys can check it.
 - **Honest about strength.** The agent's hooks and the pre-push hook are advisory: an agent running as you can reach them. Evidence signed by a CI runner key the agent cannot read, with a required check on your Git host, is what enforces. `use05 doctor` and the brief say which is which.
-- **What it is not.** 05 is not an agent, an agent runner, a code reviewer powered by a model, a session recorder or a Git host. It keeps the agents you run coordinated and shows what was checked; it does not judge whether a change is correct.
+- **What it is not.** Not an agent, not a code reviewer powered by a model, not a Git host. 05 shows what was checked; it does not judge whether a change is correct.
 
 ## Install
 
@@ -69,7 +69,7 @@ On a terminal, `init` first asks a few questions, each with a default you accept
 
 1. **Who works in this repository:** just you, a small team, or a larger or regulated team. This sets how strict the rules start; you can change each one afterwards.
 2. **Which branch finished changes land on.**
-3. **Which environment each long-lived branch is:** dev, uat, pre-prod, prod, another environment you name, or not an environment. 05 suggests a level from the branch's name (`main` is dev, `staging` is uat, `production` is prod). A level can hold several environments: pick dev for a second branch and you name it, for example `dev-eu`. Then you can add any other branch as an environment. 05 records the environments and shows them; 05 records them and shows them; it has no rules for promoting between them.
+3. **Which environment each long-lived branch is:** dev, uat, pre-prod, prod, another environment you name, or not an environment. 05 suggests a level from the branch's name (`main` is dev, `staging` is uat, `production` is prod). A level can hold several environments: pick dev for a second branch and you name it, for example `dev-eu`. 05 records environments and shows them; it has no rules for promoting between them.
 4. **The checks that must pass**, and any you want to add (`lint: npm run lint`).
 5. **Folder and file rules:** what needs a person's approval, what is locked, where only new files may be added (it suggests migration folders it finds), what agents may not read (it suggests `.env*` if you have one), and which folders must be updated with every change, such as `docs/**` or `CHANGELOG.md` (a `[[require]]` rule on `**`; narrower rules go in the file).
 6. **How strict to be** when an agent works outside its plan, when a change weakens tests, and when an agent starts from older code than origin has.
@@ -200,7 +200,7 @@ You are asked for your approver passphrase. An approval is signed, tied to the e
 use05 approve --unsigned --json      # the exact statement and the passkey challenge; nothing is signed or stored
 use05 approve --signed approval.json # file it, if a key you trust as an approver signed it
 ```
-`--unsigned` takes the same `--intent`, `--reject`, `--reason`, `--task` and `--tree` as a normal approval. `--signed` refuses an approval no trusted approver key signed (`APPROVAL_NOT_TRUSTED`) and files it under the tree or plan it names, whatever task is current. A passkey counts on your machine when its public key is a line in `passkeys.pub` in 05's per-user directory (`<public key> <name>`, one per line); for the CI gate, list it under `[[trust.key]]` with `role = "approver"` and `person` set to the owner's name, and list the preparing machine's key (the "machine" line of `use05 key show` on that machine) with `role = "local"`. `--unsigned` includes this machine's co-signature (`details.cosignature`); the signer puts it in the envelope next to the passkey's own entry. A passkey approval counts only with that co-signature and only for the person who owns the work; otherwise it is filed but does not count, and `--signed` and the brief say why. Passkeys approve and reject; they cannot bypass.
+`--unsigned` takes the same `--intent`, `--reject`, `--reason`, `--task` and `--tree` as a normal approval. `--signed` refuses an approval no trusted approver key signed (`APPROVAL_NOT_TRUSTED`) and files it under the tree or plan it names, whatever task is current. A passkey counts on your machine when its public key is a line in `passkeys.pub` in 05's per-user directory (`<public key> <name>`, one per line); `use05 cloud enrol` writes it. A passkey approval counts only with the co-signature of the machine that prepared it (`details.cosignature` in the `--unsigned` output) and only for the person who owns the work; otherwise it is filed but does not count, and the brief says why. Passkeys approve and reject; they cannot bypass. For passkey approvals to count in CI, see [Turn on the CI gate](turn-on-the-ci-gate.md#phone-approvals-in-ci).
 
 **Break glass.** To let one exact change through a block, with a reason:
 ```sh
@@ -222,7 +222,7 @@ use05 approve --tested --note "Signed up, paid an invoice, checked the receipt e
 ```
 Where the policy says `skippable`, you may skip it instead, saying why: `use05 approve --skip-testing --reason "Only a comment changed"`. Both need your approver passphrase, so an agent cannot sign off for you, and both are bound to the exact code: change it afterwards, and sign off again.
 
-The pre-push hook holds a push to those branches until there is a sign-off (`TESTING_REQUIRED`), and so does the CI gate, for the branch a pull request or a merge queue merges into, or the branch pushed, so skipping the hook does not get around it. Without `branches`, the landing branch is the policy's `[branches] target`, else the host's default branch (in GitHub Actions), else origin's; never the target an agent declares. A CI run that names no branch at all is held as if it went to the landing branch. An approval never counts as a sign-off: accepting a change is not trying it. The sign-off, with its note, is filed with the change's receipts, shows in the brief under Tested, and, with your own console, on the task's page, where the person driving the work can also sign off from their phone with their passkey (`--unsigned` and `--signed` work for testing as they do for approvals).
+The pre-push hook, `use05 land` and the CI gate hold a push to those branches until there is a sign-off (`TESTING_REQUIRED`), so skipping the hook does not get around it. Without `branches`, the landing branch is the policy's `[branches] target`, else the host's default branch, else origin's; never the target an agent declares. An approval never counts as a sign-off: accepting a change is not trying it. The sign-off, with its note, is filed with the change's receipts and shows in the brief under Tested. With [your own console](console.md), the person driving the work can sign off from their phone (`--unsigned` and `--signed` work for testing as they do for approvals).
 
 ## Long sessions, large changes and subagents
 
@@ -288,11 +288,11 @@ Each prints the setting before and after, and says so when the change makes the 
 | `[branches] work` | `05/*`, `agent/*`, `claude/*`, `codex/*` | Agents' working branches: removed with their worktree once landed. |
 | `[branches] target` | the remote's default branch | The branch finished changes land on, unless a plan names another. |
 | `[branches] land` | `"manual"` | `manual`: you run `use05 land`. `auto`: a change the gate allows lands when its agent stops. |
-| `[branches] fresh_base` | `"allow"` (new setups write `"warn"`) | An agent that starts behind origin's copy of the landing branch. When it is not `allow`, the hook fetches that branch when a new session starts (not on a resume or compaction; giving up after 5 seconds, and never asking for a password or passphrase) and tells the agent how far behind it is and how to update. Until the work contains what origin had, the brief reports `BASE_STALE`: `warn` notes it, `approval` asks a person, `deny` refuses. When the agent updates, by rebasing or merging, the commits it pulled in are not counted as its change, including any pushed after its session started. Checked on your machine only, not by the CI gate. |
+| `[branches] fresh_base` | `"allow"` (new setups write `"warn"`) | An agent that starts behind origin's copy of the landing branch. When it is not `allow`, the hook fetches that branch as a session starts (giving up after 5 seconds, never asking for a password) and tells the agent how far behind it is and how to update. Until the work contains what origin had, the brief reports `BASE_STALE`: `warn` notes it, `approval` asks a person, `deny` refuses. Commits the agent pulls in by rebasing or merging are not counted as its change. Checked on your machine only, not by the CI gate. |
 | `[record] middle` | `"local"` | What agents did is recorded on this machine and never uploaded. `off` records nothing. |
 | `[enforce] on_error` | `"open"` | If 05 itself fails: `open` lets the change through and says so loudly; `closed` refuses it. |
 | `[env] allow` | unrestricted | If set, the only environment variables any check may be passed. |
-| `[[trust.key]]` `name`, `role`, `public`, `expires`, `person` | none | A public key whose signatures count: `role = "runner"` for a CI runner (authoritative), `"approver"` for a person's approval key, `"local"` for another machine (advisory). `public` is the contents of the `.pub` file; `expires` (for example `"2027-12-31"`) stops trusting it after that date. `person` (0.0.7 and later) is whose key it is, as git records their name: a passkey approves only that person's work, and a machine key prepares approvals only for them. Use 0.0.7 or later everywhere that reads the policy (set `[use05] min_version = "0.0.7"`): an older use05 refuses a policy with `person`. See the CI gate guide. |
+| `[[trust.key]]` `name`, `role`, `public`, `expires`, `person` | none | A public key whose signatures count: `role = "runner"` for a CI runner (authoritative), `"approver"` for a person's approval key or passkey, `"local"` for another machine (advisory). `public` is the contents of the `.pub` file; `expires` (for example `"2027-12-31"`) stops trusting it after that date; `person` is whose key it is, as git records their name (needs 0.0.7 or later wherever the policy is read). See [Turn on the CI gate](turn-on-the-ci-gate.md). |
 | `[[require]]` `when`, `also` | none | Files that must change together. A change that touches anything in `when` must also touch something in `also`, or the brief reports `ALSO_CHANGE_MISSING`. For example `when = ["src/api/**"]`, `also = ["docs/api/**"]`; `when = ["**"]` means every change. Optional: `severity` (`approval` by default; `warn` or `deny`) and `why`, which the agent and the brief are told. 05 checks only that a file there changed, not what the change says. Any number of rules. |
 | `[testing] local` | `"off"` | Whether a person must try a change in their own environment before it is pushed: `skippable` asks for a sign-off and lets them skip it with a reason; `required` takes only a sign-off. See [Testing before a push](#testing-before-a-push). |
 | `[testing] branches` | the landing branch | Which pushed-to branches need it, as patterns such as `main` or `release/*`. |
@@ -325,18 +325,18 @@ An organisation can set a minimum for every repository: rules a repository can t
 
 ## Turn on the CI gate
 
-Hooks and the pre-push hook run on your machine, where an agent running as you can reach them, so they are advisory. The CI gate is what enforces: a runner the agent cannot reach runs the checks and signs the result, and your Git host refuses a push without it. It takes about ten minutes, once per repository: see [Turn on the CI gate](turn-on-the-ci-gate.md).
+Everything above runs on your machine, where an agent running as you can reach it, so it is advisory. The CI gate is what enforces: a runner the agent cannot reach runs the checks and signs the result, and your Git host refuses a push without it. About ten minutes, once per repository: [Turn on the CI gate](turn-on-the-ci-gate.md).
 
 ## Your own console
 
-The console is an optional web app you host yourself. From your phone you see what every agent on your machines is doing, approve the work that waits for you with a passkey, sign off that you tested a change, discard work an agent left behind, tighten a policy, and get an email when something needs you. It is one container image with its data in one SQLite file, there is no hosted version, and it is encrypted end to end: your machines seal what they report to a key only your passkey or recovery code unlocks, so the console relays your work without being able to read it. Machines connect out to it and run nothing it sends; a phone approval counts only for a statement a machine prepared and co-signed itself.
+An optional web app you host yourself, to see every agent's work and approve it from your phone with a passkey. One container image, one SQLite file, no hosted version, encrypted end to end so that the console relays your work without being able to read it.
 
 ```sh
 docker run -p 8080:8080 -v console-data:/data -e ORIGIN=https://console.example.com ghcr.io/use05-dev/use05-console
 use05 cloud login https://console.example.com   # inside a repository: claim it, pair this machine, report the repository
 ```
 
-[Your own console](console.md) covers running it, claiming it, connecting machines, approving from your phone, cloud sessions and CI, what the server can and cannot see, passkeys and recovery, working with others, and what to do when something is stuck.
+Everything else is in [Your own console](console.md).
 
 ## Commands
 

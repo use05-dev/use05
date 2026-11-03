@@ -44,7 +44,7 @@ An agent can write fifty thousand lines in an afternoon. Nobody can review that,
 - **Approve from your phone.** Run your own console: see every agent's work, approve with a passkey, sign off that you tested a change, throw away abandoned work. Self-hosted, one container, encrypted end to end.
 - **Your rules, honestly enforced.** Protected, locked and append-only paths, testing before a push, an organisation floor. Hooks are advisory, a required CI check enforces, and 05 says which is which.
 
-It works with the agents you already run (Claude Code, Codex, and any agent with hooks). It is not an agent, a code reviewer powered by a model, or a Git host. Free and open source; everything runs on your machine, with no account and no telemetry.
+It works with the agents you already run (Claude Code, Codex, and any agent with hooks). It is not an agent, not a code reviewer powered by a model, not a Git host. Free and open source; everything runs on your machine, with no account and no telemetry.
 
 ## Five principles, hence the name
 

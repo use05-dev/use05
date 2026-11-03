@@ -28,24 +28,41 @@ If the policy asks for testing before a push (`[testing]`), the gate holds a pul
 
 Known limits:
 - Pull requests from forks get no secrets and a read-only token, so the gate cannot sign (it fails with `NO_RUNNER_KEY`) and could not push. A refused push is reported, never fatal. Review fork PRs by hand, or run the gate on a trusted branch after review.
-- Phone (passkey) approvals count in CI only if both keys are in the policy: the passkey with `role = "approver"` and `person = "<the owner's name, as in git config user.name>"`, and the key of the machine that prepared the approval (the "machine" line of `use05 key show` on that machine) with `role = "local"`. `person` needs use05 0.0.7 or later wherever the policy is read, including the CI gate: set `[use05] min_version = "0.0.7"` so an older one says to upgrade instead of refusing the file. Without the machine's key the brief says `no machine that prepared it co-signed it`. Give the machine key the same `person` so it can only prepare for them. Keep `[evidence] accept = ["runner"]` (step 3): with `local` accepted, a machine key listed here could also sign check results that CI would believe.
 - Approvals have to be on the remote: use `use05 approve --push` (or push the `05-receipts/<key>` branch yourself) before CI runs. `use05 brief --fetch` pulls other people's receipts.
 
-## Your own console
+## Phone approvals in CI
 
-With [your own console](console.md), CI can report each verdict there and collect approvals signed on a phone. Store a CI token from the console's Machines page as the secret `USE05_CI`, then around the gate step:
+An approval signed with a passkey on [your own console](console.md) counts in CI only if both keys are in the policy:
+
+```toml
+[[trust.key]]
+name = "alex-phone"
+role = "approver"
+person = "Alex Example"                # as in git config user.name
+public = "use05-passkey-p256-public:..."
+
+[[trust.key]]
+name = "alex-macbook"
+role = "local"
+person = "Alex Example"                # the machine that prepares the approvals may prepare only for them
+public = "use05-ed25519-public:..."    # the "machine" line of `use05 key show` on that machine
+```
+
+`person` needs use05 0.0.7 or later wherever the policy is read, so set `[use05] min_version = "0.0.7"`. Without the machine's key the brief says `no machine that prepared it co-signed it`. Keep `[evidence] accept = ["runner"]`: with `local` accepted, a machine key listed here could also sign check results that CI would believe.
+
+With a CI token from the console's Machines page stored as the secret `USE05_CI`, CI can also file approvals signed on a phone and report its verdict to the console. Around the gate step:
 
 ```yaml
       - run: use05-cloud ci collect                    # file approvals signed on a phone, before the gate
-        env: { USE05_CI: "${{ secrets.USE05_CI }}" }
+        env: { USE05_CI: "${{ secrets.USE05_CI }}", USE05_RUNNER_KEY: "${{ secrets.USE05_RUNNER_KEY }}", USE05_PUSH_TOKEN: "${{ github.token }}" }
       - run: use05 gate --ci --push --json > gate.json  # the gate, as in step 4; its exit status still decides
         env: { USE05_RUNNER_KEY: "${{ secrets.USE05_RUNNER_KEY }}", USE05_PUSH_TOKEN: "${{ github.token }}" }
       - if: always()
         run: use05-cloud ci report gate.json           # send the verdict, whatever it was
-        env: { USE05_CI: "${{ secrets.USE05_CI }}" }
+        env: { USE05_CI: "${{ secrets.USE05_CI }}", USE05_RUNNER_KEY: "${{ secrets.USE05_RUNNER_KEY }}" }
 ```
 
-Nothing about the gate changes: what counts is still the signatures on the receipts branches.
+Nothing about the gate changes: what counts is still the signatures on the receipts branches. `collect` co-signs what it files with the runner key; `report` uses it to prepare an approval CI is held for, when no machine can (a cloud session that has ended, work done without 05). The console then asks the person who made the token; they approve with their passkey, and the next run's `collect` files it. When the console's key changes (someone was removed), every token made before stops working.
 
 ## Rotating the runner key
 
