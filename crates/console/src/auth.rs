@@ -351,7 +351,8 @@ mod tests {
         db
     }
 
-    /// Minutes until the session ends.
+    /// Minutes until the session ends. Dates as days are floats: read in the millisecond the
+    /// session was made, an hour can come out a hair over 60.
     async fn left(db: &sqlx::SqlitePool, cookie: &str) -> f64 {
         sqlx::query_scalar("select (julianday(expires_at) - julianday('now')) * 1440 from sessions where token_hash = ?1").bind(hash(cookie)).fetch_one(db).await.unwrap()
     }
@@ -360,7 +361,7 @@ mod tests {
     async fn a_session_ends_after_an_hour_without_use_and_use_renews_it() {
         let db = db().await;
         let cookie = new_session(&db, "pk").await.unwrap();
-        assert!((59.0..=60.0).contains(&left(&db, &cookie).await));
+        assert!((59.0..=60.001).contains(&left(&db, &cookie).await));
         // Twenty minutes pass; the page polls on its own: that is not use.
         sqlx::query("update sessions set expires_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now', '+40 minutes')").execute(&db).await.unwrap();
         assert!(session_member(&db, &cookie, false).await.unwrap().is_some());
