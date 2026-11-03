@@ -965,9 +965,12 @@ fn doctor_reports_problems_with_a_nonzero_exit_and_never_changes_anything() {
     let s = Sandbox::initialised();
     let before = s.snapshot_files();
     // PATH without the folders holding extensions (use05-*) installed on this computer: they are
-    // not the test's, and doctor lists them.
-    let path = std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default())
-        .filter(|d| !fs::read_dir(d).into_iter().flatten().flatten().any(|e| e.file_name().to_string_lossy().starts_with("use05-")))
+    // not the test's, and doctor lists them. The build folder holds use05-cloud too, so the
+    // test's own use05 goes on PATH from a folder of its own.
+    let own = tempfile::tempdir().unwrap();
+    std::os::unix::fs::symlink(BIN, own.path().join("use05")).unwrap();
+    let path = std::iter::once(own.path().to_path_buf())
+        .chain(std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default()).filter(|d| !fs::read_dir(d).into_iter().flatten().flatten().any(|e| e.file_name().to_string_lossy().starts_with("use05"))))
         .collect::<Vec<_>>();
     let path = std::env::join_paths(path).unwrap();
     let healthy = s.run_env(&["doctor"], &[("PATH", path.to_str().unwrap())]);
