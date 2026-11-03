@@ -117,9 +117,14 @@ fn clean(dir: &Path, tracked_only: bool) -> bool {
 /// Is the branch's head already in its target, locally or on `origin`?
 pub fn landed(top: &Path, branch: &str, target: &str) -> bool {
     let Some(head) = head_of(top, branch) else { return false };
+    landed_commit(top, &head, target)
+}
+
+/// Is this commit already in `target`, locally or on `origin`?
+pub fn landed_commit(top: &Path, head: &str, target: &str) -> bool {
     [format!("refs/heads/{target}"), format!("refs/remotes/origin/{target}")]
         .iter()
-        .any(|t| git::resolve_commit(top, t).is_some() && is_ancestor(top, &head, t))
+        .any(|t| git::resolve_commit(top, t).is_some() && is_ancestor(top, head, t))
 }
 
 /// Move `target` forward to `branch`'s head. Fast-forward only; never forced. If the target is

@@ -96,7 +96,7 @@ export async function openResult(machineId: string | null, repo: string, ref: st
 /// Seal something for one machine only: what it alone should read (a signed approval, the commit to
 /// apply), for one kind of instruction. The body names the repository and the request or edit it is
 /// for; the machine refuses it routed as anything else.
-export async function sealTo(machineId: string, kind: "file_approval" | "prepare_policy_edit" | "apply_policy_edit" | "prepare_testing" | "file_testing" | "prepare_discard" | "discard", body: Record<string, unknown>): Promise<string> {
+export async function sealTo(machineId: string, kind: "file_approval" | "prepare_policy_edit" | "apply_policy_edit" | "prepare_testing" | "file_testing" | "prepare_discard" | "discard" | "ask_approval", body: Record<string, unknown>): Promise<string> {
   const m = (await world(true)).overview.machines.find((x: any) => x.id === machineId);
   const keys = await unlocked();
   // Only to keys the team pinned: a key the console swapped in gets nothing.
@@ -131,12 +131,16 @@ function tasks(w: World, repo?: string) {
     .map((r) => {
       const t = r.body;
       const g = gate.get(`${r.repo}/${t.id}`);
+      // When the work last changed on its machine, never when it was last sent here: a resync
+      // sends every task again and would make a week-old session look new.
+      const happened = [t.updated, t.ended, t.finished, t.created].filter((x: unknown): x is string => typeof x === "string" && !Number.isNaN(Date.parse(x))).sort().pop() ?? r.at;
       return {
-        ...t, repo_id: r.repo, repo: repoName(w, r.repo), machine: machineName(w, r.machine), machine_id: r.machine, updated_at: r.at,
+        ...t, repo_id: r.repo, repo: repoName(w, r.repo), machine: machineName(w, r.machine), machine_id: r.machine, updated_at: happened, reported_at: r.at,
         created_at: t.created, finished_at: t.finished, ended_at: t.ended,
-        decision: g && g.at >= madeAt(r) ? g.decision : t.decision,
+        landed: t.landed === true,
+        decision: t.landed === true ? "landed" : g && g.at >= madeAt(r) ? g.decision : t.decision,
         // Not touched for a week and not done: probably left behind (D89). Nothing is deleted for it.
-        abandoned: (t.status === "active" || (g?.decision ?? t.decision) === "approval_required") && Date.now() - new Date(r.at).getTime() > ABANDONED_MS,
+        abandoned: !t.landed && (t.status === "active" || (g?.decision ?? t.decision) === "approval_required") && Date.now() - new Date(happened).getTime() > ABANDONED_MS,
       };
     })
     .sort((a, b) => (a.updated_at < b.updated_at ? 1 : -1));
@@ -159,7 +163,8 @@ export async function view(path: string): Promise<any> {
     const yours = (t: any) => w.overview.machines.some((m: any) => m.id === t.machine_id && m.member_id === w.overview.me);
     // Work whose last check says a person must approve it, but whose machine has not asked here
     // (the session ended before it finished, say): it needs you all the same.
-    const held = all.filter((t) => t.decision === "approval_required" && yours(t) && !open.some((a) => a.task_id === t.id && a.repo_id === t.repo_id));
+    // Work already in the landing branch has nothing left to approve, whatever its last verdict said.
+    const held = all.filter((t) => t.decision === "approval_required" && !t.landed && yours(t) && !open.some((a) => a.task_id === t.id && a.repo_id === t.repo_id));
     const edits = w.overview.edits.map((e: any) => ({ ...e, repo: repoName(w, e.repo_id) }));
     // One count for the page's headline and the menu: everything waiting on you to act.
     const needs_you = open.filter((a) => a.status === "waiting" && a.mine !== false).length + held.length + w.overview.pairings.length + edits.filter((e: any) => e.status === "ready" || e.status === "stuck").length;

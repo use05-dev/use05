@@ -58,3 +58,9 @@ test("a discard must be of the work shown, and nothing else passes for one", () 
   assert.throws(() => checkStatement(approval(), { type: "discard", task: "t1" }), /not a discard of this work/);
   assert.throws(() => checkStatement(discard("t1"), { type: "approval" }), /not an approval/);
 });
+
+test("a rejection signs only when the person asked to reject, and an approval never stands in for it", () => {
+  assert.doesNotThrow(() => checkStatement(approval({ decision: "reject", rationale: "out of scope" }), { type: "approval", decision: "reject" }));
+  assert.throws(() => checkStatement(approval({ decision: "approve" }), { type: "approval", decision: "reject" }), /not an approval/);
+  assert.throws(() => checkStatement(approval({ decision: "reject" }), { type: "approval" }), /not an approval/);
+});

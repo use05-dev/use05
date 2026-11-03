@@ -13,7 +13,10 @@ use crate::ui::{Glyph, Item, Out, Tone, Ui};
 
 pub fn run(repo: &Path, task: Option<&str>, tree: Option<&str>, fetch: bool, json: bool) -> ExitCode {
     let fail = |e| emit(&Report::from_core("brief", e), json);
-    let ctx = match Ctx::open_judging(repo, task) {
+    // A named task is looked at where its work is, not wherever this was run.
+    let (repo, located) = if tree.is_none() { crate::pending::locate(repo, task, None) } else { (repo.to_path_buf(), None) };
+    let tree = tree.or(located.as_deref());
+    let ctx = match Ctx::open_judging(&repo, task) {
         Ok(c) => c,
         Err(e) => return fail(e),
     };
@@ -174,7 +177,7 @@ pub fn render(ui: &Ui, b: &Brief, org: Option<&str>, overlaps: &[use05_core::ove
         "medium" => Tone::Warn,
         _ => Tone::Dim,
     };
-    intent.push(Item { glyph: None, text: format!("risk   {}", ui.paint(risk_tone, b.risk.word())), dim: false });
+    intent.push(Item { glyph: None, text: format!("risk   {}", ui.paint(risk_tone, b.risk.word())), dim: false, columns: false });
     for r in &b.gate.risk_reasons {
         let shown: Vec<&str> = r.paths.iter().take(3).map(String::as_str).collect();
         let more = if r.paths.len() > 3 { format!(" and {} more", r.paths.len() - 3) } else { String::new() };

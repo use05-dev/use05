@@ -156,6 +156,15 @@ pub fn truncate_middle(text: &str, max: usize) -> String {
     format!("{}…{}", chars[..head].iter().collect::<String>(), chars[chars.len() - tail..].iter().collect::<String>())
 }
 
+/// Shorten a sentence from the end, so what is left still reads: `Approve selection and rep…`.
+pub fn truncate_end(text: &str, max: usize) -> String {
+    let chars: Vec<char> = text.chars().collect();
+    if chars.len() <= max || max < 2 {
+        return text.to_string();
+    }
+    format!("{}…", chars[..max - 1].iter().collect::<String>().trim_end())
+}
+
 /// An output document built from labelled sections, rendered to the terminal's width.
 pub struct Out<'a> {
     ui: &'a Ui,
@@ -167,17 +176,23 @@ pub struct Item {
     pub glyph: Option<(Glyph, Tone)>,
     pub text: String,
     pub dim: bool,
+    /// Already laid out in columns, to fit: kept as it is, never re-flowed.
+    pub columns: bool,
 }
 
 impl Item {
     pub fn new(glyph: Glyph, tone: Tone, text: impl Into<String>) -> Item {
-        Item { glyph: Some((glyph, tone)), text: text.into(), dim: false }
+        Item { glyph: Some((glyph, tone)), text: text.into(), dim: false, columns: false }
     }
     pub fn plain(text: impl Into<String>) -> Item {
-        Item { glyph: None, text: text.into(), dim: false }
+        Item { glyph: None, text: text.into(), dim: false, columns: false }
     }
     pub fn dim(text: impl Into<String>) -> Item {
-        Item { glyph: None, text: text.into(), dim: true }
+        Item { glyph: None, text: text.into(), dim: true, columns: false }
+    }
+    /// A line of aligned columns, as `pending::list_rows` makes them.
+    pub fn columns(glyph: Glyph, tone: Tone, text: impl Into<String>) -> Item {
+        Item { glyph: Some((glyph, tone)), text: text.into(), dim: false, columns: true }
     }
 }
 
@@ -215,7 +230,8 @@ impl<'a> Out<'a> {
                 Some((g, tone)) => (format!("{} ", self.ui.paint(tone, self.ui.glyph(g))), 2),
                 None => (String::new(), 0),
             };
-            let lines = self.ui.wrap(&item.text, body.saturating_sub(glyph_width));
+            let room = body.saturating_sub(glyph_width);
+            let lines = if item.columns { vec![truncate_middle(&item.text, room)] } else { self.ui.wrap(&item.text, room) };
             for (i, line) in lines.iter().enumerate() {
                 let lead = if first {
                     first = false;
@@ -263,6 +279,8 @@ mod tests {
     #[test]
     fn middle_truncation_keeps_both_ends() {
         assert_eq!(truncate_middle("abcdefghij", 6), "abc…ij");
+        assert_eq!(truncate_end("Approve selection and repo", 12), "Approve sel…");
+        assert_eq!(truncate_end("short", 12), "short");
         assert_eq!(truncate_middle("short", 10), "short");
         assert_eq!(truncate_middle("héllo wörld", 6).chars().count(), 6, "counts characters, not bytes");
     }

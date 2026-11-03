@@ -1,11 +1,11 @@
 import { useView } from "../records";
-import { useEffect, useState } from "react";
-import { ago, post } from "../api";
+import { useEffect, useState, type ReactNode } from "react";
+import { post } from "../api";
 import { linkKey, pairCommit, pairingCode, random, wrap } from "../crypto";
 import { machinePin } from "../opened";
 import { b64, confirmMachines, unb64, unlocked } from "../keys";
 import { friendly } from "../passkey";
-import { Link, Loading, Online, Verdict } from "../ui";
+import { Link, Loading, Online, Verdict, When } from "../ui";
 
 /// Someone left and the team's key changed; these machines of yours still seal to the old one.
 function OldKey({ machines, reload }: { machines: any[]; reload: () => void }) {
@@ -36,6 +36,19 @@ function OldKey({ machines, reload }: { machines: any[]; reload: () => void }) {
   );
 }
 
+/// One row of the pane: what it is, where, who, and when it really happened.
+function Row({ to, chip, title, sub, at, attention }: { to: string; chip: ReactNode; title: string; sub: string; at?: string | null; attention?: boolean }) {
+  return (
+    <Link to={to} className={`item${attention ? " attention-row" : ""}`}>
+      <div className="grow"><div className="title">{title}</div><div className="sub">{sub}</div></div>
+      {chip}
+      <When at={at} />
+    </Link>
+  );
+}
+
+const who = (t: any) => `${t.agent ?? "a person"}${t.model ? ` (${t.model})` : ""}`;
+
 export function Home() {
   const { data, error, reload } = useView<any>("/overview", 6000);
   if (!data) return <Loading error={error} />;
@@ -44,22 +57,44 @@ export function Home() {
   const inFlight = data.approvals.filter((a: any) => a.status !== "waiting" || a.mine === false);
   const edits = data.edits;
   const held: any[] = data.held ?? [];
-  const nothing = !waiting.length && !held.length && !inFlight.length && !edits.length && !data.pairings.length && !data.refusals.length;
-  const active = data.tasks.filter((t: any) => t.status === "active");
+  const heldIds = new Set(held.map((t: any) => `${t.repo_id}/${t.id}`));
+  const askedIds = new Set(waiting.map((a: any) => `${a.repo_id}/${a.task_id}`));
+  const others = data.tasks.filter((t: any) => !heldIds.has(`${t.repo_id}/${t.id}`) && !askedIds.has(`${t.repo_id}/${t.id}`));
+  const working = others.filter((t: any) => t.status === "active" && !t.landed);
+  const finished = others.filter((t: any) => !(t.status === "active" && !t.landed));
   const online = data.machines.filter((m: any) => m.online).length;
+  const needsAny = waiting.length > 0 || held.length > 0 || edits.some((e: any) => e.status === "ready" || e.status === "stuck") || data.refusals.length > 0;
+  const perRepo = (id: string) => ({
+    needs: waiting.filter((a: any) => a.repo_id === id).length + held.filter((t: any) => t.repo_id === id).length,
+    working: working.filter((t: any) => t.repo_id === id).length,
+  });
 
   return (
-    <div className="stack-lg">
+    <div className="pane">
       {data.old_key?.length > 0 && <OldKey machines={data.old_key} reload={reload} />}
       {data.unverified > 0 && <p className="error">{data.unverified} record{data.unverified === 1 ? "" : "s"} could not be verified and {data.unverified === 1 ? "is" : "are"} not shown. A machine you did not pair, something changed them on the way, or the console sent an older copy of something you have seen.</p>}
-      <div className="hd">
+      <div className="hd" style={{ marginBottom: 0 }}>
         <div>
           <h1>{data.needs_you ? `${data.needs_you} need${data.needs_you === 1 ? "s" : ""} you` : "Nothing needs you"}</h1>
           <p className="muted">
             {data.machines.length === 0 ? "No machine is paired yet." : `${online} of ${data.machines.length} machine${data.machines.length === 1 ? "" : "s"} online`}
-            {active.length > 0 && `, ${active.length} agent task${active.length === 1 ? "" : "s"} working`}
+            {working.length > 0 && `, ${working.length} agent task${working.length === 1 ? "" : "s"} working`}
           </p>
         </div>
+        {data.repos.length > 0 && (
+          <div className="chips" aria-label="Repositories">
+            {data.repos.map((r: any) => {
+              const c = perRepo(r.id);
+              return (
+                <Link key={r.id} to={`/repos/${r.id}`}>
+                  {r.name}
+                  {c.needs > 0 && <span className="n">{c.needs} need you</span>}
+                  {c.working > 0 && <span className="w">{c.working} working</span>}
+                </Link>
+              );
+            })}
+          </div>
+        )}
       </div>
 
       {data.machines.length === 0 && (
@@ -73,85 +108,89 @@ export function Home() {
 
       {data.pairings.map((p: any) => <Pairing key={p.id} p={p} done={reload} />)}
 
-      {waiting.map((a: any) => (
-        <Link key={a.id} to={`/tasks/${a.repo_id}/${a.task_id}`} className="panel attention" style={{ display: "block", color: "inherit", textDecoration: "none" }}>
-          <div className="row between">
-            <span className="verdict v-approval_required">{a.scope === "intent" ? "Approve the plan" : "Approve the change"}</span>
-            <span className="small muted">{ago(a.created_at)}</span>
-          </div>
-          <h2 style={{ marginTop: 10 }}>{a.title || `Task ${a.task_id}`}</h2>
-          <p className="muted small" style={{ marginTop: 4 }}>{a.repo}</p>
-        </Link>
-      ))}
-
-      {held.map((t: any) => (
-        <Link key={`${t.repo_id}/${t.id}`} to={`/tasks/${t.repo_id}/${t.id}`} className="panel attention" style={{ display: "block", color: "inherit", textDecoration: "none" }}>
-          <div className="row between">
-            <span className="verdict v-approval_required">Held for you</span>
-            <span className="small muted">{ago(t.updated_at)}</span>
-          </div>
-          <h2 style={{ marginTop: 10 }}>{t.title || `Task ${t.id}`}</h2>
-          <p className="muted small" style={{ marginTop: 4 }}>{t.repo} on {t.machine ?? "a machine"}: it cannot go on until you approve it or discard it{t.abandoned ? "; it looks abandoned" : ""}.</p>
-        </Link>
-      ))}
-
-      {inFlight.map((a: any) => (
-        <div key={a.id} className="panel">
-          <div className="row between">
-            <strong>{a.title || a.task_id}</strong>
-            <span className="small muted">{a.status === "waiting" ? `Waiting for ${a.driver}` : a.status === "signed" ? "Signed; waiting for the machine to file it" : "The machine could not file it"}</span>
-          </div>
-        </div>
-      ))}
-
-      {edits.map((e: any) => (
-        <Link key={e.id} to={`/edits/${e.id}`} className={`panel${e.status === "stuck" || e.status === "ready" ? " attention" : ""}`} style={{ display: "block", color: "inherit", textDecoration: "none" }}>
-          <strong>Policy edit for {e.repo}</strong>
-          <p className="small muted" style={{ marginTop: 4 }}>{EDIT_WORDS[e.status] ?? e.status}{e.reason ? `: ${e.reason}` : ""}</p>
-        </Link>
-      ))}
-
-      {data.refusals.map((r: any, i: number) => (
-        <div key={i} className="panel attention">
-          <strong>{r.actor.replace("machine:", "")} refused a request from the console</strong>
-          <p className="small" style={{ marginTop: 4 }}>{r.detail.what}: {r.detail.why}</p>
-          <p className="small muted" style={{ marginTop: 4 }}>{ago(r.at)}. If you did not ask for this, see <Link to="/guide/security">what a refusal means</Link>.</p>
-        </div>
-      ))}
-
-      {nothing && data.machines.length > 0 && <p className="muted">When an agent waits for your approval it shows up here, and you get an email.</p>}
-
-      <div>
-        <div className="section-title"><h2>Recent work</h2><Link to="/activity" className="small">Everything that happened</Link></div>
-        {data.tasks.length === 0 ? (
-          <div className="list"><div className="item empty">No tasks yet. They appear when an agent declares a plan with use05 start.</div></div>
-        ) : (
-          <div className="list">
-            {data.tasks.slice(0, 12).map((t: any) => (
-              <Link key={`${t.repo_id}/${t.id}`} to={`/tasks/${t.repo_id}/${t.id}`} className="item">
-                <div className="grow">
-                  <div className="title">{t.title || `Task ${t.id}`}</div>
-                  <div className="sub">{t.repo} on {t.machine ?? "a machine"}, {t.agent ?? "a person"}{t.model ? ` (${t.model})` : ""}, {ago(t.updated_at)}{t.abandoned ? ", looks abandoned" : ""}</div>
-                </div>
-                <Verdict decision={t.decision} />
-              </Link>
+      {needsAny && (
+        <section>
+          <div className="section-title"><h2>Needs you<span className="count-pill">{data.needs_you}</span></h2></div>
+          <div className="list tight attention">
+            {waiting.map((a: any) => (
+              <Row key={a.id} to={`/tasks/${a.repo_id}/${a.task_id}`} attention
+                chip={<span className="verdict v-approval_required">{a.scope === "intent" ? "Approve the plan" : "Approve the change"}</span>}
+                title={a.title || `Task ${a.task_id}`} sub={a.repo} at={a.created_at} />
             ))}
-          </div>
-        )}
-      </div>
-
-      {data.machines.length > 0 && (
-        <div>
-          <div className="section-title"><h2>Machines</h2><Link to="/machines" className="small">Manage</Link></div>
-          <div className="list">
-            {data.machines.map((m: any) => (
-              <div key={m.id} className="item">
-                <Online on={m.online} />
-                <div className="grow"><div className="title">{m.name}</div><div className="sub">{m.online ? "online" : `last heard ${ago(m.last_seen)}`}{m.use05_version ? `, use05 ${m.use05_version}` : ""}</div></div>
+            {held.map((t: any) => (
+              <Row key={`${t.repo_id}/${t.id}`} to={`/tasks/${t.repo_id}/${t.id}`} attention
+                chip={<span className="verdict v-approval_required">Held for you</span>}
+                title={t.title || `Task ${t.id}`} sub={`${t.repo}, ${who(t)} on ${t.machine ?? "a machine"}${t.abandoned ? ", looks abandoned" : ""}`} at={t.updated_at} />
+            ))}
+            {edits.filter((e: any) => e.status === "ready" || e.status === "stuck").map((e: any) => (
+              <Row key={e.id} to={`/edits/${e.id}`} attention chip={<span className="verdict v-approval_required">Policy edit</span>}
+                title={`Policy edit for ${e.repo}`} sub={`${EDIT_WORDS[e.status] ?? e.status}${e.reason ? `: ${e.reason}` : ""}`} at={e.updated_at ?? e.created_at} />
+            ))}
+            {data.refusals.map((r: any, i: number) => (
+              <div key={i} className="item">
+                <div className="grow"><div className="title">{r.actor.replace("machine:", "")} refused a request from the console</div><div className="sub">{r.detail.what}: {r.detail.why}. If you did not ask for this, see <Link to="/guide/security">what a refusal means</Link>.</div></div>
+                <When at={r.at} />
               </div>
             ))}
           </div>
-        </div>
+        </section>
+      )}
+
+      {inFlight.length > 0 && (
+        <section>
+          <div className="section-title"><h2>On its way<span className="count-pill">{inFlight.length}</span></h2></div>
+          <div className="list tight">
+            {inFlight.map((a: any) => (
+              <div key={a.id} className="item">
+                <div className="grow"><div className="title">{a.title || a.task_id}</div><div className="sub">{a.status === "waiting" ? `Waiting for ${a.driver}` : a.status === "signed" ? "Signed; waiting for the machine to file it" : "The machine could not file it"}</div></div>
+              </div>
+            ))}
+          </div>
+        </section>
+      )}
+
+      {working.length > 0 && (
+        <section>
+          <div className="section-title"><h2>Working now<span className="count-pill">{working.length}</span></h2></div>
+          <div className="list tight">
+            {working.map((t: any) => (
+              <Row key={`${t.repo_id}/${t.id}`} to={`/tasks/${t.repo_id}/${t.id}`} chip={<span className="verdict v-none">Working</span>}
+                title={t.title || `Task ${t.id}`} sub={`${t.repo}, ${who(t)} on ${t.machine ?? "a machine"}${t.abandoned ? ", looks abandoned" : ""}`} at={t.updated_at} />
+            ))}
+          </div>
+        </section>
+      )}
+
+      <section>
+        <div className="section-title"><h2>Recently finished</h2><Link to="/activity" className="small">Everything that happened</Link></div>
+        {data.tasks.length === 0 ? (
+          <div className="list"><div className="item empty">No tasks yet. They appear when an agent declares a plan with use05 start.</div></div>
+        ) : finished.length === 0 ? (
+          <p className="muted small">Nothing finished lately.</p>
+        ) : (
+          <div className="list tight">
+            {finished.slice(0, 10).map((t: any) => (
+              <Row key={`${t.repo_id}/${t.id}`} to={`/tasks/${t.repo_id}/${t.id}`} chip={<Verdict decision={t.decision} />}
+                title={t.title || `Task ${t.id}`} sub={`${t.repo}, ${who(t)} on ${t.machine ?? "a machine"}`} at={t.updated_at} />
+            ))}
+          </div>
+        )}
+      </section>
+
+      {data.machines.length > 0 && (
+        <section>
+          <div className="section-title"><h2>Machines</h2><Link to="/machines" className="small">Manage</Link></div>
+          <div className="list tight">
+            {data.machines.map((m: any) => (
+              <div key={m.id} className="item">
+                <Online on={m.online} />
+                <div className="grow"><div className="title">{m.name}</div></div>
+                <span className="sub">{m.use05_version ? `use05 ${m.use05_version}` : ""}</span>
+                {m.online ? <span className="when">online</span> : <When at={m.last_seen} />}
+              </div>
+            ))}
+          </div>
+        </section>
       )}
     </div>
   );

@@ -1,0 +1,9 @@
+05                                                                      1 repository on this machine
+────────────────────────────────────────────────────────────────────────────────────────────────────
+Repositories 05 has been used in. The list stays on this machine: ~/repos.tsv
+
+#  Repo        Needs you  Working  Last active  Path
+1  <REPO>          1        0  <AGO>     <DIR>
+
+────────────────────────────────────────────────────────────────────────────────────────────────────
+Next: cd <DIR> && use05

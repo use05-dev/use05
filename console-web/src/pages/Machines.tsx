@@ -3,7 +3,7 @@ import { useState } from "react";
 import { ago, post } from "../api";
 import { makeReporter, wrapForPasskey } from "../keys";
 import { create, friendly, prfOf, signIn } from "../passkey";
-import { Link, Loading, Online, useData } from "../ui";
+import { Crumbs, Link, Loading, Online, useData } from "../ui";
 import { Pairing } from "./Home";
 
 export function Machines() {
@@ -41,7 +41,7 @@ export function Machines() {
 
   return (
     <div className="stack-lg">
-      <div className="hd"><div><h1>Machines and passkeys</h1><p className="muted">Machines report to the console. Passkeys sign you in and sign approvals.</p></div><Link to="/team" className="btn quiet">Team</Link></div>
+      <div className="hd"><div><Crumbs trail={[["Home", "/"], ["Machines and passkeys", null]]} /><h1>Machines and passkeys</h1><p className="muted">Machines report to the console. Passkeys sign you in and sign approvals.</p></div><Link to="/team" className="btn quiet">Team</Link></div>
 
       {data.pairings.map((p: any) => <Pairing key={p.id} p={p} done={reload} />)}
 

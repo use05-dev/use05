@@ -163,7 +163,7 @@ pub fn approval_needed(task: Option<&str>, tree: &str, intent_sha256: Option<&st
         return None;
     }
     let asking: Vec<&use05_core::gate::Finding> = r.findings.iter().filter(|f| f.effect == Effect::Approval).collect();
-    let scope = if asking.iter().any(|f| f.next.as_deref() == Some("use05 approve --intent")) { "intent" } else { "outcome" };
+    let scope = if crate::pending::need_of(r) == crate::pending::Need::Plan { "intent" } else { "outcome" };
     let codes: Vec<&str> = asking.iter().map(|f| f.code).collect();
     Some(json!({ "task": task, "scope": scope, "tree": tree, "intent_sha256": intent_sha256, "findings": codes }))
 }

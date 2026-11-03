@@ -92,6 +92,9 @@ fn brief(api: &Api, r: &Repo, task: &str) -> Option<Value> {
 }
 
 static SEEN: Mutex<Option<HashMap<String, std::time::SystemTime>>> = Mutex::new(None);
+/// Whether each task's work had landed when it was last reported: a push changes that without
+/// touching the task's own file, and the console should hear of it.
+static LANDED: Mutex<Option<HashMap<String, bool>>> = Mutex::new(None);
 
 /// Report a repository and its recent tasks. With `full`, every task's brief again.
 pub fn send_repo(api: &Api, r: &Repo, full: bool) -> Result<()> {
@@ -110,10 +113,14 @@ pub fn send_repo(api: &Api, r: &Repo, full: bool) -> Result<()> {
             continue;
         }
         let key = format!("{}:{}", r.id, t.id);
+        let landed = t.status != use05_core::task::Status::Discarded && r.landed(&t);
         let changed = {
             let mut seen = SEEN.lock().unwrap();
             let map = seen.get_or_insert_with(HashMap::new);
-            let changed = full || modified.is_some_and(|m| map.get(&key) != Some(&m));
+            let mut moved = LANDED.lock().unwrap();
+            let landed_map = moved.get_or_insert_with(HashMap::new);
+            let changed = full || modified.is_some_and(|m| map.get(&key) != Some(&m)) || landed_map.get(&key) != Some(&landed);
+            landed_map.insert(key.clone(), landed);
             if let Some(m) = modified {
                 map.insert(key, m);
             }
@@ -135,6 +142,10 @@ pub fn send_repo(api: &Api, r: &Repo, full: bool) -> Result<()> {
             "agent": t.agent.as_ref().map(|a| a.kind.clone()).or_else(|| t.author.strip_prefix("agent:").map(str::to_string)),
             "model": t.agent.as_ref().and_then(|a| a.model.clone()),
             "created": t.created, "finished": t.finished, "ended": t.ended,
+            // When the work last changed on this machine. The console shows this, not when it was
+            // last sent: a resync sends every task again.
+            "updated": modified.and_then(|m| m.duration_since(std::time::UNIX_EPOCH).ok()).map(|d| use05_core::time::rfc3339(d.as_secs())),
+            "landed": landed,
             "detail": detail,
         }));
     }
@@ -179,7 +190,7 @@ pub fn drain(api: &Api, dir: &Path) -> Result<()> {
         api.record("event", &r.id, &reference, json!({ "kind": kind, "task": task, "data": data }))?;
         if kind == "approval_needed" {
             if let (Some(task), Some(cwd)) = (task, ev["repo"].as_str()) {
-                if let Err(e) = r.ask_for_approval(api, task, ev["scope"].as_str().unwrap_or("outcome"), ev["tree"].as_str(), cwd) {
+                if let Err(e) = r.ask_for_approval(api, task, ev["scope"].as_str().unwrap_or("outcome"), ev["tree"].as_str(), cwd, None) {
                     eprintln!("approval for {task}: {e:#}");
                 }
             }

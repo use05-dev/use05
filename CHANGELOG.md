@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.0.11
+
+- **The console is one pane.** Home lists what needs you first, then what is working, then what finished lately, in tight rows, with your repositories and machines in a line each. Every inner page has breadcrumbs, so there is always a way back.
+- **Fixed: times that lied.** A row said when a record was last sent to the console, so every resync made a day-old session look new. It now says when the work last changed on its machine; a day or more back reads as a date, with the exact time on hover.
+- **Fixed: approved and released work shown as held.** The helper reports whether a task's work is already in the landing branch. Home shows it as **Landed** and it no longer asks for you.
+- **Held work needs no terminal.** Work held for you that its machine never asked about has **Ask for my approval** and **Reject it instead…** on its page: your machine prepares the statement and your passkey signs it there. A rejection is signed only when you asked to reject.
+- **Fixed: Discard that waited for ever.** The console stops waiting for a machine that does not answer after two minutes, says so, and lets you try again.
+- **`use05 approve` says which task it is approving.** With several tasks waiting, a terminal shows a numbered list (no default, so Enter never approves the first); under an agent or CI it refuses with `TASK_AMBIGUOUS` and lists them. `--task <id>` still names one, and now judges that task's own checkout, not the folder you ran it in.
+- **`use05` shows everything on the machine.** Outside a repository it lists the repositories 05 is used in, most needing you first, and opens the one you pick. Inside one it is a single pane of Needs you, Working and Recent, each with its id and whether finished work has landed. A small list of repositories, `repos.tsv` in 05's per-user folder, stays on the machine and is removed by `uninstall`.
+- **Upgrading.** Upgrade the machines first (`npm install -g @use05/cli`, then `use05 cloud install`), then redeploy your console: an older helper refuses the new ask-for-approval request, and says so on Home.
+
 ## 0.0.10
 
 - **Fixed: an approval that could never clear a push.** `use05 approve`, the brief and the other judging commands read the rules at the task's start commit, but the pre-push hook and CI read them where the work forks from the remote. A task that began before the policy was committed, or before it changed, signed every approval under other rules, so the push held with "given under a different policy" however often it was approved. They now all read the rules from the same place.

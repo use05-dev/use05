@@ -2,7 +2,7 @@ import { useEffect, useState } from "react";
 import { openResult, sealTo, useView } from "../records";
 import { ago, get, post } from "../api";
 import { friendly, signStatement } from "../passkey";
-import { Link, Loading, Seal } from "../ui";
+import { Crumbs, Loading, Seal } from "../ui";
 
 const ORDER = ["preparing", "ready", "signed", "applied"];
 
@@ -55,7 +55,7 @@ export function Edit({ id }: { id: string }) {
     <div className="stack-lg">
       <div className="hd">
         <div>
-          <p className="small"><Link to={`/repos/${e.repo_id}`}>{e.repo}</Link></p>
+          <Crumbs trail={[["Home", "/"], [e.repo, `/repos/${e.repo_id}`], ["Policy edit", null]]} />
           <h1>Policy edit</h1>
           <p className="muted">Started {ago(e.created_at)}</p>
         </div>

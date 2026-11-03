@@ -25,11 +25,15 @@ pub struct ApproveArgs {
     /// With `unsigned`: the person the statement is for, when someone else signs it (CI).
     pub approver: Option<String>,
     pub intent: bool,
+    /// Asked for the outcome by name: with no `--task`, only tasks whose result waits are offered.
+    pub outcome: bool,
     pub reject: bool,
     pub reason: Option<String>,
     pub task: Option<String>,
     pub tree: Option<String>,
     pub passphrase_stdin: bool,
+    /// A person at a terminal, who may be asked which task: never under an agent, CI or a pipe.
+    pub interactive: bool,
     pub repo: PathBuf,
 }
 
@@ -78,9 +82,86 @@ fn expiry(days: u32, hours: u32) -> String {
     rfc3339(now_secs() + days as u64 * 86_400 + hours as u64 * 3_600)
 }
 
-pub fn run_approve(args: ApproveArgs) -> Report {
+/// Which task an approval is for, when `--task` did not say. Every task in this repository that
+/// waits for a person is found; one is named and used, several are offered to a person at a
+/// terminal, and under an agent, CI or a pipe several are an error that lists them. The task's own
+/// checkout (or branch) is what gets approved, not whatever this directory happens to hold.
+fn choose_task(args: &mut ApproveArgs) -> Result<(), Report> {
+    use crate::pending::{self, Need};
+    let survey = pending::survey(&args.repo, pending::MAX_TASKS).map_err(|e| Report::from_core("approve", e))?;
+    let (plan_only, change_only) = (args.intent, args.outcome);
+    let waiting: Vec<&pending::Entry> = survey.waiting().into_iter().filter(|e| e.needs().is_some_and(|n| (!plan_only || n == Need::Plan) && (!change_only || n == Need::Change))).collect();
+    let now = now_secs();
+    let ui = crate::ui::Ui::stderr();
+    let chosen = match waiting.as_slice() {
+        [] => return nothing_waits(args),
+        [one] => {
+            eprintln!("Approving \"{}\" (task {}, its {}): the only task waiting here.", one.task.title, one.task.id, one.needs().map_or("", Need::word));
+            *one
+        }
+        many if args.interactive => {
+            let rows = pending::list_rows(&ui, many, now, ui.width.saturating_sub(6), |e| e.needs().map_or(String::new(), |n| n.word().to_string()));
+            let title = format!("{} tasks wait for you in {}. Which one?", many.len(), repo_name(&args.repo));
+            match crate::pick::choose_here(&ui, Some(&title), &rows, "Quit, approve nothing") {
+                Some(i) => {
+                    eprintln!("Approving \"{}\" (task {}, its {}).", many[i].task.title, many[i].task.id, many[i].needs().map_or("", Need::word));
+                    many[i]
+                }
+                None => return Err(Report::error("approve", "NOTHING_CHOSEN", "no task was chosen; nothing was approved".into(), None, 1)),
+            }
+        }
+        many => {
+            let listed: Vec<String> = many.iter().map(|e| format!("{} \"{}\" ({})", e.task.id, e.task.title, e.needs().map_or("", Need::word))).collect();
+            let mut r = Report::error("approve", "TASK_AMBIGUOUS", format!("{} tasks wait for approval here, so say which: {}", many.len(), listed.join(", ")), Some("use05 approve --task <id>".into()), 6);
+            r.details = json!({ "candidates": many.iter().map(|e| json!({ "task": e.task.id, "title": e.task.title, "needs": e.needs().map(Need::word), "agent": e.who(), "last_activity": rfc3339(e.activity) })).collect::<Vec<_>>() });
+            return Err(r);
+        }
+    };
+    args.task = Some(chosen.task.id.clone());
+    if let Some(place) = &chosen.place {
+        args.repo = place.dir.clone();
+        args.tree = place.tree.clone();
+    }
+    // What the person was asked for is what they sign: a task whose plan waits gets its plan approved.
+    args.intent = args.intent || chosen.needs() == Some(Need::Plan);
+    Ok(())
+}
+
+fn repo_name(repo: &std::path::Path) -> String {
+    git::dirs(repo).ok().and_then(|d| d.top.file_name().map(|n| n.to_string_lossy().to_string())).unwrap_or_else(|| "this repository".into())
+}
+
+/// No task waits. A change nobody started a task for (a person's own, to a protected file) still
+/// can be approved, as can an intent asked for by name or a statement prepared for someone else
+/// to sign; anything else has nothing to approve.
+fn nothing_waits(args: &ApproveArgs) -> Result<(), Report> {
+    if args.intent || args.unsigned {
+        return Ok(());
+    }
+    let asks = Ctx::open_judging(&args.repo, None).and_then(|ctx| ctx.target(args.tree.as_deref()).and_then(|t| ctx.gate(&t))).is_ok_and(|g| g.decision == use05_core::gate::Decision::ApprovalRequired);
+    if asks {
+        return Ok(());
+    }
+    Err(Report::error("approve", "NOTHING_WAITS", "nothing is waiting for your approval in this repository".into(), Some("use05   shows every task; approve a particular one with: use05 approve --task <id>".into()), 6))
+}
+
+/// `--task` names a task: approve its own work, wherever it is checked out.
+fn locate_task(args: &mut ApproveArgs) {
+    let (repo, tree) = crate::pending::locate(&args.repo, args.task.as_deref(), args.tree.as_deref());
+    args.repo = repo;
+    args.tree = tree;
+}
+
+pub fn run_approve(mut args: ApproveArgs) -> Report {
     if let Some(file) = &args.signed {
         return run_signed(file, args.push, &args.repo);
+    }
+    if args.task.is_none() && args.tree.is_none() && !args.tested && !args.skip_testing {
+        if let Err(r) = choose_task(&mut args) {
+            return r;
+        }
+    } else if args.tree.is_none() {
+        locate_task(&mut args);
     }
     let ctx = match Ctx::open_judging(&args.repo, args.task.as_deref()) {
         Ok(c) => c,

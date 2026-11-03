@@ -211,6 +211,28 @@ impl Store {
         write(&self.task_path(&task.id), &String::from_utf8_lossy(&json))
     }
 
+    /// Save a change that is bookkeeping, not something that happened to the task (its base moved
+    /// to match the latest code): the file keeps the time of the last real change.
+    pub fn save_keeping_time(&self, task: &Task) -> Result<()> {
+        let path = self.task_path(&task.id);
+        let before = fs::metadata(&path).and_then(|m| m.modified()).ok();
+        self.save(task)?;
+        if let (Some(at), Ok(file)) = (before, fs::OpenOptions::new().write(true).open(&path)) {
+            let _ = file.set_modified(at);
+        }
+        Ok(())
+    }
+
+    /// When the task last changed, in seconds: the latest of its own file (written when it is
+    /// declared, finished or gets its outcome), the times it records, and its action log. This
+    /// is real activity, not when something last looked at it.
+    pub fn last_activity(&self, task: &Task) -> u64 {
+        use crate::time::parse_rfc3339;
+        let file = fs::metadata(self.task_path(&task.id)).and_then(|m| m.modified()).ok().and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok()).map_or(0, |d| d.as_secs());
+        let recorded = [Some(&task.created), task.sealed.as_ref(), task.finished.as_ref(), task.ended.as_ref()].into_iter().flatten().filter_map(|t| parse_rfc3339(t)).max().unwrap_or(0);
+        file.max(recorded).max(crate::log::last_activity(&self.state_dir(), &task.id))
+    }
+
     pub fn load(&self, id: &str) -> Result<Task> {
         if !id.chars().all(|c| c.is_ascii_alphanumeric()) {
             return Err(Error::new("TASK_NOT_FOUND", format!("{id:?} is not a task id")));
@@ -325,6 +347,23 @@ mod tests {
         store.finish(&mut loaded, Some(" tests pass ")).unwrap();
         assert_eq!(store.load(&task.id).unwrap().outcome.as_deref(), Some("tests pass"));
         assert_eq!(store.list().len(), 1);
+    }
+
+    #[test]
+    fn activity_is_when_the_task_changed_and_a_quiet_save_does_not_move_it() {
+        let dir = repo();
+        let store = Store::open(dir.path()).unwrap();
+        let mut task = store.create("Cap retries", "agent:codex", None, Some("s1")).unwrap();
+        let path = store.task_path(&task.id);
+        let long_ago = std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_000_000);
+        fs::OpenOptions::new().write(true).open(&path).unwrap().set_modified(long_ago).unwrap();
+        task.created = crate::time::rfc3339(1_000_000);
+        store.save_keeping_time(&task).unwrap();
+        assert_eq!(store.last_activity(&task), 1_000_000, "a base moved to the latest code is not activity");
+        task.finished = Some(crate::time::rfc3339(2_000_000));
+        assert_eq!(store.last_activity(&task), 2_000_000, "a time the task records counts");
+        store.save(&task).unwrap();
+        assert!(store.last_activity(&task) > 2_000_000, "a real save counts");
     }
 
     #[test]

@@ -31,6 +31,7 @@ pub fn routes() -> Router<Shared> {
         .route("/repos/{id}/testing", post(signoff_start))
         .route("/reporters", post(reporter_new))
         .route("/repos/{id}/discard", post(discard_start))
+        .route("/repos/{id}/ask-approval", post(ask_approval_start))
         .route("/discards/{id}", get(discard_view))
         .route("/discards/{id}/sign", post(discard_sign))
         .route("/forget", post(forget))
@@ -274,6 +275,18 @@ async fn signoff_start(State(app): State<Shared>, me: Member, Path(id): Path<Str
     Ok(Json(json!({ "signoff": c.id })))
 }
 
+/// Work is held for a person but its machine never asked here (the session ended first, say):
+/// the person asks for the approval to be prepared, from the console, and signs it there.
+async fn ask_approval_start(State(app): State<Shared>, me: Member, Path(id): Path<String>, Json(c): Json<SignoffIn>) -> Res {
+    let mine: bool = sqlx::query_scalar("select exists (select 1 from repo_machines rm join machines m on m.id = rm.machine_id where rm.repo_id = ?1 and rm.allowed and not m.revoked and m.id = ?2 and m.member_id = ?3 and m.kind = 'machine')").bind(&id).bind(c.machine).bind(me.id).fetch_one(&app.db).await?;
+    if !mine {
+        return Err(forbidden("only the person whose machine did the work can ask for its approval"));
+    }
+    instruct(&app.db, c.machine, "ask_approval", json!({ "ask": c.id, "repo": id, "sealed": c.sealed })).await?;
+    audit(&app, &me.name, "approval_asked_for", json!({ "repo": id })).await;
+    Ok(Json(json!({ "ask": c.id })))
+}
+
 /// Throwing a task's work away from a phone (D89): the machine that holds it prepares the
 /// discard with what would be lost, the person's passkey signs it, the machine does it.
 async fn discard_start(State(app): State<Shared>, me: Member, Path(id): Path<String>, Json(c): Json<SignoffIn>) -> Res {
@@ -290,7 +303,19 @@ async fn discard_start(State(app): State<Shared>, me: Member, Path(id): Path<Str
     Ok(Json(json!({ "discard": c.id })))
 }
 
+/// A discard the machine never answered stops waiting: the page would otherwise say it is
+/// working it out for ever (the machine asleep, offline, or not the one that answers for this
+/// repository). The request is closed too, so a late answer cannot act on it.
+async fn expire_unanswered(db: &sqlx::SqlitePool, id: &str) -> Result<(), Fail> {
+    let stopped = sqlx::query("update discards set status = 'stuck', updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') where id = ?1 and ((status = 'preparing' and created_at < strftime('%Y-%m-%dT%H:%M:%fZ', 'now', '-120 seconds')) or (status = 'signed' and updated_at < strftime('%Y-%m-%dT%H:%M:%fZ', 'now', '-300 seconds')))").bind(id).execute(db).await?;
+    if stopped.rows_affected() > 0 {
+        sqlx::query("update instructions set done_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') where done_at is null and kind in ('prepare_discard', 'discard') and json_extract(payload, '$.discard') = ?1").bind(id).execute(db).await?;
+    }
+    Ok(())
+}
+
 async fn discard_view(State(app): State<Shared>, _m: Member, Path(id): Path<Uuid>) -> Res {
+    expire_unanswered(&app.db, &id.to_string()).await?;
     let row: Option<Value> = sqlx::query("select id, repo_id, machine_id, member_id, status, prepared, created_at, updated_at from discards where id = ?1").bind(id).fetch_optional(&app.db).await?.map(|r| crate::db::row_json(Some(&r)));
     let row = row.ok_or_else(|| missing("there is no such discard"))?;
     let keys: Vec<(String,)> = sqlx::query_as("select id from passkeys where member_id = ?1").bind(row["member_id"].as_str().and_then(|d| d.parse::<Uuid>().ok())).fetch_all(&app.db).await?;
@@ -602,6 +627,32 @@ mod tests {
         let left: Vec<String> = sqlx::query_scalar("select ref_key from records").fetch_all(&db).await.unwrap();
         assert_eq!(left, vec!["t2".to_string()]);
         assert_eq!(forget_records(&db, me, true, "r1", &refs, &[]).await.unwrap(), 1, "an admin may clear anyone's");
+    }
+
+    #[tokio::test]
+    async fn a_discard_the_machine_never_answers_stops_waiting() {
+        let db = sqlx::sqlite::SqlitePoolOptions::new().max_connections(1).connect("sqlite::memory:").await.unwrap();
+        sqlx::migrate!("./migrations").run(&db).await.unwrap();
+        let machine = Uuid::new_v4();
+        sqlx::query("insert into machines (id, name, token_hash) values (?1, 'm', ?2)").bind(machine).bind(machine.0.to_string()).execute(&db).await.unwrap();
+        sqlx::query("insert into repos (id) values ('r1')").execute(&db).await.unwrap();
+        let (fresh, old, signed_old) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
+        for (id, status, age) in [(fresh, "preparing", "-10 seconds"), (old, "preparing", "-200 seconds"), (signed_old, "signed", "-400 seconds")] {
+            sqlx::query("insert into discards (id, repo_id, machine_id, status, created_at, updated_at) values (?1, 'r1', ?2, ?3, strftime('%Y-%m-%dT%H:%M:%fZ', 'now', ?4), strftime('%Y-%m-%dT%H:%M:%fZ', 'now', ?4))").bind(id).bind(machine).bind(status).bind(age).execute(&db).await.unwrap();
+            instruct(&db, machine, "prepare_discard", json!({ "discard": id.to_string(), "repo": "r1" })).await.unwrap();
+        }
+        for id in [fresh, old, signed_old] {
+            expire_unanswered(&db, &id.to_string()).await.unwrap();
+        }
+        let status = |id: Uuid| {
+            let db = db.clone();
+            async move { sqlx::query_scalar::<_, String>("select status from discards where id = ?1").bind(id).fetch_one(&db).await.unwrap() }
+        };
+        assert_eq!(status(fresh).await, "preparing", "still within its two minutes");
+        assert_eq!(status(old).await, "stuck");
+        assert_eq!(status(signed_old).await, "stuck");
+        let open: i64 = sqlx::query_scalar("select count(*) from instructions where done_at is null").fetch_one(&db).await.unwrap();
+        assert_eq!(open, 1, "only the fresh request is still open to the machine");
     }
 
     #[tokio::test]

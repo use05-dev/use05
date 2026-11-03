@@ -46,6 +46,7 @@ fn sealed_kind(kind: &str) -> Option<&'static str> {
         "prepare_policy_edit" | "apply_policy_edit" => Some("edit"),
         "prepare_testing" | "file_testing" => Some("signoff"),
         "prepare_discard" | "discard" => Some("discard"),
+        "ask_approval" => Some("ask"),
         _ => None,
     }
 }
@@ -177,6 +178,11 @@ mod tests {
         assert!(bind_instruction("apply_policy_edit", &serde_json::json!({ "edit": "e1", "repo": "p1" }), Some(serde_json::json!({ "repo": "p1", "commit": "c" }))).is_err());
         // What must come sealed, unsealed.
         assert!(bind_instruction("prepare_policy_edit", &serde_json::json!({ "edit": "e1", "repo": "p1", "toml": "" }), None).is_err());
+        // An ask for an approval must come sealed, naming the ask and the repository, with the task inside.
+        let asked = bind_instruction("ask_approval", &serde_json::json!({ "ask": "a1", "repo": "p1" }), Some(serde_json::json!({ "ask": "a1", "repo": "p1", "task": "t1", "scope": "intent" }))).unwrap();
+        assert_eq!(asked["task"], "t1");
+        assert!(bind_instruction("ask_approval", &serde_json::json!({ "ask": "a1", "repo": "p1" }), None).is_err());
+        assert!(bind_instruction("ask_approval", &serde_json::json!({ "ask": "a2", "repo": "p1" }), Some(serde_json::json!({ "ask": "a1", "repo": "p1", "task": "t1" }))).is_err());
         // What needs no seal passes as routed.
         assert_eq!(bind_instruction("send_tree", &serde_json::json!({ "repo": "p1" }), None).unwrap(), serde_json::json!({ "repo": "p1" }));
     }

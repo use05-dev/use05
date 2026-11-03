@@ -85,6 +85,33 @@ impl Repo {
         [format!("refs/remotes/origin/{}", self.landing), format!("refs/heads/{}", self.landing), "HEAD".into()].into_iter().find(|r| git(&self.top, &["rev-parse", "--verify", "--quiet", &format!("{r}^{{commit}}")]).is_ok())
     }
 
+    /// Whether a task's work is already in the landing branch, so nothing of it waits for a person.
+    /// A finished task is its last commit; one still open is where its branch (or this checkout)
+    /// is now, and only counts when nothing is left uncommitted. A task that never went past the
+    /// commit it started from has no work to have landed.
+    pub fn landed(&self, task: &use05_core::task::Task) -> bool {
+        let Some(land) = self.policy_ref() else { return false };
+        let finished = task.status == use05_core::task::Status::Finished;
+        let tip = match (&task.head, finished, &task.branch) {
+            (Some(h), true, _) => h.clone(),
+            (_, _, Some(b)) => match git(&self.top, &["rev-parse", "--verify", "--quiet", &format!("refs/heads/{b}^{{commit}}")]) {
+                Ok(t) => t,
+                Err(_) => return false,
+            },
+            _ => match git(&self.top, &["rev-parse", "HEAD"]) {
+                Ok(t) => t,
+                Err(_) => return false,
+            },
+        };
+        if task.base_commit.as_deref() == Some(tip.as_str()) {
+            return false;
+        }
+        if !finished && git(&self.top, &["status", "--porcelain"]).map(|s| !s.is_empty()).unwrap_or(true) {
+            return false;
+        }
+        git(&self.top, &["merge-base", "--is-ancestor", &tip, &land]).is_ok()
+    }
+
     fn policy_at(&self, rev: &str) -> Result<(String, Policy)> {
         let text = git(&self.top, &["show", &format!("{rev}:{POLICY_PATH}")]).unwrap_or_default();
         let policy = Policy::parse(&text).map_err(|e| anyhow!(e.message))?;
@@ -117,12 +144,16 @@ impl Repo {
     }
 
     /// 05 says a task waits for a person: have the installed use05 prepare the exact statement.
-    pub fn ask_for_approval(&self, api: &Api, task: &str, scope: &str, tree: Option<&str>, cwd: &str) -> Result<()> {
+    /// With `reject`, the person's reason: the statement prepared is a rejection for their passkey to sign.
+    pub fn ask_for_approval(&self, api: &Api, task: &str, scope: &str, tree: Option<&str>, cwd: &str, reject: Option<&str>) -> Result<()> {
         let mut args = vec!["approve", "--task", task, "--unsigned", "--json"];
         if scope == "intent" {
             args.push("--intent");
         } else if let Some(t) = tree.filter(|t| hex_id(t)) {
             args.extend(["--tree", t]);
+        }
+        if let Some(reason) = reject {
+            args.extend(["--reject", "--reason", reason]);
         }
         let dir = if self.contains(cwd) { cwd } else { &self.top };
         let (code, v) = self.use05(api, dir, &args)?;
@@ -132,7 +163,8 @@ impl Repo {
         let d = &v["details"];
         crate::prepared()?.remember(&self.id, Purpose::Approval, d["payload"].as_str().unwrap_or_default())?;
         // Sealed to the team: the console knows only that this repository asks for something.
-        let reference = cloud::seal::hmac_ref(&crate::stored_id_key()?, "approval", &format!("{task}|{}|{}", d["scope"].as_str().unwrap_or(""), d["tree"].as_str().unwrap_or("")));
+        let kind = if reject.is_some() { "|reject" } else { "" };
+        let reference = cloud::seal::hmac_ref(&crate::stored_id_key()?, "approval", &format!("{task}|{}|{}{kind}", d["scope"].as_str().unwrap_or(""), d["tree"].as_str().unwrap_or("")));
         let body = json!({ "task": task, "scope": d["scope"], "tree": d["tree"], "unsigned": d });
         let (sealed, sig) = api.sealed("approval", &self.id, &reference, &body)?;
         api.post("/approval", json!({ "repo": self.id, "ref": reference, "sealed": sealed, "sig": sig }))?;
@@ -419,6 +451,16 @@ pub fn handle(api: &Api, kind: &str, payload: &Value) -> Result<Value> {
         "prepare_policy_edit" => repo.prepare(api, payload["toml"].as_str().ok_or_else(|| anyhow!("no policy"))?),
         "prepare_testing" => repo.prepare_testing(api, payload),
         "file_testing" => repo.file(api, &payload["envelope"], Purpose::Testing, false),
+        "ask_approval" => {
+            let task = payload["task"].as_str().filter(|t| !t.is_empty() && t.chars().all(|c| c.is_ascii_alphanumeric())).ok_or_else(|| anyhow!("no task to ask about"))?;
+            let scope = if payload["scope"] == "intent" { "intent" } else { "outcome" };
+            let reject = payload["reject"].as_bool().unwrap_or(false);
+            let reason = payload["reason"].as_str().map(str::trim).filter(|r| !r.is_empty());
+            if reject && reason.is_none() {
+                bail!("say why you are rejecting it");
+            }
+            repo.ask_for_approval(api, task, scope, None, &repo.top, reason.filter(|_| reject)).map(|_| json!({}))
+        }
         "prepare_discard" => repo.prepare_discard(api, payload),
         "discard" => {
             let done = repo.discard(api, &payload["envelope"]);
@@ -430,5 +472,54 @@ pub fn handle(api: &Api, kind: &str, payload: &Value) -> Result<Value> {
         }
         "apply_policy_edit" => repo.apply(api, &payload["envelope"], payload["commit"].as_str().unwrap_or(""), payload["base"].as_str().unwrap_or("")),
         other => Err(repo.refuse(api, &format!("an unknown request ({})", other.chars().take(40).collect::<String>()), "it is not one of the things the console may ask")),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn run(dir: &str, args: &[&str]) -> String {
+        git(dir, args).unwrap_or_else(|e| panic!("git {args:?}: {e}"))
+    }
+
+    fn task(base: &str, status: &str, head: Option<&str>) -> use05_core::task::Task {
+        serde_json::from_value(json!({
+            "id": "t1", "title": "x", "author": "agent:claude-code", "created": "2026-11-01T00:00:00Z",
+            "base_commit": base, "base_tree": "", "status": status, "head": head,
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn work_counts_as_landed_only_once_the_landing_branch_has_it_and_nothing_is_left_over() {
+        let dir = tempfile::tempdir().unwrap();
+        let top = std::fs::canonicalize(dir.path()).unwrap().to_string_lossy().to_string();
+        run(&top, &["init", "-q", "-b", "main"]);
+        run(&top, &["config", "user.name", "t"]);
+        run(&top, &["config", "user.email", "t@t"]);
+        std::fs::write(dir.path().join("a"), "1").unwrap();
+        run(&top, &["add", "-A"]);
+        run(&top, &["commit", "-q", "-m", "a"]);
+        let a = run(&top, &["rev-parse", "HEAD"]);
+        run(&top, &["update-ref", "refs/remotes/origin/main", &a]);
+        let repo = Repo { top: top.clone(), id: "r".into(), name: "r".into(), remote: None, landing: "main".into(), common: std::path::PathBuf::from(&top) };
+
+        let open = task(&a, "active", None);
+        assert!(!repo.landed(&open), "nothing was done past where it started");
+
+        std::fs::write(dir.path().join("b"), "2").unwrap();
+        run(&top, &["add", "-A"]);
+        run(&top, &["commit", "-q", "-m", "b"]);
+        let b = run(&top, &["rev-parse", "HEAD"]);
+        assert!(!repo.landed(&open), "committed here, not on the landing branch yet");
+
+        run(&top, &["update-ref", "refs/remotes/origin/main", &b]);
+        assert!(repo.landed(&open), "pushed, and nothing left over");
+
+        std::fs::write(dir.path().join("c"), "3").unwrap();
+        assert!(!repo.landed(&open), "an open task with uncommitted work is not done");
+        assert!(repo.landed(&task(&a, "finished", Some(&b))), "a finished task is its last commit");
+        assert!(!repo.landed(&task(&a, "finished", Some(&a))), "finished with nothing new");
     }
 }

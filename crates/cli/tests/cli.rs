@@ -142,6 +142,7 @@ fn normalise(sandbox: &Sandbox, raw: &str) -> String {
     let raw = raw.replace(&sandbox.dir.path().display().to_string(), "<DIR>");
     let repo_name = sandbox.dir.path().file_name().unwrap().to_string_lossy().to_string();
     let raw = raw.replace(&repo_name, "<REPO>");
+    let raw = mask_ago(&raw);
     let mut out = String::new();
     for line in raw.lines() {
         let indent = line.len() - line.trim_start().len();
@@ -160,6 +161,27 @@ fn normalise(sandbox: &Sandbox, raw: &str) -> String {
         }
         None => out,
     }
+}
+
+/// "just now", "5 min ago", "3 h ago", "2 d ago": how long ago varies between runs.
+fn mask_ago(text: &str) -> String {
+    let words: Vec<&str> = text.split(' ').collect();
+    let mut out: Vec<String> = Vec::new();
+    let mut i = 0;
+    while i < words.len() {
+        let is_number = |w: &str| !w.is_empty() && w.chars().all(|c| c.is_ascii_digit());
+        if words[i] == "just" && words.get(i + 1).is_some_and(|w| w.starts_with("now")) {
+            out.push(format!("<AGO>{}", words[i + 1].trim_start_matches("now")));
+            i += 2;
+        } else if is_number(words[i]) && words.get(i + 1).is_some_and(|w| ["min", "h", "d"].contains(w)) && words.get(i + 2).is_some_and(|w| w.starts_with("ago")) {
+            out.push(format!("<AGO>{}", words[i + 2].trim_start_matches("ago")));
+            i += 3;
+        } else {
+            out.push(words[i].to_string());
+            i += 1;
+        }
+    }
+    out.join(" ")
 }
 
 fn is_duration(token: &str) -> bool {
@@ -4072,4 +4094,257 @@ fn discard_signed_by_a_passkey_from_the_console_counts_only_as_prepared_here() {
     // Signed again: it is done already.
     let again = s.run(&["discard", "--signed", "signed.json", "--json"]);
     assert_eq!(json(&again)["code"], "ALREADY_DISCARDED", "{}", text(&again));
+}
+
+// ----------------------------------------------------------------------------- choosing what to approve, and the one page for everything
+
+/// The text a terminal shows, without its colour codes and carriage returns.
+fn plain(screen: &str) -> String {
+    let mut out = String::new();
+    let mut chars = screen.chars();
+    while let Some(c) = chars.next() {
+        if c == '\x1b' {
+            for n in chars.by_ref() {
+                if n.is_ascii_alphabetic() {
+                    break;
+                }
+            }
+        } else if c != '\r' {
+            out.push(c);
+        }
+    }
+    out
+}
+
+/// The number a numbered list on `screen` gives the line that holds `title`.
+fn number_of(screen: &str, title: &str) -> String {
+    let screen = plain(screen);
+    let line = screen.lines().find(|l| l.contains(title) && l.trim_start().starts_with(|c: char| c.is_ascii_digit())).unwrap_or_else(|| panic!("no numbered line for {title}:\n{screen}"));
+    line.split_whitespace().next().unwrap().to_string()
+}
+
+/// A second task waiting for approval beside the first, in the same checkout.
+fn two_waiting() -> (Sandbox, String, String) {
+    let s = Sandbox::waiting_for_approval();
+    let first = json(&s.run(&["approve", "--unsigned", "--json"]))["details"]["task"].as_str().unwrap().to_string();
+    let out = s.run(&["start", "Second change", "--scope", ".05/**", "--json"]);
+    assert_eq!(code(&out), 0, "{}", text(&out));
+    let second = json(&out)["details"]["task"].as_str().unwrap().to_string();
+    assert_ne!(first, second);
+    (s, first, second)
+}
+
+#[test]
+fn approve_names_the_one_task_waiting_before_it_asks_for_anything() {
+    let s = Sandbox::waiting_for_approval();
+    let out = s.run(&["approve", "--unsigned", "--json"]);
+    assert_eq!(code(&out), 0, "{}", text(&out));
+    let id = json(&out)["details"]["task"].as_str().unwrap().to_string();
+    let said = String::from_utf8_lossy(&out.stderr).to_string();
+    assert!(said.contains("Approving \"Tighten the policy\"") && said.contains(&id) && said.contains("its change") && said.contains("only task waiting"), "{said}");
+}
+
+#[test]
+fn approve_with_several_tasks_waiting_fails_without_a_terminal_and_lists_them() {
+    let (s, first, second) = two_waiting();
+    let before = s.stored_receipts();
+    let out = s.run(&["approve", "--reason", "fine", "--json"]);
+    assert_eq!(code(&out), 6, "{}", text(&out));
+    let v = json(&out);
+    assert_eq!(v["code"], "TASK_AMBIGUOUS");
+    let message = v["message"].as_str().unwrap();
+    assert!(message.contains(&first) && message.contains(&second) && message.contains("Second change") && message.contains("Tighten the policy"), "{message}");
+    assert_eq!(v["next"], "use05 approve --task <id>");
+    assert_eq!(v["details"]["candidates"].as_array().unwrap().len(), 2, "{v}");
+    assert_eq!(s.stored_receipts(), before, "nothing was signed");
+    // A pipe is no terminal either: nobody is asked, even with the passphrase on stdin.
+    let piped = s.run_with_stdin(&["approve", "--reason", "fine", "--passphrase-stdin"], "correct horse\n");
+    assert_eq!(code(&piped), 6, "{}", text(&piped));
+    snapshot("approve_ambiguous", &s, &s.run(&["approve", "--reason", "fine"]));
+}
+
+#[test]
+fn approve_task_still_names_its_task_whatever_else_waits() {
+    let (s, first, second) = two_waiting();
+    for id in [&first, &second] {
+        let out = s.run(&["approve", "--task", id, "--unsigned", "--json"]);
+        assert_eq!(code(&out), 0, "{}", text(&out));
+        assert_eq!(json(&out)["details"]["task"], *id);
+    }
+}
+
+#[test]
+fn a_person_at_a_terminal_picks_which_of_several_tasks_to_approve() {
+    let (s, first, _second) = two_waiting();
+    s.approver();
+    let before = s.stored_receipts();
+    // Quitting the list signs nothing, and shows it.
+    let (quit, screen) = on_a_terminal(&s, &["approve", "--reason", "fine"], &["q"]);
+    assert_ne!(quit, 0, "{screen}");
+    assert!(plain(&screen).contains("2 tasks wait for you") && plain(&screen).contains("Quit, approve nothing"), "{screen}");
+    assert_eq!(s.stored_receipts(), before, "quitting signs nothing");
+
+    // The person types the number beside the first task, then the passphrase.
+    let number = number_of(&screen, "Tighten the policy");
+    let (done, screen) = on_a_terminal(&s, &["approve", "--reason", "reviewed the policy edit"], &[&number, "correct horse"]);
+    assert_eq!(done, 0, "{screen}");
+    let said = plain(&screen);
+    assert!(said.contains("Approving \"Tighten the policy\"") && said.contains(&first), "it names what was chosen: {said}");
+    assert!(!screen.contains("correct horse"), "{screen}");
+    assert_eq!(s.stored_receipts().len(), before.len() + 1);
+}
+
+#[test]
+fn approve_with_nothing_waiting_says_so_and_signs_nothing() {
+    let s = Sandbox::initialised();
+    s.approver();
+    let out = s.run(&["approve", "--reason", "fine", "--json"]);
+    assert_eq!(code(&out), 6, "{}", text(&out));
+    assert_eq!(json(&out)["code"], "NOTHING_WAITS");
+    assert!(s.stored_receipts().is_empty());
+}
+
+#[test]
+fn approving_a_task_approves_its_own_checkout_not_the_one_the_command_ran_in() {
+    let s = Sandbox::initialised();
+    let holder = tempfile::tempdir().unwrap();
+    let wt = agent_worktree(&s, &holder, "claude/elsewhere");
+    let id = task_in(&s, &wt, "Work in a worktree");
+    fs::write(wt.join("main.rs"), "fn main() { /* in the worktree */ }\n").unwrap();
+    git_at(&wt, &["commit", "-qam", "work"]);
+    let out = s.run(&["approve", "--task", &id, "--unsigned", "--json"]);
+    assert_eq!(code(&out), 0, "{}", text(&out));
+    assert_eq!(json(&out)["details"]["tree"], git_at(&wt, &["rev-parse", "HEAD^{tree}"]), "the tree is the worktree's");
+    assert_ne!(json(&out)["details"]["tree"], s.git(&["rev-parse", "HEAD^{tree}"]));
+}
+
+/// Bare `use05` somewhere that is no repository, with this per-user directory.
+fn bare_elsewhere(home: &Path) -> Output {
+    let elsewhere = tempfile::tempdir().unwrap();
+    let mut cmd = Command::new(BIN);
+    cmd.current_dir(elsewhere.path()).env_clear().env("PATH", "/usr/bin:/bin").env("HOME", home).env("USE05_HOME", home).env("LANG", "C.UTF-8").env("COLUMNS", "100").stdin(Stdio::null());
+    if let Ok(d) = std::env::var("DEVELOPER_DIR") {
+        cmd.env("DEVELOPER_DIR", d);
+    }
+    cmd.output().unwrap()
+}
+
+fn dir_name(s: &Sandbox) -> String {
+    s.dir.path().file_name().unwrap().to_string_lossy().to_string()
+}
+
+#[test]
+fn the_machine_index_records_a_repository_once_and_drops_one_that_is_gone() {
+    let a = Sandbox::initialised();
+    let b = Sandbox::initialised();
+    let home = a.home.path().to_path_buf();
+    let index = home.join("repos.tsv");
+    let real = |s: &Sandbox| fs::canonicalize(s.dir.path()).unwrap().display().to_string();
+    let lists = |s: &Sandbox| fs::read_to_string(&index).unwrap().lines().any(|l| l.ends_with(&format!("\t{}", real(s))));
+    assert!(lists(&a), "init lists the repository: {}", fs::read_to_string(&index).unwrap());
+    // Another repository, used with the same per-user directory.
+    b.run_env(&["doctor"], &[("USE05_HOME", home.to_str().unwrap())]);
+    assert!(lists(&b) && lists(&a));
+    assert_eq!(fs::read_to_string(&index).unwrap().lines().count(), 2);
+    // A command a few minutes later does not write it again.
+    let stamp = || fs::metadata(&index).unwrap().modified().unwrap();
+    let written = stamp();
+    a.run(&["doctor"]);
+    a.run(&["brief"]);
+    assert_eq!(stamp(), written, "a repository listed moments ago is not rewritten");
+
+    let shown = text(&bare_elsewhere(&home));
+    assert!(shown.contains(&dir_name(&a)) && shown.contains(&dir_name(&b)), "{shown}");
+    let gone = dir_name(&b);
+    drop(b);
+    let after = text(&bare_elsewhere(&home));
+    assert!(after.contains(&dir_name(&a)) && !after.contains(&gone), "a deleted repository drops off:\n{after}");
+}
+
+#[test]
+fn a_repository_that_never_set_05_up_is_not_listed_and_uninstall_takes_its_entry_away() {
+    let plain_repo = Sandbox::new();
+    plain_repo.run(&["brief"]);
+    assert!(!plain_repo.home.path().join("repos.tsv").exists(), "looking is not using");
+
+    let s = Sandbox::initialised();
+    assert!(s.home.path().join("repos.tsv").exists());
+    let out = s.run(&["uninstall"]);
+    assert_eq!(code(&out), 0, "{}", text(&out));
+    assert!(text(&out).contains("list of repositories on this machine"), "{}", text(&out));
+    assert!(!s.home.path().join("repos.tsv").exists(), "an empty list leaves no file");
+}
+
+#[test]
+fn bare_use05_outside_a_repository_lists_the_repositories_most_in_need_first() {
+    let quiet = Sandbox::initialised();
+    let busy = Sandbox::waiting_for_approval();
+    let home = busy.home.path().to_path_buf();
+    quiet.run_env(&["doctor"], &[("USE05_HOME", home.to_str().unwrap())]);
+    let out = bare_elsewhere(&home);
+    assert_eq!(code(&out), 0, "{}", text(&out));
+    let shown = text(&out);
+    let at = |s: &Sandbox| shown.find(&dir_name(s)).unwrap_or_else(|| panic!("{shown}"));
+    assert!(at(&busy) < at(&quiet), "the repository with a task waiting comes first:\n{shown}");
+    assert!(shown.contains("Needs you") && shown.contains("Working") && shown.contains("Last active"), "{shown}");
+    assert!(shown.contains("&& use05"), "it says how to open one:\n{shown}");
+    let row = shown.lines().find(|l| l.contains(&dir_name(&busy))).unwrap();
+    assert!(row.split_whitespace().nth(2) == Some("1"), "one task waits there: {row}");
+    assert!(!shown.contains("> "), "no prompt without a terminal");
+}
+
+#[test]
+fn bare_use05_outside_a_repository_prints_the_same_table_for_a_pipe() {
+    let busy = Sandbox::waiting_for_approval();
+    let out = bare_elsewhere(busy.home.path());
+    assert_eq!(code(&out), 0, "{}", text(&out));
+    snapshot("status_repos", &busy, &out);
+}
+
+#[test]
+fn bare_use05_outside_a_repository_on_a_terminal_opens_the_repository_picked() {
+    let busy = Sandbox::waiting_for_approval();
+    // Somewhere that is no repository, with the same per-user directory.
+    let somewhere = Sandbox { dir: tempfile::tempdir().unwrap(), home: tempfile::tempdir().unwrap() };
+    fs::copy(busy.home.path().join("repos.tsv"), somewhere.home.path().join("repos.tsv")).unwrap();
+    let (code_, screen) = on_a_terminal(&somewhere, &[], &["1", "q"]);
+    assert_eq!(code_, 0, "{screen}");
+    let shown = plain(&screen);
+    assert!(shown.contains("Last active") && shown.contains("Needs you") && shown.contains("Tighten the policy"), "the first row's page was opened:\n{shown}");
+}
+
+#[test]
+fn bare_use05_in_a_repository_is_one_page_of_who_needs_you_who_is_working_and_what_landed() {
+    let s = Sandbox::waiting_for_approval();
+    let holder = tempfile::tempdir().unwrap();
+    // An agent working in a worktree of its own.
+    let working = agent_worktree(&s, &holder, "claude/retries");
+    let working_id = task_in(&s, &working, "Add retries");
+    // Another that finished, and whose work is already in main.
+    let done = agent_worktree(&s, &holder, "claude/docs");
+    let done_id = task_in(&s, &done, "Update the docs");
+    fs::write(done.join("docs.md"), "# docs\n").unwrap();
+    git_at(&done, &["add", "docs.md"]);
+    git_at(&done, &["commit", "-qm", "docs"]);
+    assert_eq!(code(&s.run(&["finish", "--task", &done_id, "--repo", done.to_str().unwrap(), "--outcome", "wrote the docs"])), 0);
+    s.git(&["merge", "-q", "--ff-only", "claude/docs"]);
+
+    let out = s.run(&[]);
+    assert_eq!(code(&out), 0);
+    let shown = text(&out);
+    let line = |needle: &str| shown.lines().find(|l| l.contains(needle)).unwrap_or_else(|| panic!("no line with {needle}:\n{shown}")).to_string();
+    let waiting = line("Tighten the policy");
+    assert!(waiting.starts_with("Needs you") && waiting.contains("change"), "{waiting}");
+    let busy = line("Add retries");
+    assert!(busy.starts_with("Working") && busy.contains(&working_id), "{busy}");
+    let landed = line("Update the docs");
+    assert!(landed.starts_with("Recent") && landed.contains(&done_id) && landed.contains("landed on main"), "{landed}");
+    assert!(shown.contains("Next: use05 brief --task"), "{shown}");
+    assert!(!shown.contains("Open a task"), "no menu without a terminal:\n{shown}");
+    snapshot("status_tasks", &s, &out);
+
+    // At a terminal the menu opens a task, and what can be done with it.
+    let (picked, screen) = on_a_terminal(&s, &[], &["1", "q"]);
+    assert_eq!(picked, 0, "{screen}");
+    assert!(plain(&screen).contains("Open a task") && plain(&screen).contains("Which task?"), "{}", plain(&screen));
 }

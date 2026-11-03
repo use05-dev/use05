@@ -560,6 +560,11 @@ pub fn run(args: Args) -> Report {
     if let Err(e) = save_manifest(&store, &manifest) {
         return Report::error("init", "IO_ERROR", format!("could not record what was installed: {e}"), None, 4);
     }
+    // So bare `use05` can list this repository among the ones on this machine.
+    if use05_core::repos::touch(&store.dirs) {
+        let file = use05_core::keys::user_dir().map(|d| d.join(use05_core::repos::FILE).display().to_string()).unwrap_or_default();
+        changed.push(format!("listed this repository in {file}, so bare `use05` can show every repository on this machine (it stays on this machine)"));
+    }
 
     let mut rows: Vec<(String, String)> = Vec::new();
     for c in &changed {
@@ -655,6 +660,9 @@ pub fn uninstall(repo: &Path) -> Report {
         }
     }
     let _ = fs::remove_file(manifest_path(&store));
+    if use05_core::repos::forget(&store.dirs) {
+        rows.push(("removed".into(), "this repository from the list of repositories on this machine".into()));
+    }
     Report {
         command: "uninstall",
         outcome: "removed",

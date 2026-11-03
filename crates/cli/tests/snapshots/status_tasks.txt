@@ -1,0 +1,15 @@
+05  <REPO>                                                                                  main
+────────────────────────────────────────────────────────────────────────────────────────────────────
+Needs you  ! Tighten the policy  <TASK>  change          by hand  <AGO>
+Working    ○ Add retries         <TASK>  working         by hand  <AGO>
+Recent     ✓ Update the docs     <TASK>  landed on main  by hand  <AGO>
+
+Change     2 staged files
+           ! APPROVAL REQUIRED 2 things hold it back
+
+Controls   ○ agent hooks off
+           ✓ pre-push on · advisory (--no-verify skips it)
+           ○ CI gate off
+
+────────────────────────────────────────────────────────────────────────────────────────────────────
+Next: use05 brief --task <TASK>   read what it changed, then approve it

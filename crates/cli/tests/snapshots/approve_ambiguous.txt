@@ -1,0 +1,4 @@
+✗ 2 tasks wait for approval here, so say which: <TASK> "Second change" (change), <TASK> "Tighten
+  the policy" (change)
+
+Next: use05 approve --task <id>

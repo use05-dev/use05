@@ -1,8 +1,8 @@
 import { openResult, sealTo, useView, view } from "../records";
 import { Fragment, useEffect, useState } from "react";
-import { ago, get, post } from "../api";
+import { get, post } from "../api";
 import { friendly, signStatement } from "../passkey";
-import { Link, Loading, Paths, Seal, Verdict, go } from "../ui";
+import { Crumbs, Link, Loading, Paths, Seal, Verdict, When, go } from "../ui";
 
 export function ApprovalRedirect({ id }: { id: string }) {
   const [error, setError] = useState<string | null>(null);
@@ -25,10 +25,10 @@ export function Task({ repo, id }: { repo: string; id: string }) {
     <div className="stack-lg">
       <div className="hd">
         <div>
-          <p className="small"><Link to={`/repos/${repo}`}>{t.repo}</Link></p>
+          <Crumbs trail={[["Home", "/"], [t.repo, `/repos/${repo}`], [t.title || `Task ${t.id}`, null]]} />
           <h1>{t.title || `Task ${t.id}`}</h1>
           <p className="muted">
-            {t.agent ?? "A person"}{t.model ? ` (${t.model})` : ""} on {t.machine ?? "a machine"}, {t.status === "active" ? "working" : t.status}, updated {ago(t.updated_at)}
+            {t.agent ?? "A person"}{t.model ? ` (${t.model})` : ""} on {t.machine ?? "a machine"}, {t.landed ? "landed" : t.status === "active" ? "working" : t.status}, last activity <When at={t.updated_at} />
           </p>
         </div>
         <Verdict decision={t.decision} />
@@ -36,10 +36,18 @@ export function Task({ repo, id }: { repo: string; id: string }) {
 
       {t.abandoned && <p className="small muted">Looks abandoned: nothing has happened here for over a week.</p>}
 
-      {!request && t.decision === "approval_required" && data.mine && (
+      {t.landed && (
+        <section className="panel verified stack">
+          <h2>Landed</h2>
+          <p className="muted">This work is already in {d.lands_on ?? "the landing branch"}, so nothing waits for you. What follows is the record of it.</p>
+        </section>
+      )}
+
+      {!request && !t.landed && t.decision === "approval_required" && data.mine && (
         <section className="panel attention stack">
           <h2>Held for you</h2>
-          <p className="muted">A person must approve this before it goes, and {t.machine ?? "the machine"} has not asked here yet. At a terminal on {t.machine ?? "that machine"}: <code>use05 brief</code>, then approve or reject. Or, if the work was left behind, discard it below.</p>
+          <p className="muted">A person must approve this before it goes, and {t.machine ?? "the machine"} has not asked here yet. Ask it to, then approve with your passkey right here. Or, if the work was left behind, discard it below.</p>
+          <AskForApproval task={t} repo={repo} scope={findings.some((f: any) => f.code === "INTENT_NOT_APPROVED") ? "intent" : "outcome"} />
         </section>
       )}
 
@@ -128,7 +136,7 @@ export function Task({ repo, id }: { repo: string; id: string }) {
           <div className="section-title"><h2>Timeline</h2></div>
           <div className="list">
             {data.events.map((e: any, i: number) => (
-              <div key={i} className="item"><div className="grow"><div className="title">{e.kind.replace("_", " ")}</div><div className="sub">{e.machine}, {ago(e.at)}{e.data?.decision ? `, ${e.data.decision.replace("_", " ")}` : ""}{e.data?.note ? `: "${e.data.note}"` : ""}</div></div></div>
+              <div key={i} className="item"><div className="grow"><div className="title">{e.kind.replace("_", " ")}</div><div className="sub">{e.machine}, <When at={e.at} />{e.data?.decision ? `, ${e.data.decision.replace("_", " ")}` : ""}{e.data?.note ? `: "${e.data.note}"` : ""}</div></div></div>
             ))}
           </div>
         </section>
@@ -152,6 +160,7 @@ function Approval({ request, task, mine, done }: { request: any; task: any; mine
   const signs = statement?.predicate;
   const signedTree: string | undefined = statement?.subject?.[0]?.digest?.gitTree;
 
+  const rejecting = signs?.decision === "reject";
   const approve = async () => {
     setBusy(true);
     setError(null);
@@ -159,7 +168,7 @@ function Approval({ request, task, mine, done }: { request: any; task: any; mine
       const info = await view(`/approvals/${request.id}`);
       if (info.request.unsigned?.payload !== request.unsigned?.payload) throw new Error("The request changed while you were reading it. Look again before approving.");
       const scope = request.scope === "intent" ? "intent" : "outcome";
-      const envelope = await signStatement(info.request.unsigned, { type: "approval", scope, tree: scope === "outcome" ? request.tree : undefined }, info.rp_id, info.credentials);
+      const envelope = await signStatement(info.request.unsigned, { type: "approval", scope, tree: scope === "outcome" ? request.tree : undefined, decision: rejecting ? "reject" : "approve" }, info.rp_id, info.credentials);
       // Sealed to the machine that asked: the console passes it on and cannot read it.
       await post(`/approvals/${request.id}/sign`, { sealed: await sealTo(info.request.machine_id, "file_approval", { request: request.id, repo: info.request.repo_id, envelope }) });
       done();
@@ -182,20 +191,21 @@ function Approval({ request, task, mine, done }: { request: any; task: any; mine
         )}
         {request.status === "waiting" && mine && (
           <>
-            <h2>Approve {what}?</h2>
-            <p className="muted">Your passkey signs exactly what {task.machine ?? "the machine"} prepared: {request.scope === "intent" ? "this plan" : `the tree ${(signedTree ?? request.tree).slice(0, 12)}`} under today's policy. If the work changes, the approval stops counting.</p>
+            <h2>{rejecting ? "Reject" : "Approve"} {what}?</h2>
+            <p className="muted">Your passkey signs exactly what {task.machine ?? "the machine"} prepared: {request.scope === "intent" ? "this plan" : `the tree ${(signedTree ?? request.tree).slice(0, 12)}`} under today's policy. {rejecting ? "A rejection stands until the work changes." : "If the work changes, the approval stops counting."}</p>
             {signs && (
               <dl className="kv">
-                <dt>You approve</dt><dd>{signs.scope === "intent" ? "the plan" : "the finished change"} of task {signs.task}</dd>
+                <dt>You {rejecting ? "reject" : "approve"}</dt><dd>{signs.scope === "intent" ? "the plan" : "the finished change"} of task {signs.task}</dd>
+                {rejecting && signs.rationale && <><dt>Because</dt><dd>{signs.rationale}</dd></>}
                 <dt>Until</dt><dd>{new Date(signs.expires).toLocaleString()}</dd>
               </dl>
             )}
-            {!signs && <p className="error">This request carries no readable statement. Do not approve it.</p>}
+            {!signs && <p className="error">This request carries no readable statement. Do not sign it.</p>}
             <div className="row">
-              <button className="btn primary" disabled={busy || !signs} onClick={approve}>{busy ? "Waiting for your passkey…" : "Approve with passkey"}</button>
+              <button className={`btn ${rejecting ? "danger" : "primary"}`} disabled={busy || !signs} onClick={approve}>{busy ? "Waiting for your passkey…" : rejecting ? "Reject with passkey" : "Approve with passkey"}</button>
               <button className="btn quiet" disabled={busy} onClick={async () => { await post(`/approvals/${request.id}/dismiss`); done(); }}>Not now</button>
             </div>
-            <p className="small muted">To reject it, tell the agent, or run the reject command at a terminal.</p>
+            {!rejecting && <RejectInstead task={task} repo={request.repo_id} scope={request.scope === "intent" ? "intent" : "outcome"} />}
           </>
         )}
         {request.status === "signed" && (<><h2>Signed</h2><p className="muted">Waiting for {task.machine ?? "the machine"} to file it.</p></>)}
@@ -209,6 +219,77 @@ function Approval({ request, task, mine, done }: { request: any; task: any; mine
         {error && <p className="error">{error}</p>}
       </Seal>
     </section>
+  );
+}
+
+/// The machine did not ask for an approval (the session ended first, say): ask it to prepare one,
+/// and it appears on this page to sign, with no terminal.
+function AskForApproval({ task, repo, scope }: { task: any; repo: string; scope: "intent" | "outcome" }) {
+  const [asked, setAsked] = useState(false);
+  const [slow, setSlow] = useState(false);
+  const [busy, setBusy] = useState(false);
+  const [problem, setProblem] = useState<string | null>(null);
+  useEffect(() => {
+    if (!asked) return;
+    const t = setTimeout(() => setSlow(true), 90_000);
+    return () => clearTimeout(t);
+  }, [asked]);
+  const ask = async () => {
+    setBusy(true);
+    setProblem(null);
+    try {
+      const id = crypto.randomUUID();
+      const sealed = await sealTo(task.machine_id, "ask_approval", { ask: id, repo, task: task.id, scope });
+      await post(`/repos/${repo}/ask-approval`, { id, machine: task.machine_id, sealed });
+      setAsked(true);
+    } catch (e) {
+      setProblem(friendly(e));
+    } finally {
+      setBusy(false);
+    }
+  };
+  return (
+    <>
+      {!asked ? (
+        <div className="row"><button className="btn primary" disabled={busy} onClick={ask}>{busy ? "Asking…" : scope === "intent" ? "Ask for my approval of the plan" : "Ask for my approval of the change"}</button></div>
+      ) : (
+        <p className="small muted">Asked {task.machine ?? "your machine"}. The approval appears here to sign; this page updates itself.{slow && <> Still nothing? {task.machine ?? "The machine"} may be asleep or offline: see <Link to="/machines">Machines</Link>.</>}</p>
+      )}
+      {problem && <p className="error">{problem}</p>}
+      {!asked && <RejectInstead task={task} repo={repo} scope={scope} />}
+    </>
+  );
+}
+
+/// Say no, with a reason, from here: the machine prepares the rejection and a passkey signs it, as for an approval.
+function RejectInstead({ task, repo, scope }: { task: any; repo: string; scope: "intent" | "outcome" }) {
+  const [open, setOpen] = useState(false);
+  const [reason, setReason] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [asked, setAsked] = useState(false);
+  const [problem, setProblem] = useState<string | null>(null);
+  const send = async () => {
+    setBusy(true);
+    setProblem(null);
+    try {
+      const id = crypto.randomUUID();
+      const sealed = await sealTo(task.machine_id, "ask_approval", { ask: id, repo, task: task.id, scope, reject: true, reason: reason.trim() });
+      await post(`/repos/${repo}/ask-approval`, { id, machine: task.machine_id, sealed });
+      setAsked(true);
+    } catch (e) {
+      setProblem(friendly(e));
+    } finally {
+      setBusy(false);
+    }
+  };
+  if (asked) return <p className="small muted">Asked {task.machine ?? "your machine"} to prepare the rejection. It appears here to sign.</p>;
+  if (!open) return <div className="row"><button className="btn small quiet" onClick={() => setOpen(true)}>Reject it instead…</button></div>;
+  return (
+    <div className="stack">
+      <label className="stack"><span className="small">Why are you rejecting it? The agent and your record both keep this.</span><input type="text" value={reason} onChange={(e) => setReason(e.target.value)} maxLength={300} /></label>
+      <div className="row"><button className="btn danger" disabled={busy || !reason.trim()} onClick={send}>{busy ? "Asking…" : "Ask to reject"}</button><button className="btn quiet" disabled={busy} onClick={() => setOpen(false)}>Cancel</button></div>
+      {problem && <p className="error">{problem}</p>}
+    </div>
   );
 }
 
@@ -228,14 +309,26 @@ function Discard({ task, repo, abandoned }: { task: any; repo: string; abandoned
       const d = (await get(`/discards/${id}`).catch(() => null))?.discard;
       if (!d) return;
       setState(d.status);
-      if (d.status === "ready" && !plan) setPlan((await openResult(d.machine_id, repo, id, d.prepared))?.result ?? null);
+      try {
+        if (d.status === "ready" && !plan) setPlan((await openResult(d.machine_id, repo, id, d.prepared))?.result ?? null);
+      } catch {
+        clearInterval(tick);
+        setProblem("The machine's answer could not be checked, so nothing was done. Try again.");
+        setId(null);
+        setState(null);
+        return;
+      }
       if (d.status === "done") {
         clearInterval(tick);
         go("/");
       }
       if (d.status === "stuck") {
         clearInterval(tick);
-        setProblem((await openResult(d.machine_id, repo, id, d.prepared))?.result?.reason ?? "The machine could not do it.");
+        // No answer at all (the console gave up waiting) or the machine said why it could not.
+        const why = d.prepared ? (await openResult(d.machine_id, repo, id, d.prepared).catch(() => null))?.result?.reason : null;
+        setProblem(why ?? `${task.machine ?? "Your machine"} did not answer in time. Check that it is awake and online under Machines, then try again.`);
+        setId(null);
+        setState(null);
       }
     }, 2000);
     return () => clearInterval(tick);
@@ -284,7 +377,12 @@ function Discard({ task, repo, abandoned }: { task: any; repo: string; abandoned
           <div className="row"><button className="btn quiet" disabled={busy} onClick={start}>Discard this work…</button></div>
         </>
       )}
-      {id && state === "preparing" && <p className="small muted">{task.machine ?? "Your machine"} is working out what would go…</p>}
+      {id && state === "preparing" && (
+        <div className="row between">
+          <p className="small muted">{task.machine ?? "Your machine"} is working out what would go. The console gives up after two minutes.</p>
+          <button className="btn small quiet" onClick={() => { setId(null); setState(null); }}>Stop waiting</button>
+        </div>
+      )}
       {id && state === "ready" && plan && (
         <>
           <dl className="kv">{rows.map(([k, v]) => <Fragment key={k}><dt>{k[0].toUpperCase() + k.slice(1)}</dt><dd>{v}</dd></Fragment>)}</dl>

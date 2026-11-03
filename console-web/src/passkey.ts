@@ -93,7 +93,7 @@ type Unsigned = { payload: string; payload_type: string; challenge: string; cosi
 /// What the person asked to sign. The statement the machine hands back must be exactly that: the
 /// machine and the console both pass it on, and a passkey signs whatever it is shown.
 export type Want =
-  | { type: "approval"; scope?: "intent" | "outcome"; tree?: string; task?: string }
+  | { type: "approval"; scope?: "intent" | "outcome"; tree?: string; task?: string; decision?: "approve" | "reject" }
   | { type: "testing"; tree: string; outcome: "tested" | "skipped"; note: string; task?: string }
   | { type: "discard"; task: string };
 
@@ -110,7 +110,7 @@ export function checkStatement(unsigned: Unsigned, want: Want) {
       ? s?.predicateType === "https://use05.dev/discard/v0" && p?.task === want.task && s?.subject?.[0]?.name === "work" && s?.subject?.[0]?.digest?.task === want.task
       : want.type === "testing"
       ? s?.predicateType === "https://use05.dev/testing/v0" && tree === want.tree && p?.outcome === want.outcome && p?.note === want.note && (want.task === undefined || p?.task === want.task)
-      : s?.predicateType === "https://use05.dev/approval/v0" && p?.decision === "approve" && (want.scope === undefined || p?.scope === want.scope) && (want.tree === undefined || tree === want.tree) && (want.task === undefined || p?.task === want.task);
+      : s?.predicateType === "https://use05.dev/approval/v0" && p?.decision === (want.decision ?? "approve") && (want.scope === undefined || p?.scope === want.scope) && (want.tree === undefined || tree === want.tree) && (want.task === undefined || p?.task === want.task);
   if (!ok) {
     throw new Error(
       want.type === "discard"

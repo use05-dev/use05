@@ -8,6 +8,8 @@
 mod cmd;
 mod ctx;
 mod extend;
+mod pending;
+mod pick;
 mod policy_edit;
 mod prompt;
 mod report;
@@ -211,7 +213,7 @@ struct ApproveCli {
     /// Why
     #[arg(long, value_name = "TEXT")]
     reason: Option<String>,
-    /// A task id (default: the current task)
+    /// A task id (default: the task that waits for you; if several do, you are asked at a terminal)
     #[arg(long)]
     task: Option<String>,
     /// The tree to approve: "index", "worktree", or a commit (default: what the brief shows)
@@ -500,7 +502,7 @@ fn main() -> ExitCode {
         ),
         Cmd::Brief(a) => cmd::brief::run(&a.common.repo, a.task.as_deref(), a.tree.as_deref(), a.fetch, a.common.json),
         Cmd::Approve(a) => emit(
-            &cmd::approve::run_approve(cmd::approve::ApproveArgs { intent: a.intent, reject: a.reject, reason: a.reason, task: a.task, tree: a.tree, passphrase_stdin: a.passphrase_stdin, push: a.push, unsigned: a.unsigned, signed: a.signed, tested: a.tested, skip_testing: a.skip_testing, note: a.note, approver: a.approver, repo: a.common.repo }),
+            &cmd::approve::run_approve(cmd::approve::ApproveArgs { intent: a.intent, outcome: a.outcome, interactive: terminal() && !a.common.json && !a.passphrase_stdin, reject: a.reject, reason: a.reason, task: a.task, tree: a.tree, passphrase_stdin: a.passphrase_stdin, push: a.push, unsigned: a.unsigned, signed: a.signed, tested: a.tested, skip_testing: a.skip_testing, note: a.note, approver: a.approver, repo: a.common.repo }),
             a.common.json,
         ),
         Cmd::Verify(a) => emit(&cmd::verify::run(cmd::verify::Args { receipt: a.receipt, key: a.key, tree: a.tree, repo: a.common.repo }), a.common.json),

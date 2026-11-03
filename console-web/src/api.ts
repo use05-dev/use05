@@ -33,11 +33,24 @@ export const put = <T = any>(path: string, body: unknown = {}) => call<T>("PUT",
 
 export type Change = { path: string; value: unknown };
 
+/// How long ago, in the words a person would use. Past a week it is the date, because "12 d ago"
+/// says nothing about which day.
 export function ago(when?: string | null): string {
   if (!when) return "never";
-  const s = Math.max(0, (Date.now() - new Date(when).getTime()) / 1000);
+  const t = new Date(when).getTime();
+  if (Number.isNaN(t)) return "unknown";
+  const s = Math.max(0, (Date.now() - t) / 1000);
   if (s < 50) return "just now";
   if (s < 3600) return `${Math.round(s / 60)} min ago`;
   if (s < 86400) return `${Math.round(s / 3600)} h ago`;
-  return `${Math.round(s / 86400)} d ago`;
+  if (s < 172800) return "yesterday";
+  if (s < 7 * 86400) return `${Math.round(s / 86400)} d ago`;
+  return new Date(t).toLocaleDateString(undefined, { day: "numeric", month: "short", ...(s > 300 * 86400 ? { year: "numeric" } : {}) });
+}
+
+/// The exact moment, in the person's own time zone: what a tooltip shows beside "3 h ago".
+export function stamp(when?: string | null): string {
+  if (!when) return "";
+  const d = new Date(when);
+  return Number.isNaN(d.getTime()) ? "" : d.toLocaleString(undefined, { weekday: "short", day: "numeric", month: "short", hour: "2-digit", minute: "2-digit" });
 }

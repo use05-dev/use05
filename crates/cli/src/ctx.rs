@@ -62,6 +62,8 @@ impl Ctx {
 
     fn open_rules(repo: &Path, task_id: Option<&str>, policy_rev: Option<&str>, strict: bool) -> Result<Ctx> {
         let store = Store::open(repo)?;
+        // Best effort, and one small read when it was done in the last few minutes.
+        use05_core::repos::touch(&store.dirs);
         let mut task = match task_id {
             Some(id) => Some(store.load(id)?),
             None => store.current(),
@@ -71,7 +73,7 @@ impl Ctx {
         // it pulled in are not counted as its change (the hooks do the same as the agent works).
         if let Some(t) = task.as_mut().filter(|t| t.fresh.is_some()) {
             if use05_core::fresh::catch_up(&top, t) {
-                store.save(t)?;
+                store.save_keeping_time(t)?;
             }
         }
         // Whatever decides acceptance reads its rules where a push would be judged: the commit the

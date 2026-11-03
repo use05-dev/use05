@@ -1,6 +1,6 @@
 import { createContext, useContext, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { post, put, type Change } from "../api";
-import { Link, Loading, go } from "../ui";
+import { Crumbs, Loading, go } from "../ui";
 import { sealBase, sealTo, useView, view, world } from "../records";
 import { baseChanges, previewEdit } from "../policyWasm";
 import { settingName } from "./Edit";
@@ -134,7 +134,7 @@ export function PolicyEditor({ repo }: { repo?: string }) {
     <div className="stack-lg">
       <div className="hd">
         <div>
-          <p className="small">{repo ? <Link to={`/repos/${repo}`}>{data.repo.name}</Link> : <Link to="/repos">Repositories</Link>}</p>
+          <Crumbs trail={repo ? [["Home", "/"], ["Repositories", "/repos"], [data.repo.name, `/repos/${repo}`], ["Policy", null]] : [["Home", "/"], ["Repositories", "/repos"], ["Base policy", null]]} />
           <h1>{repo ? "Policy" : "Base policy"}</h1>
           <p className="muted">{repo ? <>The rules in <code>.05/policy.toml</code> on <code>{data.repo.landing}</code>. Saving prepares the change on your Mac; your passkey signs it, and it lands as a commit.</> : "Your starting template. Apply it to a repository from that repository's policy page; it copies these settings once and keeps the repository's checks and keys."}</p>
         </div>

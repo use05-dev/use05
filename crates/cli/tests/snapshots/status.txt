@@ -1,6 +1,6 @@
 05  <REPO>                                                                                  main
 ────────────────────────────────────────────────────────────────────────────────────────────────────
-Task       none. `use05 start "what you are about to do"` begins one
+Tasks      none. `use05 start "what you are about to do"` begins one
 
 Change     nothing staged. `git add` what you want 05 to look at
 

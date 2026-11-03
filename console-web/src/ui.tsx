@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useState, type ReactNode, type MouseEvent } from "react";
-import { get } from "./api";
+import { ago, get, stamp } from "./api";
 
 // A router small enough to read: the path is the state.
 const listeners = new Set<() => void>();
@@ -54,10 +54,26 @@ export function Loading({ error }: { error?: string | null }) {
   return error ? <p className="error">{error}</p> : <p className="muted">Loading…</p>;
 }
 
-const DECISION_WORDS: Record<string, string> = { allow: "Allowed", approval_required: "Needs you", deny: "Refused", wait: "Waiting" };
+const DECISION_WORDS: Record<string, string> = { allow: "Allowed", approval_required: "Needs you", deny: "Refused", wait: "Waiting", landed: "Landed" };
 export function Verdict({ decision }: { decision?: string | null }) {
   if (!decision) return <span className="verdict v-none">No decision yet</span>;
   return <span className={`verdict v-${decision}`}>{DECISION_WORDS[decision] ?? decision}</span>;
+}
+
+/// A moment as people say it, with the exact time on hover and for screen readers.
+export function When({ at }: { at?: string | null }) {
+  return <time className="when" dateTime={at ?? undefined} title={stamp(at)}>{ago(at)}</time>;
+}
+
+/// Where this page sits, each step a way back. The last step is the page itself.
+export function Crumbs({ trail }: { trail: [string, string | null][] }) {
+  return (
+    <nav className="crumbs" aria-label="Breadcrumb">
+      {trail.map(([label, to], i) => (
+        <span key={i}>{to ? <Link to={to}>{label}</Link> : <span aria-current="page">{label}</span>}{i < trail.length - 1 && <span className="sep" aria-hidden="true"> / </span>}</span>
+      ))}
+    </nav>
+  );
 }
 
 export function Online({ on }: { on: boolean }) {
