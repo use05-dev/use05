@@ -583,11 +583,24 @@ pub fn run(args: Args) -> Report {
             notes.extend(after);
             notes
         },
-        next: Some("use05 doctor   to see how strongly each control is enforced".into()),
+        next: Some(match uncommitted_setup(&top) {
+            // The rules count at a push and in CI only once committed.
+            Some(paths) => format!("git add {paths} && git commit -m \"Set up 05\"   so your rules count at a push"),
+            None => "use05 doctor   to see how strongly each control is enforced".into(),
+        }),
         excerpt: vec![],
         details: json!({ "changed": changed, "kept": kept, "not_covered": gaps }),
         exit: 0,
     }
+}
+
+/// What `init` wrote for everyone that is not committed yet, as `git add` arguments.
+fn uncommitted_setup(top: &Path) -> Option<String> {
+    let paths: Vec<&str> = [".05", ".codex", "AGENTS.md", ".claude/settings.json", ".github/workflows/05.yml"]
+        .into_iter()
+        .filter(|p| top.join(p).exists() && git::text(top, &["status", "--porcelain", "--", p]).is_ok_and(|s| !s.trim().is_empty()))
+        .collect();
+    (!paths.is_empty()).then(|| paths.join(" "))
 }
 
 pub fn uninstall(repo: &Path) -> Report {

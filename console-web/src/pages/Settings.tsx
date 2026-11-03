@@ -51,7 +51,7 @@ export function Settings() {
       </section>
       <section className="panel stack">
         <h2>Recovery code</h2>
-        <p className="small muted">Your recovery code opens your console's records if your passkeys cannot. Making a new one replaces the old.</p>
+        <p className="small muted">Your recovery code opens your console's records when the passkey you signed in with cannot. Signing in always takes a passkey, so keep a second one under Machines. Making a new code replaces the old.</p>
         {newCode ? <div className="note stack"><span>Your new recovery code, shown once:</span><code className="recovery" data-recovery-code>{newCode}</code></div> : <div><button className="btn quiet" onClick={async () => { setProblem(null); try { const { id, prf } = await prfOf(); setNewCode(await replaceRecovery(id, prf)); } catch (e) { setProblem(friendly(e)); } }}>Make a new recovery code</button></div>}
       </section>
       <button className="btn quiet" onClick={async () => { await lock(); await post("/auth/logout"); window.location.href = "/"; }}>Sign out</button>

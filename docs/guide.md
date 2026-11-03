@@ -8,14 +8,25 @@ How to install 05, set it up in a repository, work with it day to day, and confi
 - [Working by hand](#working-by-hand)
 - [Reading the brief](#reading-the-brief)
 - [Approving, rejecting and bypassing](#approving-rejecting-and-bypassing)
+- [Testing before a push](#testing-before-a-push)
 - [Long sessions, large changes and subagents](#long-sessions-large-changes-and-subagents)
 - [Several agents at once](#several-agents-at-once)
 - [Configure: `.05/policy.toml`](#configure-05policytoml)
 - [Organisation rules](#organisation-rules)
 - [Turn on the CI gate](#turn-on-the-ci-gate)
+- [Your own console](#your-own-console)
 - [Commands](#commands)
 - [Exit codes and environment variables](#exit-codes-and-environment-variables)
 - [Upgrade and uninstall](#upgrade-and-uninstall)
+
+## How 05 works
+
+- **A sealed plan.** Before its first edit, an agent declares what it will do and where (`use05 start`). 05 seals the declaration where the agent cannot change it, and holds the agent and its subagents to it.
+- **Receipts.** `prove` runs a check on an exact git tree and signs the result: an in-toto statement in a DSSE envelope, signed with Ed25519 (see [Receipt format](receipts.md)). Anyone can verify one offline with `use05 verify`. Receipts live on ordinary `05-receipts/<key>` branches, so they travel with the repository.
+- **A gate of fixed rules.** No model judges anything. The gate compares the plan, the files changed, the evidence on the exact tree, approvals and protected paths, and answers allow, wait, approval required or deny. A change is held to the rules at its base, never its own, so it cannot loosen them.
+- **A record you can check later.** What the agent did (tools, paths and decisions; never contents or prompts) is a hash-chained log, sealed by signed receipts as the work happens and countersigned by CI. Anyone with the repository and the public keys can check it.
+- **Honest about strength.** The agent's hooks and the pre-push hook are advisory: an agent running as you can reach them. Evidence signed by a CI runner key the agent cannot read, with a required check on your Git host, is what enforces. `use05 doctor` and the brief say which is which.
+- **What it is not.** 05 is not an agent, an agent runner, a code reviewer powered by a model, a session recorder or a Git host. It keeps the agents you run coordinated and shows what was checked; it does not judge whether a change is correct.
 
 ## Install
 
@@ -58,7 +69,7 @@ On a terminal, `init` first asks a few questions, each with a default you accept
 
 1. **Who works in this repository:** just you, a small team, or a larger or regulated team. This sets how strict the rules start; you can change each one afterwards.
 2. **Which branch finished changes land on.**
-3. **Which environment each long-lived branch is:** dev, uat, pre-prod, prod, another environment you name, or not an environment. 05 suggests a level from the branch's name (`main` is dev, `staging` is uat, `production` is prod). A level can hold several environments: pick dev for a second branch and you name it, for example `dev-eu`. Then you can add any other branch as an environment. 05 records the environments and shows them; rules for promoting between them come in a later version.
+3. **Which environment each long-lived branch is:** dev, uat, pre-prod, prod, another environment you name, or not an environment. 05 suggests a level from the branch's name (`main` is dev, `staging` is uat, `production` is prod). A level can hold several environments: pick dev for a second branch and you name it, for example `dev-eu`. Then you can add any other branch as an environment. 05 records the environments and shows them; 05 records them and shows them; it has no rules for promoting between them.
 4. **The checks that must pass**, and any you want to add (`lint: npm run lint`).
 5. **Folder and file rules:** what needs a person's approval, what is locked, where only new files may be added (it suggests migration folders it finds), what agents may not read (it suggests `.env*` if you have one), and which folders must be updated with every change, such as `docs/**` or `CHANGELOG.md` (a `[[require]]` rule on `**`; narrower rules go in the file).
 6. **How strict to be** when an agent works outside its plan, when a change weakens tests, and when an agent starts from older code than origin has.
@@ -76,7 +87,7 @@ Then `init` lists exactly what it changed, and what is still not covered. It:
 - installs a git pre-push hook;
 - adds a short block to `AGENTS.md` so agents know how 05 works.
 
-Commit `.05/` and `AGENTS.md`. Then run `use05 doctor`: it checks the setup and says how strongly each control is enforced. Until you turn on the CI gate, everything is advisory, and doctor says so.
+Commit what it wrote: `git add .05 AGENTS.md && git commit -m "Set up 05"`, with `.codex` too if it wrote one (from 0.0.9, `init` prints the exact line). The policy counts at a push and in CI only once it is committed: until then they hold changes to 05's defaults. Your first push of the setup changes 05's own rules, which are always protected, so the pre-push hook asks you to approve it once (`use05 approve --outcome`, with the approver key below). Then run `use05 doctor`: it checks the setup and says how strongly each control is enforced. Until you turn on the CI gate, everything is advisory, and doctor says so.
 
 `use05 init --no-hooks` skips the hooks, `--no-agents-md` leaves `AGENTS.md` alone, and `--ci github` also writes the CI workflow. `use05 uninstall` reverses exactly what `init` did.
 
@@ -112,20 +123,22 @@ Any other agent with hooks of its own can call `use05 hook generic` (see [Extend
 
 ## Working by hand
 
-The same flow works without an agent:
+The same flow works without an agent. Work on a branch of your own: `use05 land` moves finished work from a working branch onto the landing branch, never from the landing branch itself.
 
 ```sh
+git switch -c retries
 use05 start "Stop retrying failed charges" --scope "src/billing/**"
-# … make the change, stage it with git add …
-use05 prove                  # run the policy's checks on the staged files and sign the result
+# … make the change …
+git commit -am "Stop retrying failed charges"
+use05 prove                  # run the policy's checks on exactly these files and sign the result
 use05 finish --outcome "Retries capped at three; failed charges are not retried"
 use05 brief
-use05 approve --outcome      # only if the brief asks for it
-use05 land
+use05 approve --outcome      # only if the brief asks for it; billing is a risk area, so here it does
+use05 land                   # main moves to this branch's commit, and the branch is deleted
 git push origin main
 ```
 
-`use05 prove` runs every required check. `use05 prove test lint` runs named checks; `use05 prove -- cargo test` runs any command. Checks run on a copy of exactly the staged files, with a scrubbed environment. A failing check still gets a receipt that records the failure.
+`use05 prove` runs every required check. `use05 prove test lint` runs named checks; `use05 prove -- cargo test` runs any command. Checks run on a copy of exactly those files (the staged ones if anything is staged, else the working tree), with a scrubbed environment. A failing check still gets a receipt that records the failure.
 
 **A written plan (a plan card).** Instead of flags, `use05 start` can read the plan from a TOML file: `use05 start "Cap payment retries" --card card.toml`.
 
@@ -250,7 +263,7 @@ Each prints the setting before and after, and says so when the change makes the 
 |---|---|---|
 | `[use05] min_version` | the version that ran `init` | The oldest use05 that reads this file. An older one is told to upgrade. |
 | `[intent] mode` | `"inferred"` | `inferred`: no written plan needed. `risky`: a plan for risky changes. `always`: a plan for every change. |
-| `[[check]]` `name`, `run` | `test` | A check 05 runs on the change: `run` is the command as a list, e.g. `["npm", "run", "test", "--silent"]`. Optional: `required` (default true), `env` (variables passed through), `timeout_secs` (default 900). |
+| `[[check]]` `name`, `run` | none (`init` proposes `test` when it finds one) | A check 05 runs on the change: `run` is the command as a list, e.g. `["npm", "run", "test", "--silent"]`. Optional: `required` (default true), `env` (variables passed through), `timeout_secs` (default 900). |
 | `[protect] paths` | `[]` | A change here needs a person's approval. `.05/**` is always protected. |
 | `[protect] locked` | `[]` | Never changed. No approval clears it; a person's bypass can. |
 | `[protect] absolute` | `[]` | Locked, and not even a bypass clears it. |
@@ -316,68 +329,14 @@ Hooks and the pre-push hook run on your machine, where an agent running as you c
 
 ## Your own console
 
-The console is a web app you host yourself, for you or your team. From your phone you see what every agent on your machines is doing, approve the work that waits for you with a passkey, edit policies, and get an email when something needs you. There is no 05-run service: your console holds your team's activity and nobody else's.
-
-**What it can read: none of your work.** Everything is encrypted end to end. Each machine seals what it reports (plans, file and folder names, checks and verdicts, the policy) to your team's key and signs it with its own; your browser checks the signature, opens it, and builds every page itself. The policy editor runs in your browser too. The console keeps sealed bytes and what it needs to route them: which machine, which repository (by an opaque id), what kind, when, and who must approve what. Emails say only that something needs you. Code, diffs, prompts and the agent's messages never leave the machine at all.
-
-**What it cannot do.** Machines connect out to it; it never reaches into a machine. A machine runs nothing it is sent: it files a signed approval only of a statement it prepared itself, co-signed with its own key, and applies only policy edits that tighten the rules, checked again on the machine. So someone who took over the console could not read your work, run anything on your machines, or approve anything a machine did not ask for.
-
-**The honest limit.** The web app's code comes from the console. Whoever controls the host could serve a page that reads what you unlock in that browser, or that shows you one thing and asks your passkey to sign another: a real approval, a policy edit, or a new team key for your machines. Host it where only you or your team can change it. Machines and CI keep their own checks even then: nothing runs that a machine did not prepare, and a policy edit only tightens. Two smaller limits: the console can show an older copy of a record to a browser that never saw the newer one (a browser that did refuses it), and someone who left could, working with whoever runs the host at the moment the key changes, take the copy of the new key meant for one member; that member then cannot unlock, and the admin's browser refuses it outright if it saw that member's key before.
-
-**Run it.** One container image. Its data is one SQLite file, so give it a volume:
+The console is an optional web app you host yourself. From your phone you see what every agent on your machines is doing, approve the work that waits for you with a passkey, sign off that you tested a change, discard work an agent left behind, tighten a policy, and get an email when something needs you. It is one container image with its data in one SQLite file, there is no hosted version, and it is encrypted end to end: your machines seal what they report to a key only your passkey or recovery code unlocks, so the console relays your work without being able to read it. Machines connect out to it and run nothing it sends; a phone approval counts only for a statement a machine prepared and co-signed itself.
 
 ```sh
-docker run -p 8080:8080 -v console-data:/data \
-  -e ORIGIN=https://console.example.com \
-  ghcr.io/use05-dev/use05-console
+docker run -p 8080:8080 -v console-data:/data -e ORIGIN=https://console.example.com ghcr.io/use05-dev/use05-console
+use05 cloud login https://console.example.com   # inside a repository: claim it, pair this machine, report the repository
 ```
 
-| Setting | What it is |
-|---|---|
-| `DATABASE` | The database file. In the image, `/data/console.db`; the console creates it and its tables on start. |
-| `ORIGIN` | The address people open, with `https://`. Passkeys are tied to its host name, so choose it before anyone signs up: moving later means adding passkeys again. |
-| `RP_ID` | The passkey site, if not `ORIGIN`'s host. |
-| `SETUP_SECRET` | Optional: a claim code of your own. Without it, the console makes one each time it starts while it has no owner, and writes it to its log. |
-| `CLOUDFLARE_ACCOUNT_ID` and `CLOUDFLARE_API_TOKEN`, or `SMTP_URL` | Email: Cloudflare Email Service, or any SMTP server (`smtps://user:password@host:465`). Without either, alerts show in the console only. |
-| `ALERT_FROM` | The address emails come from. |
-| `PORT` | Default 8080. |
-
-Put it behind HTTPS (passkeys need it), on a host only you or your team control. To back it up, copy the file while the console runs with `sqlite3 /data/console.db ".backup /data/backup.db"`; it holds sealed records the backup cannot read either. A host that mounts volumes owned by root (Railway, for one) needs the container to run as root to write there: on Railway, attach a volume at `/data` and set `RAILWAY_RUN_UID=0`.
-
-**Claim it, then invite people if you want.** Until someone has made a passkey, whoever signs up first would own the console, so the first sign-up needs the claim code the console writes to its log when it starts (`05 console has no owner yet … claim code: ABCDE-FGH23`; on Railway, the service's deploy logs; with Docker, `docker logs`). Run `use05 cloud login ORIGIN` on your machine: it asks for the code, opens a one-time link where you give your name and make your passkey, and then pairs the machine. (Or open `ORIGIN` and type the code there.) You are the console's admin. You stay signed in until you have not used it for an hour, also when you open it from a link in an email; after that, or in a new browser, one passkey tap signs you in again. Open pages update as soon as anything changes.
-
-If you work with others, admins invite people from **Team**: an invitation is a link that works once, for 48 hours, and each person makes their own passkey. Admins remove people, which ends their sessions and cuts off their machines at once. The person removed still holds the team's key, so removing them also makes a new one (one passkey tap by the admin), sealed to everyone who stays; the team still reads what came before. Each person then confirms the new key for their own machines from **Home**, with their passkey. A machine takes it only from a passkey pinned on it with `use05 cloud enrol`; until then it keeps sealing to the old key. Each person sets and confirms their own email under **Settings**, and uses the name git records them under (`git config user.name`), so approvals from their phone match their own work in CI.
-
-**Passkeys and the recovery code.** Your passkey signs you in, approves, and unlocks your key to the team's records, which needs a passkey with the PRF feature: iCloud Keychain on iOS 18 or macOS 15 and later, Google Password Manager, a recent Chrome, 1Password, or a YubiKey 5. When you join you get a recovery code, 32 letters and digits, shown once. Keep it somewhere safe: it unlocks your key on a device whose passkey cannot (a passkey without PRF still signs you in), and it is the only way back if you lose your passkeys. Make a new one under **Settings**; it replaces the old.
-
-**Pair a machine.** `use05-cloud` comes with 05 (0.0.7 and later). On each Mac or Linux machine:
-
-```sh
-use05 cloud login https://console.example.com   # shows a word to type under Machines, then a code
-use05 cloud add                                   # in each repository you want to see
-use05 cloud enrol                                 # pin your passkeys here, at the terminal
-use05 cloud install                               # keep it running in the background
-```
-
-Run `login` inside a repository and it does the other three for that repository too, asking you to confirm each passkey; elsewhere, or with no person at the terminal, it says what is next.
-
-`install` keeps the helper running: a launchd job on macOS, a `systemd --user` service on Linux (run `loginctl enable-linger $USER` to keep it running while you are logged out). Where there is neither, such as a container, it prints the command to run under your own supervisor. `use05 cloud status` says which, and where its keys are: files only you can read, which an agent running as you can still reach.
-
-`login` shows a word; type it in the console, which only someone at that terminal can do. Then the terminal and your browser each show a code, worked out from your console's key, the machine's keys and a random number from each side; pair only if the two are the same, or the console has swapped a key. A machine belongs to whoever pairs it: only they can approve the work done on it. Another machine reporting a repository that one already reports waits until an admin allows it.
-
-**For phone approvals to count in CI,** list each person's passkey under `[[trust.key]]` with `role = "approver"` and their `person`, and the machine that prepares their approvals with `role = "local"` and the same `person`; see [Turn on the CI gate](turn-on-the-ci-gate.md).
-
-**Cloud agent sessions.** For 05 to hold work done in Claude Code or Codex in the cloud, it has to travel with the repository: run `use05 init --shared-hooks` and commit `.claude/settings.json`. In a Claude Code cloud session (and only there) the first hook installs this version of 05 when the session lacks it, and, when the session has a token, reports to your console. Make the token under **Machines**, *Cloud sessions and CI*, for one repository; in Claude Code store it in the cloud environment as `USE05_SESSION`. A session's token reports for that repository only, as you, and is sent nothing to run; what it reports shows as coming from the cloud session, and never replaces what a machine paired at a terminal reported. When someone leaves and the team's key changes, every token made before stops working (the Machines page says which): make new ones. The agent can read it, so treat what a session reports as the session's word. Codex cloud runs its agent offline by default, so there the work's receipts travel in the repository and CI reports for it (below). In both, CI is the strong control: local hooks are advisory everywhere.
-
-**CI on the console.** Make a token for CI the same way and store it as the CI secret `USE05_CI`, next to `USE05_RUNNER_KEY`. Around the CI gate:
-```sh
-use05-cloud ci collect                            # file approvals signed on the console since the last run
-use05 gate --ci --json > gate.json || true        # the gate, as before
-use05-cloud ci report gate.json                   # the verdict, sealed to your team
-```
-The repository's page then shows CI's latest verdict, or "CI gate not seen" while nothing has come. When CI holds work for a person and no machine can prepare the approval (a cloud session that has ended, work done without 05), `report` prepares it for the person who made the token, co-signed by the runner key, and asks on the console; they approve with their passkey, and the next run's `collect` files it. It asks only when an approval would clear something: a missing testing sign-off is given at a terminal. For it to count, the policy lists their passkey with their `person` and the runner key with `role = "runner"`. Asking someone other than the token's person is not built yet.
-
-**Edits from the phone only tighten.** The console may change where agents may work and how strictly 05 holds them, and only to make it stricter: protect or lock more, raise a strictness, require more. Anything that loosens a rule, and anything that decides what runs, what is trusted or what counts as proof, is changed at a terminal.
+[Your own console](console.md) covers running it, claiming it, connecting machines, approving from your phone, cloud sessions and CI, what the server can and cannot see, passkeys and recovery, working with others, and what to do when something is stuck.
 
 ## Commands
 
@@ -401,8 +360,9 @@ The repository's page then shows CI's latest verdict, or "CI gate not seen" whil
 | `use05 policy org-sign` | Sign an organisation's rules. See [Organisation rules](#organisation-rules). |
 | `use05 hook <agent> <event>` | What agent hooks call: `claude-code`, `codex`, or `generic` for any other agent (see [Extending 05](extending.md)). |
 | `use05 uninstall` | Reverse exactly what `init` did. |
+| `use05 cloud <login\|add\|enrol\|install\|status\|sync>` | Connect this machine to [your own console](console.md), through the `use05-cloud` helper. |
 
-Every command takes `--help`, `--repo <dir>` and `--json`.
+Commands take `--help`; most take `--repo <dir>` and `--json`.
 
 More flags worth knowing:
 

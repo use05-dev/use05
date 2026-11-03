@@ -1,7 +1,7 @@
 //! Email, only for what needs a person: an approval waiting, a policy edit that could not be
 //! applied, a helper refusing a request, a passkey added. Each alert goes to the member it is
 //! about, at the address they confirmed; one about nobody in particular goes to the admins. A burst
-//! becomes one email. Emails name the repository and what is waiting, never goals or file names.
+//! becomes one email. Emails say only that something needs you: never the repository, goals or file names.
 //! They go out through Cloudflare Email Service or any SMTP server; without either, alerts are
 //! kept in the console only.
 

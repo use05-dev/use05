@@ -43,7 +43,7 @@ enum Cmd {
     Prove(ProveCli),
     /// The one page a person reads: intent, outcome, evidence, drift, what to do
     Brief(BriefCli),
-    /// Approve (or reject) an intent or an outcome, signed with your passphrase-protected key
+    /// Approve (or reject) an intent or an outcome, signed with your passphrase-protected key or a passkey
     Approve(ApproveCli),
     /// Check a receipt offline: no account, no network
     #[command(after_help = "Examples:\n  use05 verify receipt.json --key me.pub\n  use05 verify 05-receipts/<key>:receipts/<tree>/<id>.json --tree HEAD\n\nWithout --key, receipts are checked against the keys your policy and this machine trust.")]
@@ -308,7 +308,7 @@ enum PolicyCmd {
         #[command(flatten)]
         common: Common,
     },
-    /// Sign an organisation floor (what the cloud app will do for you)
+    /// Sign an organisation floor: a minimum every repository may tighten, never loosen
     #[command(hide = true)]
     OrgSign {
         /// The floor, as a TOML file

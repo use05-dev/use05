@@ -1886,6 +1886,17 @@ fn the_pre_push_hook_proves_what_is_missing_before_it_gates() {
 }
 
 #[test]
+fn init_says_to_commit_what_it_wrote_until_it_is_committed() {
+    let s = Sandbox::new();
+    s.commit_all("first");
+    let init = s.run(&["init"]);
+    assert!(text(&init).contains("Next: git add .05 AGENTS.md && git commit"), "{}", text(&init));
+    s.commit_all("Set up 05");
+    let again = s.run(&["init"]);
+    assert!(text(&again).contains("Next: use05 doctor"), "{}", text(&again));
+}
+
+#[test]
 fn an_approval_counts_at_the_push_when_the_policy_file_was_never_committed() {
     // The push is held to the rules at its base. Here the base has no policy, so the push is
     // judged by 05's defaults, and an approval must be bound to those, not to the working file.

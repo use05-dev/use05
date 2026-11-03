@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.0.9
+
+- **Setup you can follow.** `use05 init` ends by telling you to commit what it wrote (`git add .05 AGENTS.md && git commit -m "Set up 05"`, with `.codex` when it wrote one) until it is committed, since the rules count at a push and in CI only then. The README, the guide and the site walk the real first run: commit the setup, create your approver key, approve the first push once (it changes 05's own rules), and work on a branch of your own when you work by hand.
+- **Fixed: `use05-cloud <command> --help` ran the command.** `--help` or `-h` anywhere now prints the commands and does nothing else.
+- **Your own console has its own guide**, [docs/console.md](docs/console.md): running and upgrading it, every setting, claiming it, pairing machines, approving from your phone, testing sign-offs, discarding work, policy edits, email, cloud sessions and CI, what the server can and cannot see, passkeys and the recovery code, working with others, and what to do when something is stuck.
+- The console says plainly that an email names nothing (only that something needs you), and that the recovery code unlocks your records but does not sign you in: keep a second passkey. Help texts mention passkeys, and no longer promise a cloud app.
+
 ## 0.0.8
 
 - **Fixed: approvals that never counted at the push.** In a repository whose policy file was not committed yet, `use05 approve` signed under that file while the pre-push hook and CI held the change to the rules at its base, 05's defaults, so the approval could never clear the push. Approving, the brief and `use05 land` now use the rules a push and CI use; the hooks and `prove` still follow your file. `use05 doctor`, the brief and the approval itself say when the policy is not committed (`POLICY_NOT_COMMITTED`).

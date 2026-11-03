@@ -228,8 +228,15 @@ fn read(r: std::result::Result<ureq::Response, ureq::Error>) -> Result<Value> {
     }
 }
 
+const USAGE: &str = "use05 cloud: connect this machine to your own 05 console.\n\n  login <url> [--name NAME]  claim a new console, or pair this machine (its word, then two codes);\n                             in a repository, also add, enrol and install\n  add [PATH]                 report this repository (default: the one you are in)\n  enrol                      pin your console passkeys as approvers on this machine\n  install                    run in the background and hear 05's events\n  status                     what is set up\n  sync                       send everything once, now\n  session [--background]     in a cloud agent session, report with the token in USE05_SESSION\n  ci collect | ci report F   in CI, with the token in USE05_CI: file phone approvals; send the verdict\n\nIt connects out only, sends what it reports sealed to your console's key, and runs nothing it is sent.";
+
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
+    // Help is asked for, never acted on: a command with --help pairs, installs or sends nothing.
+    if args.iter().any(|a| a == "--help" || a == "-h") {
+        println!("{USAGE}");
+        return;
+    }
     let result = match args.first().map(String::as_str) {
         Some("login") => login(&args[1..]),
         Some("add") => add(args.get(1).map(PathBuf::from)),
@@ -246,9 +253,7 @@ fn main() {
         Some("session-run") => session_run(),
         Some("ci") => ci(&args[1..]),
         _ => {
-            println!(
-                "use05 cloud: connect this machine to your own 05 console.\n\n  login <url> [--name NAME]  pair this machine (type its word in the console, then compare codes)\n  add [PATH]                 report this repository (default: the one you are in)\n  enrol                      pin your console passkeys as approvers on this machine\n  install                    run in the background and hear 05's events\n  status                     what is set up\n  sync                       send everything once, now\n  session [--background]     in a cloud agent session, report with the token in USE05_SESSION\n  ci collect | ci report F   in CI, with the token in USE05_CI: file phone approvals; send the verdict\n\nIt connects out only, sends what it reports sealed to your team, and runs nothing it is sent."
-            );
+            println!("{USAGE}");
             Ok(())
         }
     };

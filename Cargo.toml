@@ -3,7 +3,7 @@ resolver = "3"
 members = ["crates/receipt", "crates/runner", "crates/core", "crates/cli", "crates/policy-edit", "crates/policy-wasm", "crates/cloud", "crates/console"]
 
 [workspace.package]
-version = "0.0.8"
+version = "0.0.9"
 edition = "2024"
 license = "Apache-2.0"
 repository = "https://github.com/use05-dev/use05"

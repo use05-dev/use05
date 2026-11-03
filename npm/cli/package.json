@@ -1,7 +1,7 @@
 {
   "name": "@use05/cli",
   "version": "0.0.0",
-  "description": "05: the acceptance layer for AI-written code. Prove and verify what agents did.",
+  "description": "05: land AI-written code with no pull request to review. Agents declare a plan; 05 holds them to it and signs the evidence.",
   "license": "Apache-2.0",
   "homepage": "https://use05.dev",
   "repository": { "type": "git", "url": "git+https://github.com/use05-dev/use05.git" },

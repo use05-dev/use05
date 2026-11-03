@@ -30,11 +30,22 @@ Known limits:
 - Pull requests from forks get no secrets and a read-only token, so the gate cannot sign (it fails with `NO_RUNNER_KEY`) and could not push. A refused push is reported, never fatal. Review fork PRs by hand, or run the gate on a trusted branch after review.
 - Phone (passkey) approvals count in CI only if both keys are in the policy: the passkey with `role = "approver"` and `person = "<the owner's name, as in git config user.name>"`, and the key of the machine that prepared the approval (the "machine" line of `use05 key show` on that machine) with `role = "local"`. `person` needs use05 0.0.7 or later wherever the policy is read, including the CI gate: set `[use05] min_version = "0.0.7"` so an older one says to upgrade instead of refusing the file. Without the machine's key the brief says `no machine that prepared it co-signed it`. Give the machine key the same `person` so it can only prepare for them. Keep `[evidence] accept = ["runner"]` (step 3): with `local` accepted, a machine key listed here could also sign check results that CI would believe.
 - Approvals have to be on the remote: use `use05 approve --push` (or push the `05-receipts/<key>` branch yourself) before CI runs. `use05 brief --fetch` pulls other people's receipts.
-- Until a release is published (decision D44), the install step cannot download use05. Set `USE05_BASE_URL` in the workflow, or build from source in the job.
 
 ## Your own console
 
-With your own console (see the guide's *Your own console*), CI can report each verdict there and collect approvals signed on a phone: store a CI token from the console's Machines page as the secret `USE05_CI`, run `use05-cloud ci collect` before the gate and `use05-cloud ci report gate.json` after `use05 gate --ci --json > gate.json`. Nothing about the gate changes: what counts is still the signatures on the receipts branches.
+With [your own console](console.md), CI can report each verdict there and collect approvals signed on a phone. Store a CI token from the console's Machines page as the secret `USE05_CI`, then around the gate step:
+
+```yaml
+      - run: use05-cloud ci collect                    # file approvals signed on a phone, before the gate
+        env: { USE05_CI: "${{ secrets.USE05_CI }}" }
+      - run: use05 gate --ci --push --json > gate.json  # the gate, as in step 4; its exit status still decides
+        env: { USE05_RUNNER_KEY: "${{ secrets.USE05_RUNNER_KEY }}", USE05_PUSH_TOKEN: "${{ github.token }}" }
+      - if: always()
+        run: use05-cloud ci report gate.json           # send the verdict, whatever it was
+        env: { USE05_CI: "${{ secrets.USE05_CI }}" }
+```
+
+Nothing about the gate changes: what counts is still the signatures on the receipts branches.
 
 ## Rotating the runner key
 
