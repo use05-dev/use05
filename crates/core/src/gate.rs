@@ -315,7 +315,7 @@ const CLOCK_SKEW_SECS: u64 = 300;
 /// dates, so the reader checks them against its own policy.
 pub fn approval_void(a: &use05_receipt::Approval, policy: &Policy, now: u64) -> Option<&'static str> {
     if a.policy_sha256 != policy.digest() {
-        return Some("the policy changed since");
+        return Some("it was given under a different policy");
     }
     if expired(&a.expires, now) {
         return Some("expired");
@@ -707,6 +707,19 @@ pub fn evaluate(input: &GateInput<'_>) -> Result<GateResult> {
         for f in findings.iter_mut().filter(|f| f.approvable && f.effect == Effect::Approval) {
             f.effect = Effect::Info;
             f.message.push_str(" (approved)");
+        }
+    } else if findings.iter().any(|f| f.approvable && f.effect == Effect::Approval) {
+        // An approval that is there but does not count is named, with why, never passed over
+        // as if nobody had approved.
+        for a in approval_info.iter().filter(|a| a.vote == Vote::Approve) {
+            if let Some(why) = a.void {
+                let what = if a.scope == ApprovalScope::Intent { "intent" } else { "outcome" };
+                findings.push(
+                    Finding::new("APPROVAL_NOT_COUNTED", Effect::Approval, format!("{}'s approval of the {what} does not count: {why}", a.by.name))
+                        .approvable()
+                        .next(format!("use05 approve --{what}")),
+                );
+            }
         }
     }
 

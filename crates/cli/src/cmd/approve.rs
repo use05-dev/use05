@@ -82,7 +82,7 @@ pub fn run_approve(args: ApproveArgs) -> Report {
     if let Some(file) = &args.signed {
         return run_signed(file, args.push, &args.repo);
     }
-    let ctx = match Ctx::open(&args.repo, args.task.as_deref()) {
+    let ctx = match Ctx::open_judging(&args.repo, args.task.as_deref()) {
         Ok(c) => c,
         Err(e) => return Report::from_core("approve", e),
     };
@@ -316,7 +316,7 @@ fn filed_testing(ctx: &Ctx, t: &use05_receipt::Testing, tree: &str, signer_id: &
 /// File an approval signed elsewhere. It counts only if a key this machine or the base policy
 /// trusts as an approver signed it, and it is filed under its own subject, whatever task is current.
 fn run_signed(file: &std::path::Path, push: bool, repo: &std::path::Path) -> Report {
-    let ctx = match Ctx::open(repo, None) {
+    let ctx = match Ctx::open_judging(repo, None) {
         Ok(c) => c,
         Err(e) => return Report::from_core("approve", e),
     };
@@ -385,7 +385,7 @@ fn run_signed(file: &std::path::Path, push: bool, repo: &std::path::Path) -> Rep
     let void = use05_core::gate::approval_void(a, &ctx.policy, now_secs())
         .map(|why| match why {
             "expired" => "it has expired",
-            "the policy changed since" => "the policy changed since it was prepared",
+            "it was given under a different policy" => "it was prepared under a different policy",
             other => other,
         })
         .or_else(|| use05_core::gate::passkey_void(&signed, &ctx.trust, driver.as_ref()));
@@ -416,7 +416,7 @@ pub fn run_bypass(args: BypassArgs) -> Report {
     if args.hours == 0 || args.hours > 72 {
         return Report::error("bypass", "HOURS_INVALID", "a bypass lasts between 1 and 72 hours".into(), None, 6);
     }
-    let ctx = match Ctx::open(&args.repo, None) {
+    let ctx = match Ctx::open_judging(&args.repo, None) {
         Ok(c) => c,
         Err(e) => return Report::from_core("bypass", e),
     };

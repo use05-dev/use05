@@ -1885,6 +1885,75 @@ fn the_pre_push_hook_proves_what_is_missing_before_it_gates() {
     assert!(String::from_utf8_lossy(&out.stderr).contains("proved"), "{}", String::from_utf8_lossy(&out.stderr));
 }
 
+#[test]
+fn an_approval_counts_at_the_push_when_the_policy_file_was_never_committed() {
+    // The push is held to the rules at its base. Here the base has no policy, so the push is
+    // judged by 05's defaults, and an approval must be bound to those, not to the working file.
+    let s = Sandbox::new();
+    s.write("package.json", "{\"scripts\":{\"test\":\"./test.sh\"}}\n");
+    s.commit_all("first");
+    assert_eq!(code(&s.run(&["init"])), 0);
+    let exclude = s.path(".git/info/exclude");
+    fs::write(&exclude, format!("{}\n.05/policy.toml\n", fs::read_to_string(&exclude).unwrap_or_default())).unwrap();
+    s.commit_all("hooks, but not the policy");
+    assert!(s.git(&["ls-files", ".05"]).lines().all(|l| !l.ends_with("policy.toml")));
+    let doctor = s.run(&["doctor"]);
+    assert!(text(&doctor).contains("not committed"), "doctor says the policy is not the rules yet:\n{}", text(&doctor));
+    s.approver();
+    let remote = tempfile::tempdir().unwrap();
+    let remote_path = remote.path().display().to_string();
+    assert!(Command::new("git").args(["init", "-q", "--bare", "-b", "main", &remote_path]).status().unwrap().success());
+    s.git(&["remote", "add", "origin", &remote_path]);
+    let push = || {
+        let mut cmd = Command::new("git");
+        cmd.arg("-C").arg(s.dir.path()).args(["push", "origin", "main"]);
+        cmd.env("PATH", format!("{}:{}", bin_dir(), std::env::var("PATH").unwrap())).env("USE05_HOME", s.home.path()).env("HOME", s.home.path()).env("LANG", "C.UTF-8").env("COLUMNS", "100");
+        cmd.output().unwrap()
+    };
+    assert!(push().status.success());
+    fs::create_dir_all(s.path("migrations")).unwrap();
+    s.write("migrations/001_users.sql", "create table users (id integer);\n");
+    s.commit_all("a migration, which needs a person");
+    let held = push();
+    assert!(!held.status.success(), "a migration waits for a person: {}", String::from_utf8_lossy(&held.stderr));
+
+    let brief = s.run(&["brief", "--tree", "HEAD"]);
+    assert!(text(&brief).contains("not committed"), "the brief says the policy file is not the rules yet:\n{}", text(&brief));
+    let approve = s.run_with_stdin(&["approve", "--outcome", "--tree", "HEAD", "--passphrase-stdin"], "correct horse\n");
+    assert_eq!(code(&approve), 0, "{}", text(&approve));
+    let out = push();
+    assert!(out.status.success(), "the approval counts at the push: {}", String::from_utf8_lossy(&out.stderr));
+}
+
+#[test]
+fn a_push_held_despite_an_approval_says_why_the_approval_does_not_count() {
+    // An approval given under other rules does not count. The push says so, rather than
+    // claiming nobody approved.
+    let s = Sandbox::initialised();
+    s.approver();
+    let remote = tempfile::tempdir().unwrap();
+    let remote_path = remote.path().display().to_string();
+    assert!(Command::new("git").args(["init", "-q", "--bare", "-b", "main", &remote_path]).status().unwrap().success());
+    s.git(&["remote", "add", "origin", &remote_path]);
+    let push = || {
+        let mut cmd = Command::new("git");
+        cmd.arg("-C").arg(s.dir.path()).args(["push", "origin", "main"]);
+        cmd.env("PATH", format!("{}:{}", bin_dir(), std::env::var("PATH").unwrap())).env("USE05_HOME", s.home.path()).env("HOME", s.home.path()).env("LANG", "C.UTF-8").env("COLUMNS", "100");
+        cmd.output().unwrap()
+    };
+    assert!(push().status.success());
+    // The change edits the policy and is approved here, where that edit is already the rules
+    // (no task, so the base is HEAD), while the push is held to origin's.
+    assert_eq!(code(&s.run(&["policy", "set", "approvals.expire_days", "3"])), 0);
+    s.commit_all("shorter approvals");
+    let approve = s.run_with_stdin(&["approve", "--outcome", "--tree", "HEAD", "--passphrase-stdin"], "correct horse\n");
+    assert_eq!(code(&approve), 0, "{}", text(&approve));
+    let held = push();
+    let said = String::from_utf8_lossy(&held.stderr).to_string();
+    assert!(!held.status.success(), "{said}");
+    assert!(said.contains("does not count") && said.contains("policy"), "the push says why the approval does not count:\n{said}");
+}
+
 // ----------------------------------------------------------------------------- declarations reach CI (D65)
 
 /// A repository whose policy trusts the CI runner and this developer's machine key (role local).
@@ -3572,7 +3641,7 @@ fn approve_signed_says_when_an_approval_will_not_count() {
     assert_eq!(code(&out), 0, "{}", text(&out));
     let v = json(&out);
     assert_eq!(v["details"]["counts"], false, "{v}");
-    assert!(text(&out).contains("policy changed"), "{}", text(&out));
+    assert!(text(&out).contains("under a different policy"), "{}", text(&out));
     assert_eq!(code(&s.run(&["brief"])), 3);
 }
 

@@ -19,6 +19,9 @@ pub struct Ctx {
     pub policy: Policy,
     pub org: Option<String>,
     pub trust: Trust,
+    /// The base has no committed policy, so a push and CI hold the change to 05's defaults,
+    /// while the working policy file is not the rules yet.
+    pub policy_uncommitted: bool,
     /// The current task's receipts, read and checked once however many times they are asked for.
     task_found: std::cell::OnceCell<use05_core::evidence::Found>,
 }
@@ -42,10 +45,22 @@ impl Ctx {
         Ctx::open_with(repo, task_id, None)
     }
 
+    /// For what decides whether a change is accepted (an approval, the brief, a landing): the
+    /// rules a push and CI will hold it to, read from its base as the gate reads them. Hooks and
+    /// `prove` may follow a policy file not committed yet; an approval must not, or the push it
+    /// was given for never counts it.
+    pub fn open_judging(repo: &Path, task_id: Option<&str>) -> Result<Ctx> {
+        Ctx::open_rules(repo, task_id, None, true)
+    }
+
     /// Like [`Ctx::open`], but read the rules from `policy_rev` (a commit). Gating a push or a
     /// pull request passes the change's base here, so a change cannot loosen its own rules. In
     /// that case a base with no policy means defaults, never the change's own file.
     pub fn open_with(repo: &Path, task_id: Option<&str>, policy_rev: Option<&str>) -> Result<Ctx> {
+        Ctx::open_rules(repo, task_id, policy_rev, policy_rev.is_some())
+    }
+
+    fn open_rules(repo: &Path, task_id: Option<&str>, policy_rev: Option<&str>, strict: bool) -> Result<Ctx> {
         let store = Store::open(repo)?;
         let mut task = match task_id {
             Some(id) => Some(store.load(id)?),
@@ -59,17 +74,18 @@ impl Ctx {
                 store.save(t)?;
             }
         }
-        let strict = policy_rev.is_some();
         let base = policy_rev.map(str::to_string).or_else(|| task.as_ref().and_then(|t| t.base_commit.clone())).or_else(|| git::head_commit(&top));
-        // A change's rules come from its base. If there is no committed policy yet, fall back to
-        // the working file so a fresh `init` works before its first commit.
+        // A change's rules come from its base. If there is no committed policy yet, the hooks
+        // and `prove` follow the working file, so a fresh `init` works before its first commit;
+        // a push, CI and whatever decides acceptance hold the change to the defaults.
         let from_base = match &base {
             Some(rev) => Policy::load_at(&top, rev)?,
             None => None,
         };
+        let policy_uncommitted = base.is_some() && from_base.is_none() && top.join(POLICY_PATH).exists();
         let repo_policy = match from_base {
             Some(p) => p,
-            None if strict => Policy::default(),
+            None if strict && base.is_some() => Policy::default(),
             None => Policy::load_file(&top.join(POLICY_PATH))?.unwrap_or_default(),
         };
         let mut policy = repo_policy.clone();
@@ -81,7 +97,7 @@ impl Ctx {
             None => None,
         };
         let trust = Trust::new(&policy, true);
-        Ok(Ctx { store, task, repo_policy, policy, org, trust, task_found: std::cell::OnceCell::new() })
+        Ok(Ctx { store, task, repo_policy, policy, org, trust, policy_uncommitted, task_found: std::cell::OnceCell::new() })
     }
 
     /// Resolve what to look at: `index` (staged files) or any commit or tree.
@@ -145,7 +161,7 @@ impl Ctx {
             (_, use05_core::policy::Severity::Allow) | (None, _) => None,
             (Some(t), _) => t.fresh.as_ref().and_then(|f| use05_core::fresh::stale(self.top(), f, target.head_commit.as_deref())),
         };
-        evaluate(&GateInput {
+        let mut result = evaluate(&GateInput {
             top: self.top(),
             policy: &self.policy,
             trust: &self.trust,
@@ -160,7 +176,18 @@ impl Ctx {
             stale_base: stale.as_ref(),
             pushing_to,
             default_branch,
-        })
+        })?;
+        if self.policy_uncommitted {
+            result.findings.push(use05_core::gate::Finding {
+                code: "POLICY_NOT_COMMITTED",
+                effect: use05_core::gate::Effect::Warn,
+                message: format!("{POLICY_PATH} is not committed, so it is not the rules yet: a push, CI and approvals hold this change to 05's defaults until it is"),
+                paths: vec![POLICY_PATH.to_string()],
+                next: Some(format!("commit {POLICY_PATH}")),
+                approvable: false,
+            });
+        }
+        Ok(result)
     }
 }
 

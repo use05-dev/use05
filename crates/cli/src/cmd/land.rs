@@ -12,7 +12,7 @@ use crate::ctx::Ctx;
 use crate::report::{Report, Tone};
 
 pub fn run(repo: &Path, task: Option<&str>) -> Report {
-    let ctx = match Ctx::open(repo, task) {
+    let ctx = match Ctx::open_judging(repo, task) {
         Ok(c) => c,
         Err(e) => return Report::from_core("land", e),
     };

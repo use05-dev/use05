@@ -114,7 +114,10 @@ pub fn diagnose(repo: &Path) -> Diagnosis {
     d.setup.push(Line::ok(format!("repository {}", top.display())));
 
     let setup = inspect(&top);
-    if setup.policy_file {
+    if setup.policy_file && ctx.policy_uncommitted {
+        d.setup.push(Line::note(format!("{POLICY_PATH} is valid but not committed, so it is not the rules yet: a push, CI and approvals use 05's defaults until it is")));
+        d.next = Some(format!("git add {POLICY_PATH} && git commit"));
+    } else if setup.policy_file {
         d.setup.push(Line::ok(format!("{POLICY_PATH} is valid ({} check{})", ctx.policy.check.len(), if ctx.policy.check.len() == 1 { "" } else { "s" })));
     } else {
         d.setup.push(Line::note(format!("no {POLICY_PATH}; the defaults apply")));

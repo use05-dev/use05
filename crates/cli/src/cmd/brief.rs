@@ -13,7 +13,7 @@ use crate::ui::{Glyph, Item, Out, Tone, Ui};
 
 pub fn run(repo: &Path, task: Option<&str>, tree: Option<&str>, fetch: bool, json: bool) -> ExitCode {
     let fail = |e| emit(&Report::from_core("brief", e), json);
-    let ctx = match Ctx::open(repo, task) {
+    let ctx = match Ctx::open_judging(repo, task) {
         Ok(c) => c,
         Err(e) => return fail(e),
     };

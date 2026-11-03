@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.0.8
+
+- **Fixed: approvals that never counted at the push.** In a repository whose policy file was not committed yet, `use05 approve` signed under that file while the pre-push hook and CI held the change to the rules at its base, 05's defaults, so the approval could never clear the push. Approving, the brief and `use05 land` now use the rules a push and CI use; the hooks and `prove` still follow your file. `use05 doctor`, the brief and the approval itself say when the policy is not committed (`POLICY_NOT_COMMITTED`).
+- A push held although someone approved now says whose approval does not count and why (`APPROVAL_NOT_COUNTED`, for instance "it was given under a different policy"), instead of saying nobody approved.
+- **Fixed: a false "check disabled".** `|| true` after commands that only tidy up (`cp`, `rm`, `mkdir`, `kill`, `docker rm` and the like) is no longer read as a check made to pass; `npm test || true` still is.
+
 ## 0.0.7
 
 - **Your own console.** A web app you host yourself, for you or your team: see every agent's work across your machines, approve what waits for you with a passkey from your phone, tighten policies, get an email when something needs you. One image (`ghcr.io/use05-dev/use05-console`), its data one SQLite file on a volume. People join by invitation as admins or members; each machine belongs to whoever paired it, and only they approve its work. Encrypted end to end: machines seal and sign what they report to the team's key, which each person unlocks with their passkey or a recovery code; the browser opens it and builds every page, and runs the policy editor; the console sees only what it needs to route, and emails say only that something needs you. Pairing asks for a word only the machine's terminal shows, then for two codes to match, worked out on each side from the keys and a nonce from both. Removing someone makes the team a new key. Machines connect out and run nothing they are sent; policy edits from the browser may only tighten. The helper, `use05-cloud` (`use05 cloud login|add|enrol|install|status|sync`), now ships with 05 in the release archives, the installer and npm. See [Your own console](docs/guide.md#your-own-console).

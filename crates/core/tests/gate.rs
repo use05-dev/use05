@@ -306,7 +306,7 @@ fn a_protected_path_needs_a_person_and_only_the_right_kind_of_approval_counts() 
     file_outcome_approval(&repo, &tree, &digest, approval(ApprovalScope::Outcome, Vote::Approve, &other_policy, "alice", 3600), &person);
     let stale = c.gate();
     assert_eq!(stale.decision, Decision::ApprovalRequired, "an approval is bound to the policy it was given under");
-    assert!(stale.approvals.iter().any(|a| a.void == Some("the policy changed since")));
+    assert!(stale.approvals.iter().any(|a| a.void == Some("it was given under a different policy")));
 
     // An expired approval is void.
     file_outcome_approval(&repo, &tree, &digest, approval(ApprovalScope::Outcome, Vote::Approve, &policy, "alice", -10), &person);

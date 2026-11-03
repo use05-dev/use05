@@ -235,6 +235,8 @@ Run as many agents as you like on one repository:
 
 ## Configure: `.05/policy.toml`
 
+Commit the file. A change is held to the rules at its base, so until the policy is committed, a push, CI and approvals use 05's defaults, while the hooks already follow your file; `use05 doctor` and the brief say so.
+
 `use05 init` writes the file with comments, and `use05 policy --edit` changes it by asking the setup questions again, so you rarely need to edit it by hand. To change one rule, change just that rule; the rest of the file, comments included, stays as it is:
 ```sh
 use05 policy set testing.local required

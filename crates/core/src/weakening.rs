@@ -138,7 +138,24 @@ fn rust_test_start(text: &str) -> Option<usize> {
 fn disables_a_check(line: &str) -> bool {
     let squeezed: String = line.split_whitespace().collect::<Vec<_>>().join(" ");
     let compact = squeezed.replace(": ", ":");
-    compact.contains("continue-on-error:true") || compact.contains("allow_failure:true") || compact.contains("if:false") || squeezed.contains("|| true") && occurs(&squeezed, "true", true)
+    compact.contains("continue-on-error:true") || compact.contains("allow_failure:true") || compact.contains("if:false") || squeezed.contains("|| true") && occurs(&squeezed, "true", true) && !housekeeping(&squeezed)
+}
+
+/// `cp … || true`, `rm -rf build || true`: a failure ignored where every command before it only
+/// moves files or stops something, and so checks nothing.
+fn housekeeping(line: &str) -> bool {
+    const TIDY: &[&str] = &["cp", "mv", "rm", "rmdir", "mkdir", "ln", "chmod", "chown", "touch", "unlink", "kill", "pkill", "killall", "echo", "printf"];
+    let before = line.split("|| true").next().unwrap_or("");
+    let before = before.trim_start_matches(|c: char| c == '-' || c.is_whitespace());
+    let before = before.strip_prefix("run:").unwrap_or(before);
+    before.split(['&', ';', '|']).map(str::trim).filter(|c| !c.is_empty()).all(|command| {
+        let mut words = command.split_whitespace().skip_while(|w| *w == "sudo");
+        match words.next() {
+            Some("docker") => matches!(words.next(), Some("rm" | "stop" | "kill" | "rmi")),
+            Some(first) => TIDY.contains(&first),
+            None => true,
+        }
+    })
 }
 
 /// Everything the change does to weaken its own checks.
@@ -255,6 +272,22 @@ pub fn analyse(top: &Path, base: Option<&str>, target: &str, changes: &[Change])
 mod tests {
     use super::*;
     use std::process::Command;
+
+    #[test]
+    fn a_failure_ignored_is_a_check_disabled_only_when_it_could_be_a_check() {
+        assert!(disables_a_check("      - run: npm test || true"));
+        assert!(disables_a_check("cargo test --workspace || true"));
+        assert!(disables_a_check("use05 gate --ci || true"));
+        assert!(disables_a_check("./run-checks.sh || true"));
+        // Housekeeping whose failure does not matter checks nothing.
+        assert!(!disables_a_check("          cp LICENSE* README.md \"$D/\" 2>/dev/null || true"));
+        assert!(!disables_a_check("rm -rf build || true"));
+        assert!(!disables_a_check("mkdir -p out || true"));
+        assert!(!disables_a_check("docker rm -f old || true"));
+        assert!(!disables_a_check("kill \"$pid\" 2>/dev/null || true"));
+        // Unless it hides a check after the housekeeping.
+        assert!(disables_a_check("mkdir -p out && npm test || true"));
+    }
 
     struct Repo(tempfile::TempDir);
 
