@@ -11,7 +11,38 @@ use use05_core::task::{Status, Task};
 use crate::ctx::Ctx;
 use crate::report::{Report, Tone};
 
-pub fn run(repo: &Path, task: Option<&str>) -> Report {
+/// Whether a step that follows another (land after an approval, push after landing) is done
+/// without asking, asked at a terminal, or left for the person (D91).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Then {
+    Do,
+    Ask,
+    Leave,
+}
+
+impl Then {
+    /// The policy says auto, or a flag said so: do it. Else a person at a terminal is asked.
+    pub fn choose(auto: bool, flag: bool, interactive: bool) -> Then {
+        if auto || flag {
+            Then::Do
+        } else if interactive {
+            Then::Ask
+        } else {
+            Then::Leave
+        }
+    }
+
+    /// Settle it: asking a person at the terminal, Enter meaning yes.
+    pub fn settle(self, question: &str) -> bool {
+        match self {
+            Then::Do => true,
+            Then::Leave => false,
+            Then::Ask => matches!(use05_core::tty::ask(&format!("{question} [Y/n] ")).map(|a| a.trim().to_ascii_lowercase()), Ok(a) if a.is_empty() || a == "y" || a == "yes"),
+        }
+    }
+}
+
+pub fn run(repo: &Path, task: Option<&str>, push: bool, interactive: bool) -> Report {
     let ctx = match Ctx::open_judging(repo, task) {
         Ok(c) => c,
         Err(e) => return Report::from_core("land", e),
@@ -19,7 +50,81 @@ pub fn run(repo: &Path, task: Option<&str>) -> Report {
     let Some(task) = ctx.task.clone() else {
         return Report::error("land", "NO_TASK", "there is no current task to land".into(), Some("name one: use05 land --task <id>".into()), 6);
     };
-    land_task(&ctx, task)
+    let mut report = land_task(&ctx, task);
+    let then = Then::choose(ctx.policy.branches.push == use05_core::policy::LandMode::Auto, push, interactive);
+    push_after(&ctx, &mut report, then, false);
+    report
+}
+
+/// Would this task land now? The branch, its target and the commit, when the gate allows it;
+/// nothing is changed and nobody is told.
+pub fn ready(ctx: &Ctx, task: &Task) -> Option<(String, String)> {
+    let top = ctx.top();
+    let branch = task.branch.clone()?;
+    if branches::is_kept(&ctx.policy, &branch) {
+        return None;
+    }
+    let target = branches::target_for(&ctx.policy, task.intent.as_ref(), top);
+    if target == branch || branches::checked_out_at(top, &branch).is_some_and(|dir| !branches::is_committed(&dir)) {
+        return None;
+    }
+    let head = use05_core::git::resolve_commit(top, &format!("refs/heads/{branch}"))?;
+    let base = use05_core::git::merge_base(top, &format!("refs/heads/{target}"), &head);
+    let gate = ctx.target_from(&head, base.as_deref()).and_then(|t| ctx.gate_for(&t, Some(&target))).ok()?;
+    (gate.decision == Decision::Allow).then_some((branch, target))
+}
+
+/// After a landing: push the landing branch when `then` says so (D91). The receipts this
+/// machine signed go first, so CI finds the approvals for what it is about to gate. `quiet`
+/// keeps git's own output off the terminal (under an agent's hook, where stdout is the answer).
+pub fn push_after(ctx: &Ctx, report: &mut Report, then: Then, quiet: bool) {
+    if report.code != "LANDED" {
+        return;
+    }
+    let Some(target) = report.details["target"].as_str().map(str::to_string) else { return };
+    let top = ctx.top();
+    let Ok(remote) = use05_core::store::remote_name(top) else {
+        return;
+    };
+    if !then.settle(&format!("Push {target} to {remote} now?")) {
+        return;
+    }
+    match push_branch(top, &remote, &target, quiet) {
+        Ok(()) => {
+            report.rows.push(("pushed".into(), format!("{target} → {remote}")));
+            report.next = None;
+            report.details["pushed"] = json!(true);
+        }
+        Err(e) => {
+            report.notes.push(format!("Landed, but the push did not go through: {e}"));
+            report.next = Some(format!("git push {remote} {target}"));
+            report.details["pushed"] = json!(false);
+        }
+    }
+}
+
+/// Push a branch through the pre-push hook, like any push: 05 holds it to the same rules.
+fn push_branch(top: &Path, remote: &str, target: &str, quiet: bool) -> Result<(), String> {
+    use std::process::{Command, Stdio};
+    let mut ids: Vec<String> = use05_core::keys::approver_ids();
+    ids.extend(use05_core::keys::local_public().map(|k| use05_receipt::key_id(&k)));
+    for id in ids {
+        let branch = use05_core::store::branch_for(&id);
+        if use05_core::git::resolve_commit(top, &format!("refs/heads/{branch}")).is_some() {
+            let _ = use05_core::store::push(top, &branch);
+        }
+    }
+    let mut git = Command::new("git");
+    git.arg("-C").arg(top).args(["push", remote, &format!("refs/heads/{target}:refs/heads/{target}")]).stdin(Stdio::null()).stdout(Stdio::null());
+    if quiet {
+        git.stderr(Stdio::piped());
+    }
+    let out = git.output().map_err(|e| e.to_string())?;
+    if out.status.success() {
+        return Ok(());
+    }
+    let said = String::from_utf8_lossy(&out.stderr);
+    Err(said.lines().rev().find(|l| !l.trim().is_empty()).map_or_else(|| "git push failed".to_string(), |l| l.trim().to_string()))
 }
 
 /// Land `task` and tidy up. Also used by the Stop hook when the policy says `land = "auto"`.

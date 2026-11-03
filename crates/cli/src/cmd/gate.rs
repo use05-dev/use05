@@ -79,12 +79,67 @@ fn blocked_text(ui: &Ui, what: &str, results: &[(String, GateResult)]) -> String
 fn pre_push(args: &Args) -> ExitCode {
     let mut raw = String::new();
     let _ = std::io::stdin().take(1_000_000).read_to_string(&mut raw);
-    let mut results: Vec<(String, GateResult)> = Vec::new();
     let ui = Ui::stderr();
     // Read before anything of the change runs (D73).
     let listeners = crate::extend::listeners().unwrap_or_default();
 
-    let outcome = (|| -> Result<(), use05_core::Error> {
+    let mut outcome = gate_push(args, &raw, &listeners);
+    // A person pushing at a terminal approves right here, once, instead of being sent away to
+    // run another command (D91). Never under an agent or in CI: there is no terminal there.
+    if let Ok(results) = &outcome {
+        let waits = |r: &GateResult| r.decision == Decision::ApprovalRequired;
+        if results.iter().any(|(_, _, r)| waits(r)) && results.iter().all(|(_, _, r)| r.decision != Decision::Deny) && use05_core::tty::has_tty() && std::io::IsTerminal::is_terminal(&std::io::stderr()) {
+            let shown: Vec<(String, GateResult)> = results.iter().map(|(n, _, r)| (n.clone(), r.clone())).collect();
+            eprint!("{}", blocked_text(&ui, "push", &shown));
+            let trees: Vec<String> = results.iter().filter(|(_, _, r)| waits(r)).map(|(_, sha, _)| sha.clone()).collect();
+            if crate::cmd::land::Then::Ask.settle("Approve it now?") {
+                let mut approved = true;
+                for sha in trees {
+                    let report = crate::cmd::approve::run_approve(crate::cmd::approve::ApproveArgs {
+                        push: true, land: false, unsigned: false, signed: None, tested: false, skip_testing: false, note: None, approver: None,
+                        intent: false, outcome: true, reject: false, reason: None, task: None, tree: Some(sha), passphrase_stdin: false,
+                        interactive: false, repo: args.repo.clone(),
+                    });
+                    eprintln!("05: {}", report.headline);
+                    approved &= report.code == "APPROVED";
+                }
+                if approved {
+                    outcome = gate_push(args, &raw, &[]);
+                }
+            } else {
+                eprintln!("05: not approved, so the push stays stopped. Approve later with: use05 approve");
+                return ExitCode::from(1);
+            }
+        }
+    }
+    let results: Vec<(String, GateResult)> = match outcome {
+        Ok(r) => r.into_iter().map(|(n, _, g)| (n, g)).collect(),
+        Err(e) => {
+            if e.code == "ORG_LAYER_UNAVAILABLE" {
+                eprintln!("{} 05 stopped this push: {}", ui.paint(Tone::Bad, ui.glyph(Glyph::Bad)), e.message);
+                return ExitCode::from(1);
+            }
+            // Fail open, loudly (D34).
+            eprintln!("{} 05 could not check this push ({}). It was NOT blocked.", ui.paint(Tone::Warn, ui.glyph(Glyph::Warn)), e.message);
+            return ExitCode::SUCCESS;
+        }
+    };
+    if results.iter().all(|(_, r)| r.decision == Decision::Allow) {
+        for (name, r) in &results {
+            if let Some(b) = &r.bypass {
+                eprintln!("{} 05 let {name} through by break-glass: {} ({})", ui.paint(Tone::Warn, ui.glyph(Glyph::Warn)), b.reason, b.by.name);
+            }
+        }
+        return ExitCode::SUCCESS;
+    }
+    eprint!("{}", blocked_text(&ui, "push", &results));
+    ExitCode::from(1)
+}
+
+/// Gate every ref a push sends: its name, the commit, and the decision.
+fn gate_push(args: &Args, raw: &str, listeners: &[crate::extend::Listener]) -> Result<Vec<(String, String, GateResult)>, use05_core::Error> {
+    let mut results = Vec::new();
+    {
         for line in raw.lines() {
             let f: Vec<&str> = line.split_whitespace().collect();
             let [_, local_sha, remote_ref, remote_sha] = f[..] else { continue };
@@ -122,31 +177,11 @@ fn pre_push(args: &Args) -> ExitCode {
                 eprintln!("05: proved what was missing for {} before checking the push. {}", &local_sha[..10.min(local_sha.len())], proved.headline);
                 gate = ctx.gate_for(&target, Some(branch))?;
             }
-            announce(&listeners, &top, "pre-push", &target.oid, ctx.task.as_ref(), &gate);
-            results.push((format!("{} → {}", &local_sha[..10.min(local_sha.len())], remote_ref.trim_start_matches("refs/heads/")), gate));
+            announce(listeners, &top, "pre-push", &target.oid, ctx.task.as_ref(), &gate);
+            results.push((format!("{} → {}", &local_sha[..10.min(local_sha.len())], remote_ref.trim_start_matches("refs/heads/")), local_sha.to_string(), gate));
         }
-        Ok(())
-    })();
-
-    if let Err(e) = outcome {
-        if e.code == "ORG_LAYER_UNAVAILABLE" {
-            eprintln!("{} 05 stopped this push: {}", ui.paint(Tone::Bad, ui.glyph(Glyph::Bad)), e.message);
-            return ExitCode::from(1);
-        }
-        // Fail open, loudly (D34).
-        eprintln!("{} 05 could not check this push ({}). It was NOT blocked.", ui.paint(Tone::Warn, ui.glyph(Glyph::Warn)), e.message);
-        return ExitCode::SUCCESS;
     }
-    if results.iter().all(|(_, r)| r.decision == Decision::Allow) {
-        for (name, r) in &results {
-            if let Some(b) = &r.bypass {
-                eprintln!("{} 05 let {name} through by break-glass: {} ({})", ui.paint(Tone::Warn, ui.glyph(Glyph::Warn)), b.reason, b.by.name);
-            }
-        }
-        return ExitCode::SUCCESS;
-    }
-    eprint!("{}", blocked_text(&ui, "push", &results));
-    ExitCode::from(1)
+    Ok(results)
 }
 
 /// Countersign the task's action log with the runner key, if it still matches every seal (D70).

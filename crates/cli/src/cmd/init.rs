@@ -335,7 +335,7 @@ fn agents_block() -> String {
          - Stay inside your scope. Protected paths and risky areas need a person's approval; ask the user.\n\
          - When you are done, say what you did: `use05 finish --outcome \"<what you did>\"`. 05 runs the checks itself.\n\
          - If you are on a working branch (one you, your tool or the user made), `use05 land` moves it into its target when the gate allows it, and 05 cleans up the branch and worktree afterwards. Do not create branches just for 05.\n\
-         - `use05 approve` and `use05 bypass` need the approver passphrase, which agents do not have.\n\
+         - `use05 approve` and `use05 bypass` need the person: Touch ID or the approver passphrase, which agents do not have.\n\
          {BLOCK_END}\n"
     )
 }
@@ -459,6 +459,16 @@ pub fn run(args: Args) -> Report {
         Ok((_, false)) => kept.push("this machine's signing key already exists".into()),
         Err(e) => return Report::from_core("init", e),
     }
+    // A person at the terminal makes the approver key now, not as a separate step later (D91).
+    let person = args.interactive && std::io::IsTerminal::is_terminal(&std::io::stdin()) && use05_core::tty::has_tty();
+    if !keys::approver_exists() && person {
+        let made = crate::cmd::approve::key_new(None, true, false, None);
+        if made.code == "KEY_CREATED" {
+            changed.push(format!("{} (it is how you approve; an agent cannot use it)", made.headline.replacen("Created", "created", 1)));
+        } else {
+            gaps.push(format!("no approver key: {}", made.headline));
+        }
+    }
     if !keys::approver_exists() {
         gaps.push("no approver key yet, so nobody can approve or break glass: run `use05 key new --approver`".into());
     }
@@ -564,6 +574,20 @@ pub fn run(args: Args) -> Report {
     if use05_core::repos::touch(&store.dirs) {
         let file = use05_core::keys::user_dir().map(|d| d.join(use05_core::repos::FILE).display().to_string()).unwrap_or_default();
         changed.push(format!("listed this repository in {file}, so bare `use05` can show every repository on this machine (it stays on this machine)"));
+    }
+
+    // The rules count at a push only once committed: offer to do it now (D91).
+    if person {
+        if let Some(paths) = uncommitted_setup(&top) {
+            if crate::cmd::land::Then::Ask.settle(&format!("Commit the setup now ({paths})?")) {
+                let list: Vec<&str> = paths.split(' ').collect();
+                let added = git::run(&top, &[&["add", "--"][..], &list[..]].concat());
+                match added.and_then(|_| git::run(&top, &[&["commit", "-q", "-m", "Set up 05", "--"][..], &list[..]].concat())) {
+                    Ok(_) => changed.push(format!("committed {paths} as \"Set up 05\"; your first push of it asks you to approve 05's rules, once")),
+                    Err(e) => gaps.push(format!("could not commit the setup: {}", e.message)),
+                }
+            }
+        }
     }
 
     let mut rows: Vec<(String, String)> = Vec::new();

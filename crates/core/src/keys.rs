@@ -150,8 +150,64 @@ pub fn approver_paths() -> Result<(PathBuf, PathBuf)> {
     Ok((dir.join("approver.key"), dir.join("approver.pub")))
 }
 
+/// Does this person have an approver key here: the passphrase one, or the Touch ID one?
 pub fn approver_exists() -> bool {
+    passphrase_approver_exists() || touch_id_public().is_some()
+}
+
+/// The passphrase-protected (or unprotected) Ed25519 approver key file.
+pub fn passphrase_approver_exists() -> bool {
     approver_paths().is_ok_and(|(secret, _)| secret.exists())
+}
+
+// ----------------------------------------------------------------------------- Touch ID key
+
+const SE_PREFIX: &str = "use05-secure-enclave-p256:v1:";
+
+/// The Touch ID approver key (D91): `approver-touchid.key` holds an opaque blob that only this
+/// Mac's Secure Enclave can use, `approver-touchid.pub` its public key, in passkey form.
+pub fn touch_id_paths() -> Result<(PathBuf, PathBuf)> {
+    let dir = user_dir()?;
+    Ok((dir.join("approver-touchid.key"), dir.join("approver-touchid.pub")))
+}
+
+pub fn touch_id_public() -> Option<PasskeyKey> {
+    let (secret, public) = touch_id_paths().ok()?;
+    if !secret.exists() {
+        return None;
+    }
+    match parse_any_public_key(fs::read_to_string(public).ok()?.trim()) {
+        Ok(PublicKey::Passkey(p)) => Some(p),
+        _ => None,
+    }
+}
+
+/// The Secure Enclave's blob for the Touch ID key. It is not a secret anywhere but on this Mac.
+pub fn touch_id_blob() -> Option<Vec<u8>> {
+    let (secret, _) = touch_id_paths().ok()?;
+    let text = fs::read_to_string(secret).ok()?;
+    STANDARD.decode(text.trim().strip_prefix(SE_PREFIX)?).ok()
+}
+
+pub fn save_touch_id(blob: &[u8], public: &PasskeyKey) -> Result<()> {
+    let (secret, public_path) = touch_id_paths()?;
+    if secret.exists() {
+        return Err(Error::new("KEY_EXISTS", format!("{} already exists; refusing to overwrite it", secret.display())));
+    }
+    write_private(&secret, &format!("{SE_PREFIX}{}\n", STANDARD.encode(blob)))?;
+    fs::write(&public_path, use05_receipt::passkey_public_text(public)).map_err(|e| Error::io("writing the public key", e))
+}
+
+/// Every approver key this person has here, as the ids the gate compares owners with.
+pub fn approver_ids() -> Vec<String> {
+    let mut ids: Vec<String> = touch_id_public().map(|p| PublicKey::Passkey(p).id()).into_iter().collect();
+    ids.extend(approver_public().map(|k| use05_receipt::key_id(&k)));
+    ids
+}
+
+/// The key that names this person as the owner of work started here: Touch ID if they have it.
+pub fn owner_key_id() -> Option<String> {
+    approver_ids().into_iter().next()
 }
 
 /// Is the approver key protected by a passphrase?

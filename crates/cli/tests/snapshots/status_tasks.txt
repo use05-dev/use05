@@ -12,4 +12,4 @@ Controls   ○ agent hooks off
            ○ CI gate off
 
 ────────────────────────────────────────────────────────────────────────────────────────────────────
-Next: use05 brief --task <TASK>   read what it changed, then approve it
+Next: use05 approve --task <TASK>   it shows what holds it back, then asks for you

@@ -573,6 +573,61 @@ fn tidy(ctx: &Ctx, including_here: bool) {
     let _ = use05_core::branches::tidy(&ctx.store, &ctx.policy, ctx.top(), including_here);
 }
 
+/// The line a person reads when the agent stops (D91): what 05 decided about the work, and the
+/// one command to run, if any. Nothing when the agent changed nothing.
+fn verdict_line(ctx: &Ctx, task: &use05_core::task::Task, landed: Option<&crate::report::Report>) -> Option<String> {
+    use use05_core::gate::{CheckState, Decision, Effect};
+    let plural = |n: usize, word: &str| format!("{n} {word}{}", if n == 1 { "" } else { "s" });
+    if let Some(r) = landed.filter(|r| r.code == "LANDED") {
+        let target = r.details["target"].as_str().unwrap_or("its target");
+        return Some(if r.details["pushed"] == true {
+            format!("05: \"{}\" passed its checks, landed on {target} and was pushed. Nothing needs you.", task.title)
+        } else {
+            format!("05: \"{}\" passed its checks and landed on {target}. Push when you are ready: git push origin {target}", task.title)
+        });
+    }
+    let target = ctx.target(None).ok()?;
+    let gate = ctx.gate(&target).ok()?;
+    if gate.changed.is_empty() {
+        return None;
+    }
+    let files = plural(gate.changed.len(), "file");
+    let passed = !gate.checks.is_empty() && gate.checks.iter().filter(|c| c.required).all(|c| matches!(c.state, CheckState::Passed { .. }));
+    let checks = if passed { ", checks passed" } else { "" };
+    let first = gate.findings.iter().find(|f| f.effect >= Effect::Wait);
+    let landing = task.branch.as_deref().is_some_and(|b| !use05_core::branches::is_kept(&ctx.policy, b));
+    Some(match gate.decision {
+        Decision::Allow if use05_core::brief::label_of(&gate) == use05_core::brief::Label::Allow => {
+            if landing {
+                format!("05: allowed, nothing to read ({files}{checks}). Land it: use05 land")
+            } else {
+                format!("05: allowed, nothing to read ({files}{checks}). Commit and push when you are ready.")
+            }
+        }
+        Decision::Allow => format!("05: allowed, with notes worth a look ({files}{checks}): use05 brief"),
+        Decision::Wait => {
+            let waiting: Vec<&str> = gate.checks.iter().filter(|c| c.required && matches!(c.state, CheckState::Missing | CheckState::Stale)).map(|c| c.name.as_str()).collect();
+            if waiting.is_empty() {
+                format!("05: waiting ({files}): {}", first.map_or("see use05 brief".to_string(), |f| f.message.clone()))
+            } else {
+                format!("05: {} still to run ({files}); they run when you push, or now: use05 prove", waiting.join(", "))
+            }
+        }
+        Decision::ApprovalRequired => format!("05: needs you ({files}): {}. Approve: use05 approve", first.map_or("a person must approve".to_string(), |f| f.message.trim_end_matches('.').to_string())),
+        Decision::Deny => format!("05: blocked ({files}): {}. See: use05 brief", first.map_or("a rule no approval clears".to_string(), |f| f.message.trim_end_matches('.').to_string())),
+    })
+}
+
+/// Has this line not been said for this task yet? A turn that changes nothing says nothing.
+fn said_new(ctx: &Ctx, task: &str, line: &str) -> bool {
+    let path = ctx.store.state_dir().join(format!("{task}.said"));
+    if std::fs::read_to_string(&path).is_ok_and(|said| said == line) {
+        return false;
+    }
+    let _ = std::fs::write(&path, line);
+    true
+}
+
 fn with_context(event: &str, output: Option<Value>, notes: &[String]) -> Option<Value> {
     if notes.is_empty() || !["PreToolUse", "PostToolUse", "UserPromptSubmit", "SessionStart", "SubagentStart"].contains(&event) {
         return output;
@@ -734,11 +789,18 @@ fn run_inner(agent: &str, event: &str) -> Result<Option<Value>, String> {
             // log says whether this was asked yet; without a log, never ask while looping.
             let asked = !recording || log::read(&state, &task.id).iter().any(|e| e["event"]["event"] == "asked_to_update");
             let missing = if failed.is_empty() && agent != "codex" && (!looping || !asked) { unmet_requires(&ctx) } else { Vec::new() };
-            // With `land = "auto"`, a change the gate allows lands when its agent stops (D69).
+            // With `land = "auto"`, a change the gate allows lands when its agent stops (D69), and
+            // with `push = "auto"` it is pushed too (D91).
+            let mut landed = None;
             if failed.is_empty() && missing.is_empty() && ctx.policy.branches.land == use05_core::policy::LandMode::Auto {
                 if let Ok(current) = ctx.store.load(&task.id) {
-                    let report = crate::cmd::land::land_task(&ctx, current);
-                    note(json!({ "event": "auto_land", "code": report.code, "message": report.headline }));
+                    if crate::cmd::land::ready(&ctx, &current).is_some() {
+                        let mut report = crate::cmd::land::land_task(&ctx, current);
+                        let push = crate::cmd::land::Then::choose(ctx.policy.branches.push == use05_core::policy::LandMode::Auto, false, false);
+                        crate::cmd::land::push_after(&ctx, &mut report, push, true);
+                        note(json!({ "event": "auto_land", "code": report.code, "message": report.headline }));
+                        landed = Some(report);
+                    }
                 }
             }
             tidy(&ctx, false);
@@ -759,7 +821,11 @@ fn run_inner(agent: &str, event: &str) -> Result<Option<Value>, String> {
                         "reason": format!("05: you changed {}{more}, and the policy says {also} must change with it. Update it before you finish.", shown.join(", ")),
                     })))
                 }
-                _ => Ok(None),
+                // Nothing for the agent to fix: tell the person, in the agent's window, where the
+                // work stands and the one thing to do, if any (D91). Said again only when it changes.
+                // Codex is left out until its hooks show such a line.
+                _ if agent == "codex" => Ok(None),
+                _ => Ok(verdict_line(&ctx, &task, landed.as_ref()).filter(|line| said_new(&ctx, &task.id, line)).map(|line| json!({ "systemMessage": line }))),
             }
         }
         "SessionEnd" => {
@@ -794,6 +860,9 @@ fn plain(output: Value) -> Value {
     }
     if let Some(c) = field("additionalContext") {
         out.insert("context".into(), c);
+    }
+    if let Some(m) = output.get("systemMessage").cloned() {
+        out.insert("message".into(), m);
     }
     Value::Object(out)
 }

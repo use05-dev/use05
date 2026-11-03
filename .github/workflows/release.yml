@@ -34,7 +34,14 @@ jobs:
         env:
           CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER: aarch64-linux-gnu-gcc
           CC_aarch64_unknown_linux_musl: aarch64-linux-gnu-gcc
-        run: cargo build --release -p use05 -p use05-cloud --target ${{ matrix.target }}
+          # A macOS release must have the Touch ID approver key (D91): fail rather than ship without it.
+          USE05_REQUIRE_TOUCH_ID: ${{ runner.os == 'macOS' && '1' || '' }}
+        run: |
+          [ -n "$USE05_REQUIRE_TOUCH_ID" ] || unset USE05_REQUIRE_TOUCH_ID
+          cargo build --release -p use05 -p use05-cloud --target ${{ matrix.target }}
+      - name: Touch ID is in the macOS build
+        if: runner.os == 'macOS'
+        run: otool -L target/${{ matrix.target }}/release/use05 | grep -q CryptoKit
       - name: Smoke test
         if: matrix.target != 'x86_64-apple-darwin'
         run: |

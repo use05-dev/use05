@@ -14,7 +14,7 @@ pub use dsse::{Envelope, EnvelopeSignature, Fault, PAYLOAD_TYPE, WebAuthnSig, co
 pub use keys::{
     KeyError, PublicKey, key_id, parse_any_public_key, parse_public_key, parse_secret_key, public_key_text, secret_key_text,
 };
-pub use passkey::{PasskeyKey, passkey_challenge, passkey_public_text};
+pub use passkey::{LocalAssertion, PasskeyKey, TOUCH_ID_SITE, local_assertion, passkey_challenge, passkey_entry, passkey_public_text};
 pub use statement::{
     APPROVAL_TYPE, AgentRef, AnyStatement, Approval, ApprovalScope, BYPASS_TYPE, Bypass, Command, Completion,
     DISCARD_TYPE, Decision, Declaration, Discard, Environment, Evidence, INTENT_TYPE, LOG_TYPE, LogSeal, ORG_TYPE,

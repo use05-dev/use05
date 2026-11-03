@@ -1,0 +1,14 @@
+✓ Approved the outcome on <TREE12> (staged files), and landed it on main
+  by       approver
+  reason   (none given)
+  expires  <TIMESTAMP>
+  landed   claude/two → main (<TREE12>)
+  removed  worktree <WORKTREES>/claude-two
+  deleted  branch claude/two
+  Signed by approver key <TREE12> and stored on branch 05-receipts/<ID>.
+
+Next: push main when you are ready: git push origin main
+You are about to approve the outcome on <TREE12> (staged files).
+  1 file(s) changed, risk high.
+  - PROTECTED_PATH: 1 protected file(s) changed; the change edits 05's own rules, which only take effect after it is merged
+  The approval is bound to this exact content and expires in 7 days.

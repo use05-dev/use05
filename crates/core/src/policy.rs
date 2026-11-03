@@ -328,11 +328,20 @@ pub struct BranchPolicy {
     /// Where work lands unless a declaration names another; default: the remote's default branch.
     pub target: Option<String>,
     pub land: LandMode,
+    /// After a change lands: `manual`, you push; `auto`, 05 pushes the landing branch to origin,
+    /// through the pre-push hook like any push (D91). Not written out while manual, so existing
+    /// digests hold.
+    #[serde(skip_serializing_if = "is_manual")]
+    pub push: LandMode,
     /// An agent that starts behind origin's copy of the target: at session start the hook fetches
     /// and tells it; the brief says how far behind it started. Off (`allow`) unless set, and then
     /// not written out, so existing digests hold.
     #[serde(skip_serializing_if = "is_allow")]
     pub fresh_base: Severity,
+}
+
+fn is_manual(m: &LandMode) -> bool {
+    *m == LandMode::Manual
 }
 
 fn is_allow(s: &Severity) -> bool {
@@ -351,7 +360,7 @@ pub enum LandMode {
 impl Default for BranchPolicy {
     fn default() -> Self {
         let v = |items: &[&str]| items.iter().map(|s| s.to_string()).collect();
-        BranchPolicy { keep: v(&["main", "master", "develop", "release/*"]), work: v(&["05/*", "agent/*", "claude/*", "codex/*"]), target: None, land: LandMode::Manual, fresh_base: Severity::Allow }
+        BranchPolicy { keep: v(&["main", "master", "develop", "release/*"]), work: v(&["05/*", "agent/*", "claude/*", "codex/*"]), target: None, land: LandMode::Manual, push: LandMode::Manual, fresh_base: Severity::Allow }
     }
 }
 
@@ -818,6 +827,7 @@ pub fn explain(repo: &Policy, effective: &Policy) -> Vec<Row> {
     let env = |p: &Policy| p.env.allow.as_ref().map_or("unrestricted".to_string(), |a| a.join(", "));
     let target = |p: &Policy| p.branches.target.clone().unwrap_or_else(|| "the remote's default branch".to_string());
     let land = |p: &Policy| format!("{:?}", p.branches.land).to_lowercase();
+    let push = |p: &Policy| format!("{:?}", p.branches.push).to_lowercase();
     let rules = |p: &Policy| if p.risk.rules.is_empty() { "built-in only".to_string() } else { format!("built-in, plus {}", p.risk.rules.iter().map(|r| format!("{} ({})", r.category, r.level.word())).collect::<Vec<_>>().join(", ")) };
     let exempt = |p: &Policy| match (p.risk.exempt.is_empty(), p.risk.exempt_allowed) {
         (_, false) => "not allowed".to_string(),
@@ -855,6 +865,7 @@ pub fn explain(repo: &Policy, effective: &Policy) -> Vec<Row> {
         row("branches.work", default.branches.work.join(", "), repo.branches.work.join(", "), effective.branches.work.join(", ")),
         row("branches.target", target(&default), target(repo), target(effective)),
         row("branches.land", land(&default), land(repo), land(effective)),
+        row("branches.push", push(&default), push(repo), push(effective)),
         row("branches.fresh_base", word(default.branches.fresh_base), word(repo.branches.fresh_base), word(effective.branches.fresh_base)),
         row("require", require(&default), require(repo), require(effective)),
         row("risk.exempt", exempt(&default), exempt(repo), exempt(effective)),

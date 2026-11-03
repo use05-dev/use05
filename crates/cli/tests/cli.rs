@@ -70,6 +70,8 @@ impl Sandbox {
             .env("PATH", format!("{}:{}", bin_dir(), std::env::var("PATH").unwrap()))
             .env("HOME", self.home.path())
             .env("USE05_HOME", self.home.path())
+            // The Secure Enclave is this Mac's, not the sandbox's: tests use the passphrase key.
+            .env("USE05_NO_TOUCH_ID", "1")
             .env("LANG", "C.UTF-8")
             .env("COLUMNS", "100")
             .env("GIT_AUTHOR_NAME", "t")
@@ -1882,7 +1884,7 @@ fn a_failed_check_at_stop_asks_claude_to_continue_once_and_codex_only_records_it
     let v: Value = serde_json::from_slice(&blocked.stdout).unwrap_or_else(|e| panic!("not JSON ({e}): {}", text(&blocked)));
     assert_eq!(v["decision"], "block", "{v}");
     assert!(v["reason"].as_str().unwrap().contains("test"), "{v}");
-    assert!(stop(&s, "claude-code", "s2", true).stdout.is_empty(), "the loop guard: never twice");
+    assert!(no_block(&stop(&s, "claude-code", "s2", true)), "the loop guard: never twice");
     s.write("main.rs", "fn main() { 4; }\n"); // a new tree, not yet proved
     let codex = s.run_with_stdin(&["hook", "codex", "Stop"], &serde_json::json!({ "session_id": "s3", "cwd": s.dir.path(), "hook_event_name": "Stop" }).to_string());
     assert!(codex.stdout.is_empty(), "{}", text(&codex));
@@ -2938,7 +2940,7 @@ fn guided_init_asks_about_the_team_branches_and_rules_and_writes_the_answers() {
     // team: small; lands on: main; main=dev, uat=uat, production=prod; keep checks; add lint;
     // protected: none; locked: LICENSE; append-only: none; do-not-read: none; docs: none;
     // outside plan, weakened tests, fresh base, landing: defaults; write: yes.
-    let answers = "2\n\n\n\n\n\n\nlint: npm run lint\n\n\nLICENSE\n\n\n\n\n\n\n\n\n";
+    let answers = "2\n\n\n\n\n\n\nlint: npm run lint\n\n\nLICENSE\n\n\n\n\n\n\n\n\n\n";
     let out = s.run_with_stdin(&["init", "--guided"], answers);
     assert_eq!(code(&out), 0, "{}", text(&out));
     let shown = text(&out);
@@ -2963,7 +2965,7 @@ fn policy_edit_changes_an_existing_setup_and_says_how_the_change_takes_effect() 
     // keep the current rules; lands on main; environments: defaults; checks kept, none added;
     // paths and docs: defaults; outside plan: refuse; tests, fresh base: default; landing:
     // automatic; write: yes.
-    let answers = "\n\n\n\n\n\n\n\n\n\n\n\n\n4\n\n\n2\n\n";
+    let answers = "\n\n\n\n\n\n\n\n\n\n\n\n\n4\n\n\n2\n\n\n";
     let out = s.run_with_stdin(&["policy", "--edit", "--guided"], answers);
     assert_eq!(code(&out), 0, "{}", text(&out));
     let p = policy_of(&s);
@@ -3197,7 +3199,7 @@ fn the_review_says_what_the_scope_choice_does_and_long_paths_are_not_cut() {
     let long = "infra/terraform/environments/production-europe-west/customer-facing/**";
     // team, landing, envs x3, add none, keep checks, add none, protected = long, locked, append,
     // no-read, docs, scope = 2 (ask me), tests, fresh base, land, write.
-    let answers = format!("\n\n\n\n\n\n\n\n{long}\n\n\n\n\n2\n\n\n\n\n");
+    let answers = format!("\n\n\n\n\n\n\n\n{long}\n\n\n\n\n2\n\n\n\n\n\n");
     let out = s.run_with_stdin(&["init", "--guided"], &answers);
     assert_eq!(code(&out), 0, "{}", text(&out));
     let review = text(&out);
@@ -3353,10 +3355,10 @@ fn a_require_rule_is_told_at_start_and_the_agent_is_asked_to_finish_it_at_stop()
     assert_eq!(v["decision"], "block", "{v}");
     let reason = v["reason"].as_str().unwrap();
     assert!(reason.contains("src/api.rs") && reason.contains("docs/**"), "{reason}");
-    assert!(stop(true).stdout.is_empty(), "asked once, never in a loop");
+    assert!(no_block(&stop(true)), "asked once, never in a loop");
 
     s.write("docs/api.md", "# API\n\napi() changed.\n");
-    assert!(stop(false).stdout.is_empty(), "the rule is met");
+    assert!(no_block(&stop(false)), "the rule is met");
     let brief = s.run(&["brief", "--task", &find_task(&s, "docs"), "--json"]);
     assert!(!finding_codes(&brief).contains(&"ALSO_CHANGE_MISSING".to_string()), "{}", text(&brief));
 }
@@ -3366,7 +3368,7 @@ fn the_setup_asks_which_folders_change_with_code_and_how_strict_fresh_base_is() 
     let s = with_environment_branches();
     // team, landing, envs x3, add none, keep checks, add none, protected, locked, append-only,
     // no-read, docs = docs/**, scope, tests, fresh base = 4 (refuse), land, write.
-    let answers = "\n\n\n\n\n\n\n\n\n\n\n\ndocs/**\n\n\n4\n\n\n";
+    let answers = "\n\n\n\n\n\n\n\n\n\n\n\ndocs/**\n\n\n4\n\n\n\n";
     let out = s.run_with_stdin(&["init", "--guided"], answers);
     assert_eq!(code(&out), 0, "{}", text(&out));
     let shown = text(&out);
@@ -3399,7 +3401,7 @@ fn rules_from_0_0_6_raise_an_older_policys_minimum_version() {
     s.write(".05/policy.toml", &older);
     // team, landing, envs x3, add none, keep checks, add none, paths x4, docs, scope, tests,
     // fresh base = 2 (tell the agent), land, write.
-    let out = s.run_with_stdin(&["policy", "--edit", "--guided"], &format!("{}2\n\n\n", "\n".repeat(15)));
+    let out = s.run_with_stdin(&["policy", "--edit", "--guided"], &format!("{}2\n\n\n\n", "\n".repeat(15)));
     assert_eq!(code(&out), 0, "{}", text(&out));
     let text = fs::read_to_string(s.path(".05/policy.toml")).unwrap();
     assert!(text.contains("fresh_base = \"warn\"") && text.contains("min_version = \"0.0.6\""), "{text}");
@@ -3464,7 +3466,7 @@ fn the_stop_reminder_sees_unstaged_updates_and_still_comes_after_a_failed_check(
     s.write("src/api.rs", "pub fn api() { /* v2 */ }\n");
     s.git(&["add", "src/api.rs"]);
     s.write("docs/api.md", "# API\n\nv2.\n");
-    assert!(stop(false).stdout.is_empty(), "{}", text(&stop(false)));
+    assert!(no_block(&stop(false)), "{}", text(&stop(false)));
 
     // A failing check is reported first; the docs reminder still comes on the next stop, once.
     s.git(&["checkout", "-q", "--", "docs/api.md"]);
@@ -3478,7 +3480,7 @@ fn the_stop_reminder_sees_unstaged_updates_and_still_comes_after_a_failed_check(
     assert!(first["reason"].as_str().unwrap().contains("the check test failed"), "{first}");
     let second = json(&stop(true));
     assert!(second["reason"].as_str().unwrap().contains("docs/** must change"), "{second}");
-    assert!(stop(true).stdout.is_empty(), "never asked twice");
+    assert!(no_block(&stop(true)), "never asked twice");
 }
 
 // ---------------------------------------------------------------- passkeys and outside signers
@@ -4341,12 +4343,158 @@ fn bare_use05_in_a_repository_is_one_page_of_who_needs_you_who_is_working_and_wh
     assert!(busy.starts_with("Working") && busy.contains(&working_id), "{busy}");
     let landed = line("Update the docs");
     assert!(landed.starts_with("Recent") && landed.contains(&done_id) && landed.contains("landed on main"), "{landed}");
-    assert!(shown.contains("Next: use05 brief --task"), "{shown}");
+    assert!(shown.contains("Next: use05 approve --task"), "{shown}");
     assert!(!shown.contains("Open a task"), "no menu without a terminal:\n{shown}");
     snapshot("status_tasks", &s, &out);
 
-    // At a terminal the menu opens a task, and what can be done with it.
-    let (picked, screen) = on_a_terminal(&s, &[], &["1", "q"]);
+    // At a terminal the one thing to do comes first, and Enter does it (D91); the menu still
+    // opens a task, and what can be done with it.
+    let (picked, screen) = on_a_terminal(&s, &[], &["2", "q"]);
     assert_eq!(picked, 0, "{screen}");
-    assert!(plain(&screen).contains("Open a task") && plain(&screen).contains("Which task?"), "{}", plain(&screen));
+    let screen = plain(&screen);
+    assert!(screen.contains("1  Approve \"") && screen.contains("Enter does 1"), "{screen}");
+    assert!(screen.contains("Open a task") && screen.contains("Which task?"), "{screen}");
+}
+
+/// A Stop hook that asks the agent for nothing: no answer, or only the line for the person (D91).
+fn no_block(out: &std::process::Output) -> bool {
+    out.stdout.is_empty() || serde_json::from_slice::<Value>(&out.stdout).is_ok_and(|v| v.get("decision").is_none() && v.get("systemMessage").is_some())
+}
+
+// ----------------------------------------------------------------------------- the daily flow (D91)
+
+/// A task on its own agent branch whose committed change needs a person: it edits 05's rules.
+fn protected_task(s: &Sandbox, holder: &TempDir, branch: &str) -> (PathBuf, String) {
+    let wt = agent_worktree(s, holder, branch);
+    let id = task_in(s, &wt, "Tighten the rules");
+    let policy = fs::read_to_string(wt.join(".05/policy.toml")).unwrap();
+    fs::write(wt.join(".05/policy.toml"), policy + "\n# tightened\n").unwrap();
+    git_at(&wt, &["commit", "-qam", "tighten"]);
+    assert_eq!(code(&s.run(&["prove", "--repo", wt.to_str().unwrap()])), 0);
+    (wt, id)
+}
+
+#[test]
+fn approving_a_change_lands_it_when_asked_or_when_the_policy_lands_on_its_own() {
+    let s = Sandbox::initialised();
+    s.approver();
+    let holder = tempfile::tempdir().unwrap();
+
+    // Without a terminal and without --land, the approval says how to land it, and lands nothing.
+    let (wt, id) = protected_task(&s, &holder, "claude/one");
+    let before = s.git(&["rev-parse", "main"]);
+    let v = json(&s.run_with_stdin(&["approve", "--task", &id, "--passphrase-stdin", "--json"], "correct horse\n"));
+    assert_eq!(v["code"], "APPROVED", "{v}");
+    assert!(v["next"].as_str().is_some_and(|n| n.contains(&format!("use05 land --task {id}"))), "{v}");
+    assert_eq!(s.git(&["rev-parse", "main"]), before, "nothing landed");
+    assert_eq!(code(&s.run(&["land", "--task", &id])), 0, "and it can be landed");
+    assert!(!wt.exists());
+
+    // --land lands it in the same step.
+    let (_, id) = protected_task(&s, &holder, "claude/two");
+    let out = s.run_with_stdin(&["approve", "--task", &id, "--land", "--passphrase-stdin"], "correct horse\n");
+    assert_eq!(code(&out), 0, "{}", text(&out));
+    assert!(s.git(&["branch", "--list", "claude/two"]).is_empty(), "the branch was cleaned up");
+    let holder_real = fs::canonicalize(holder.path()).unwrap().display().to_string();
+    let masked = Output { status: out.status, stdout: String::from_utf8_lossy(&out.stdout).replace(&holder_real, "<WORKTREES>").into_bytes(), stderr: out.stderr.clone() };
+    snapshot("approve_land", &s, &masked);
+
+    // With land = "auto" an approval lands it without being asked.
+    let policy = fs::read_to_string(s.path(".05/policy.toml")).unwrap();
+    s.write(".05/policy.toml", &policy.replace("land = \"manual\"", "land = \"auto\""));
+    s.commit_all("land on its own");
+    s.run_with_stdin(&["approve", "--tree", "HEAD", "--passphrase-stdin"], "correct horse\n");
+    let (wt, id) = protected_task(&s, &holder, "claude/three");
+    let head = git_at(&wt, &["rev-parse", "HEAD"]);
+    let v = json(&s.run_with_stdin(&["approve", "--task", &id, "--passphrase-stdin", "--json"], "correct horse\n"));
+    assert_eq!(v["details"]["landed"], true, "{v}");
+    assert_eq!(s.git(&["rev-parse", "main"]), head);
+}
+
+#[test]
+fn land_push_pushes_the_landing_branch_through_the_pre_push_hook() {
+    let s = Sandbox::initialised();
+    let remote = tempfile::tempdir().unwrap();
+    assert!(Command::new("git").args(["init", "-q", "--bare", "-b", "main", &remote.path().display().to_string()]).status().unwrap().success());
+    s.git(&["remote", "add", "origin", &remote.path().display().to_string()]);
+    s.git(&["push", "-q", "origin", "main"]);
+    let holder = tempfile::tempdir().unwrap();
+    let wt = agent_worktree(&s, &holder, "claude/push");
+    let id = task_in(&s, &wt, "Push it");
+    fs::write(wt.join("main.rs"), "fn main() { 12; }\n").unwrap();
+    git_at(&wt, &["commit", "-qam", "push it"]);
+    assert_eq!(code(&s.run(&["prove", "--repo", wt.to_str().unwrap()])), 0);
+    let head = git_at(&wt, &["rev-parse", "HEAD"]);
+
+    // Without a terminal or --push, landing leaves the push to the person.
+    let out = s.run(&["land", "--task", &id, "--push", "--json"]);
+    let v = json(&out);
+    assert_eq!((v["code"].as_str(), v["details"]["pushed"].as_bool()), (Some("LANDED"), Some(true)), "{v}");
+    assert!(v["next"].is_null(), "nothing is left to do: {v}");
+    let remote_main = Command::new("git").arg("-C").arg(remote.path()).args(["rev-parse", "main"]).output().unwrap();
+    assert_eq!(String::from_utf8_lossy(&remote_main.stdout).trim(), head);
+}
+
+#[test]
+fn when_the_agent_stops_the_person_reads_where_the_work_stands_once() {
+    let s = Sandbox::with_agent_hooks();
+    assert_eq!(code(&s.run(&["prove", "test"])), 0);
+    hook(&s, "s1", "PostToolUse", "Edit", "main.rs");
+    s.write("main.rs", "fn main() { 13; }\n");
+    s.git(&["add", "-A"]);
+    assert_eq!(code(&s.run(&["prove"])), 0);
+    let v = json(&stop(&s, "claude-code", "s1", false));
+    let line = v["systemMessage"].as_str().unwrap_or_else(|| panic!("{v}"));
+    assert!(v.get("decision").is_none(), "nothing is asked of the agent: {v}");
+    assert!(line.starts_with("05: allowed, nothing to read (1 file, checks passed)"), "{line}");
+    assert!(stop(&s, "claude-code", "s1", false).stdout.is_empty(), "the same news is not said twice");
+
+    // A change that needs the person says so, and how to approve it.
+    s.write(".05/policy.toml", &(fs::read_to_string(s.path(".05/policy.toml")).unwrap() + "\n# edit\n"));
+    s.git(&["add", "-A"]);
+    let v = json(&stop(&s, "claude-code", "s1", false));
+    let line = v["systemMessage"].as_str().unwrap_or_else(|| panic!("{v}"));
+    assert!(line.starts_with("05: needs you") && line.ends_with("Approve: use05 approve"), "{line}");
+    // The generic answer carries it as `message`.
+    let generic = s.run_with_stdin(&["hook", "generic", "Stop"], &serde_json::json!({ "session_id": "s1", "cwd": s.dir.path(), "hook_event_name": "Stop" }).to_string());
+    assert!(generic.stdout.is_empty() || json(&generic)["message"].is_string(), "{}", text(&generic));
+}
+
+#[test]
+fn a_push_that_needs_a_person_is_approved_right_there_at_the_terminal() {
+    let s = Sandbox::initialised();
+    s.approver();
+    let base = s.git(&["rev-parse", "HEAD"]);
+    s.write(".05/policy.toml", &(fs::read_to_string(s.path(".05/policy.toml")).unwrap() + "\n# tightened\n"));
+    s.commit_all("tighten");
+    let local = s.git(&["rev-parse", "HEAD"]);
+    let refs = format!("refs/heads/main {local} refs/heads/main {base}");
+    // Declined: the push stays stopped.
+    let (no, screen) = on_a_terminal(&s, &["gate", "--git-hook", "pre-push"], &[&refs, "\x04", "n"]);
+    assert_eq!(no, 1, "{screen}");
+    assert!(plain(&screen).contains("Approve it now?"), "{}", plain(&screen));
+    // Enter, then the passphrase: approved, and the push goes on.
+    let (yes, screen) = on_a_terminal(&s, &["gate", "--git-hook", "pre-push"], &[&refs, "\x04", "correct horse"]);
+    assert_eq!(yes, 0, "{}", plain(&screen));
+    assert!(plain(&screen).contains("05: Approved"), "{}", plain(&screen));
+    assert!(!screen.contains("correct horse"), "the passphrase is never echoed");
+}
+
+#[test]
+fn the_bare_page_offers_to_land_what_is_allowed_and_enter_does_it() {
+    let s = Sandbox::initialised();
+    let holder = tempfile::tempdir().unwrap();
+    let wt = agent_worktree(&s, &holder, "claude/ready");
+    let id = task_in(&s, &wt, "Ready to land");
+    fs::write(wt.join("main.rs"), "fn main() { 14; }\n").unwrap();
+    git_at(&wt, &["commit", "-qam", "ready"]);
+    assert_eq!(code(&s.run(&["prove", "--repo", wt.to_str().unwrap()])), 0);
+    s.run(&["finish", "--task", &id, "--repo", wt.to_str().unwrap(), "--outcome", "done"]);
+    let shown = text(&s.run(&[]));
+    assert!(shown.contains(&format!("Next: use05 land --task {id}")), "{shown}");
+    let head = git_at(&wt, &["rev-parse", "HEAD"]);
+    let (done, screen) = on_a_terminal(&s, &[], &[""]);
+    assert_eq!(done, 0, "{}", plain(&screen));
+    assert!(plain(&screen).contains("1  Land \"Ready to land\""), "{}", plain(&screen));
+    assert_eq!(s.git(&["rev-parse", "main"]), head, "Enter landed it");
 }

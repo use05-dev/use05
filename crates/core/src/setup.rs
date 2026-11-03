@@ -3,7 +3,7 @@
 
 use std::path::Path;
 
-use crate::policy::{IntentMode, Policy, Severity};
+use crate::policy::{IntentMode, LandMode, Policy, Severity};
 
 /// An environment's role on the ladder, lowest first.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -109,13 +109,15 @@ pub struct Preset {
     pub overlap: Severity,
     pub tests: Severity,
     pub approvals_min: u32,
+    /// How finished work lands: on its own for a person working alone (D91).
+    pub land: LandMode,
 }
 
 pub fn preset(team: Team) -> Preset {
     match team {
-        Team::Solo => Preset { intent: IntentMode::Inferred, scope: Severity::Warn, dependencies: Severity::Warn, overlap: Severity::Warn, tests: Severity::Approval, approvals_min: 1 },
-        Team::Small => Preset { intent: IntentMode::Risky, scope: Severity::Approval, dependencies: Severity::Approval, overlap: Severity::Approval, tests: Severity::Approval, approvals_min: 1 },
-        Team::Regulated => Preset { intent: IntentMode::Always, scope: Severity::Deny, dependencies: Severity::Approval, overlap: Severity::Deny, tests: Severity::Deny, approvals_min: 2 },
+        Team::Solo => Preset { intent: IntentMode::Inferred, scope: Severity::Warn, dependencies: Severity::Warn, overlap: Severity::Warn, tests: Severity::Approval, approvals_min: 1, land: LandMode::Auto },
+        Team::Small => Preset { intent: IntentMode::Risky, scope: Severity::Approval, dependencies: Severity::Approval, overlap: Severity::Approval, tests: Severity::Approval, approvals_min: 1, land: LandMode::Manual },
+        Team::Regulated => Preset { intent: IntentMode::Always, scope: Severity::Deny, dependencies: Severity::Approval, overlap: Severity::Deny, tests: Severity::Deny, approvals_min: 2, land: LandMode::Manual },
     }
 }
 
@@ -156,7 +158,7 @@ mod tests {
     #[test]
     fn presets_get_stricter_with_the_team() {
         let solo = preset(Team::Solo);
-        assert_eq!((solo.intent, solo.scope, solo.tests, solo.approvals_min), (IntentMode::Inferred, Severity::Warn, Severity::Approval, 1));
+        assert_eq!((solo.intent, solo.scope, solo.tests, solo.approvals_min, solo.land), (IntentMode::Inferred, Severity::Warn, Severity::Approval, 1, LandMode::Auto));
         let small = preset(Team::Small);
         assert_eq!((small.intent, small.scope, small.dependencies, small.overlap, small.approvals_min), (IntentMode::Risky, Severity::Approval, Severity::Approval, Severity::Approval, 1));
         let reg = preset(Team::Regulated);

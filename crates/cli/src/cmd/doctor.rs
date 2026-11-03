@@ -185,14 +185,22 @@ fn keys_section(d: &mut Diagnosis) {
     if pinned.skipped > 0 {
         d.keys.push(Line::problem(format!("{} line(s) of passkeys.pub are not a passkey and are ignored", pinned.skipped)));
     }
-    if keys::approver_exists() {
+    if let Some(k) = keys::touch_id_public() {
+        let id = short(&use05_receipt::PublicKey::Passkey(k).id());
+        if crate::touchid::supported() {
+            d.keys.push(Line::ok(format!("Touch ID approver key {id}: in this Mac's Secure Enclave, so only you, with {}, can approve", crate::touchid::method())));
+        } else {
+            d.keys.push(Line::problem(format!("Touch ID approver key {id} is here, but this build of 05 or this machine cannot use it")));
+        }
+    }
+    if keys::passphrase_approver_exists() {
         let id = keys::approver_public().map(|k| short(&use05_receipt::key_id(&k))).unwrap_or_else(|| "unknown".into());
         if keys::approver_protected() {
             d.keys.push(Line::ok(format!("approver key {id}: passphrase-protected, so an agent cannot approve for you")));
         } else {
             d.keys.push(Line::note(format!("approver key {id} has no passphrase: anything that can read the file can approve. Make a new one with a passphrase")));
         }
-    } else if keys::pinned_passkeys().is_empty() {
+    } else if keys::pinned_passkeys().is_empty() && keys::touch_id_public().is_none() {
         d.keys.push(Line::note("no approver key; you cannot approve changes from this machine"));
         if d.next.is_none() {
             d.next = Some("use05 key new --approver".into());
@@ -258,6 +266,9 @@ fn records_section(d: &mut Diagnosis, ctx: &Ctx) {
     }));
     if let Some(line) = crate::cmd::status::waiting_line(ctx.top()) {
         d.records.push(Line::problem(format!("inbox   {line}")));
+    }
+    for hint in use05_core::asked::hints(&ctx.store.state_dir(), use05_core::time::now_secs()) {
+        d.records.push(Line::note(format!("rules   {}", hint.sentence())));
     }
     // Nothing in the inbox vanishes silently: old and unreadable entries are named, with the way out.
     let scan = use05_core::inbox::scan(ctx.top(), use05_core::time::now_secs());

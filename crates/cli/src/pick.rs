@@ -22,16 +22,34 @@ pub fn choose(ui: &Ui, input: &mut impl BufRead, out: &mut impl Write, title: Op
 
 /// The question alone, for a list already on the screen: `count` things are numbered.
 pub fn ask(ui: &Ui, input: &mut impl BufRead, out: &mut impl Write, count: usize, quit: &str) -> Option<usize> {
+    ask_or(ui, input, out, count, quit, false)
+}
+
+/// [`ask`], where Enter alone picks the first entry: the one thing to do next (D91).
+pub fn ask_or(ui: &Ui, input: &mut impl BufRead, out: &mut impl Write, count: usize, quit: &str, enter_picks_first: bool) -> Option<usize> {
     let width = count.to_string().len();
     let _ = writeln!(out, "  {}  {quit}", ui.paint(Tone::Dim, &format!("{:>width$}", "q")));
-    let _ = write!(out, "\n> ");
+    let _ = write!(out, "\n{}> ", if enter_picks_first { ui.paint(Tone::Dim, "Enter does 1 ") } else { String::new() });
     let _ = out.flush();
     let mut line = String::new();
     if input.read_line(&mut line).ok()? == 0 {
         return None;
     }
+    if enter_picks_first && line.trim().is_empty() {
+        return Some(0);
+    }
     let pick: usize = line.trim().parse().ok()?;
     (1..=count).contains(&pick).then(|| pick - 1)
+}
+
+/// [`choose`], where Enter alone picks the first row.
+pub fn choose_first(ui: &Ui, input: &mut impl BufRead, out: &mut impl Write, rows: &[String], quit: &str) -> Option<usize> {
+    let _ = writeln!(out);
+    let width = rows.len().to_string().len();
+    for (i, row) in rows.iter().enumerate() {
+        let _ = writeln!(out, "  {}  {row}", ui.paint(Tone::Info, &format!("{:>width$}", i + 1)));
+    }
+    ask_or(ui, input, out, rows.len(), quit, true)
 }
 
 /// [`choose`] on the real terminal: the list on stderr, the answer from stdin.
@@ -58,6 +76,10 @@ mod tests {
         assert_eq!(ask("3\n", &["a", "b"]).0, None);
         assert_eq!(ask("0\n", &["a", "b"]).0, None);
         assert_eq!(ask("", &["a", "b"]).0, None, "end of input");
+        let rows = vec!["do it".to_string(), "other".to_string()];
+        let first = |answer: &str| choose_first(&Ui::fixed(80, true), &mut std::io::Cursor::new(answer.as_bytes().to_vec()), &mut Vec::new(), &rows, "Quit");
+        assert_eq!(first("\n"), Some(0), "Enter does the first, where it is the next step");
+        assert_eq!((first("2\n"), first("q\n"), first("")), (Some(1), None, None));
     }
 
     #[test]

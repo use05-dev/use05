@@ -288,7 +288,7 @@ pub fn passkey_void_of(by: &Signer, cosigners: &[Signer], approver: &str, trust:
     }
     let theirs = signer.iter().any(|k| match &k.holder {
         Holder::Person(p) => same(p, approver) && driver.is_none_or(|d| same(p, &d.name)),
-        Holder::ThisMachine => driver.is_none_or(|d| trust.this_person.as_deref() == Some(d.key_id.as_str())),
+        Holder::ThisMachine => driver.is_none_or(|d| trust.this_person.iter().any(|id| *id == d.key_id)),
         Holder::Unnamed => false,
     });
     if !theirs {

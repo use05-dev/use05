@@ -117,6 +117,9 @@ pub fn loosens(old: &Policy, new: &Policy) -> Vec<String> {
     if old.branches.land == LandMode::Manual && new.branches.land == LandMode::Auto {
         out.push("branches.land");
     }
+    if old.branches.push == LandMode::Manual && new.branches.push == LandMode::Auto {
+        out.push("branches.push");
+    }
     if lost(&old.branches.keep, &new.branches.keep) {
         out.push("branches.keep");
     }

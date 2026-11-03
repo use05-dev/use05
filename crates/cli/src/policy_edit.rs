@@ -24,6 +24,7 @@ pub struct Settings {
     pub approvals_min: u32,
     pub target: Option<String>,
     pub land: LandMode,
+    pub push: LandMode,
     pub environments: Vec<Environment>,
     pub checks: Vec<CheckDef>,
     pub protect_paths: Vec<String>,
@@ -47,6 +48,7 @@ impl Settings {
             approvals_min: p.approvals.min,
             target: p.branches.target.clone(),
             land: p.branches.land,
+            push: p.branches.push,
             environments: p.environment.clone(),
             checks: p.check.clone(),
             protect_paths: p.protect.paths.clone(),
@@ -111,6 +113,9 @@ pub fn apply(text: &str, s: &Settings) -> Result<String, String> {
     }
     if s.land != now.land {
         set(table(&mut doc, "branches"), "land", word(&s.land).into());
+    }
+    if s.push != now.push {
+        set(table(&mut doc, "branches"), "push", word(&s.push).into());
     }
     if s.fresh_base != now.fresh_base {
         set(table(&mut doc, "branches"), "fresh_base", word(&s.fresh_base).into());

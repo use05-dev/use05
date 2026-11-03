@@ -37,11 +37,13 @@ struct Status {
     tasks: Vec<Entry>,
     /// Outside a repository: the repositories listed, in the order shown, for picking one.
     repos: Vec<PathBuf>,
+    /// The first menu entry is the one thing to do next, and Enter does it (D91).
+    enter: bool,
 }
 
 impl Status {
     fn plain(text: String) -> Status {
-        Status { text, menu: vec![], tasks: vec![], repos: vec![] }
+        Status { text, menu: vec![], tasks: vec![], repos: vec![], enter: false }
     }
 }
 
@@ -87,7 +89,7 @@ fn machine(ui: &Ui) -> Option<Status> {
     out.raw(&ui.rule(ui.width));
     let first = &rows[0].0;
     out.raw(&format!("{} cd {} && use05", ui.paint(Tone::Info, "Next:"), shell_word(&first.display().to_string())));
-    Some(Status { text: out.finish(), menu: vec![], tasks: vec![], repos: rows.into_iter().map(|(p, ..)| p).collect() })
+    Some(Status { text: out.finish(), menu: vec![], tasks: vec![], repos: rows.into_iter().map(|(p, ..)| p).collect(), enter: false })
 }
 
 /// `~/code/x` for a path under the home directory.
@@ -137,7 +139,7 @@ fn gather(ui: &Ui, repo: &Path) -> Status {
             if let Some(n) = e.next {
                 out.raw(&format!("{} {n}", ui.paint(Tone::Info, "Next:")));
             }
-            return Status { text: out.finish(), menu: vec![("Check the setup".into(), Action::Run(vec!["doctor".into()]))], tasks: vec![], repos: vec![] };
+            return Status { text: out.finish(), menu: vec![("Check the setup".into(), Action::Run(vec!["doctor".into()]))], tasks: vec![], repos: vec![], enter: false };
         }
     };
     let top = ctx.top().to_path_buf();
@@ -152,6 +154,10 @@ fn gather(ui: &Ui, repo: &Path) -> Status {
     let listed = task_sections(ui, &mut out, &survey, now);
     if let Some(line) = waiting_line(&top) {
         out.section("Hooks", vec![Item::new(Glyph::Warn, Tone::Warn, line)]);
+    }
+    // A rule you always approve is costing you attention and catching nothing (D91).
+    if let Some(hint) = use05_core::asked::hints(&ctx.store.state_dir(), now).first() {
+        out.section("Tip", vec![Item::dim(hint.sentence())]);
     }
     out.blank();
 
@@ -236,7 +242,7 @@ fn gather(ui: &Ui, repo: &Path) -> Status {
     // better by naming the task that waits.
     let needs_next = match survey.waiting().as_slice() {
         [] => None,
-        [one] => Some(format!("use05 brief --task {}   read what it changed, then approve it", one.task.id)),
+        [one] => Some(format!("use05 approve --task {}   it shows what holds it back, then asks for you", one.task.id)),
         many => Some(format!("use05 approve   to choose which of the {} tasks waiting for you", many.len())),
     };
     let next = match (next, needs_next) {
@@ -244,6 +250,32 @@ fn gather(ui: &Ui, repo: &Path) -> Status {
         (n, w) => n.or(w),
     };
     let next = next.or_else(|| survey.entries.is_empty().then(|| "use05 start \"what you are about to do\"".to_string()));
+    // The one thing to do comes first in the menu, and Enter does it (D91).
+    let landable = survey.entries.iter().find(|e| {
+        e.verdict == pending::Verdict::Allowed && ctx.policy.branches.land == use05_core::policy::LandMode::Manual && e.task.branch.as_deref().is_some_and(|b| !use05_core::branches::is_kept(&ctx.policy, b))
+    });
+    let first: Option<(String, Vec<String>)> = match (setup.policy_file, survey.waiting().as_slice(), landable) {
+        (false, ..) => None,
+        (true, [one], _) => {
+            let mut args = vec!["approve".to_string(), "--task".into(), one.task.id.clone()];
+            if one.needs() == Some(Need::Plan) {
+                args.push("--intent".into());
+            }
+            Some((format!("Approve \"{}\"", one.task.title), args))
+        }
+        (true, [_, _, ..], _) => Some(("Approve: choose which task".into(), vec!["approve".into()])),
+        (true, [], Some(e)) => Some((format!("Land \"{}\"", e.task.title), vec!["land".into(), "--task".into(), e.task.id.clone()])),
+        (true, [], None) => menu.iter().find(|(l, _)| l == "Run the required checks").map(|(l, a)| (l.clone(), match a { Action::Run(v) => v.clone(), _ => vec![] })),
+    };
+    let next = match &first {
+        Some((_, args)) if args.first().is_some_and(|a| a == "land") => Some(format!("use05 {}   it is allowed; landing moves it to {}", args.join(" "), survey.target)),
+        _ => next,
+    };
+    let enter = first.is_some();
+    if let Some((label, args)) = first {
+        menu.retain(|(l, _)| *l != label);
+        menu.insert(0, (label, Action::Run(args)));
+    }
     if let Some(n) = next {
         out.raw(&format!("{} {n}", ui.paint(Tone::Info, "Next:")));
     } else {
@@ -254,7 +286,7 @@ fn gather(ui: &Ui, repo: &Path) -> Status {
     if use05_core::repos::list().iter().any(|r| r.path != use05_core::repos::root_of(&ctx.store.dirs)) {
         menu.push(("Other repositories on this machine".into(), Action::Repos));
     }
-    Status { text: out.finish(), menu, tasks: listed, repos: vec![] }
+    Status { text: out.finish(), menu, tasks: listed, repos: vec![], enter }
 }
 
 fn git_branch(top: &Path) -> String {
@@ -336,7 +368,12 @@ pub fn run_in(repo: &Path, interactive: bool) -> ExitCode {
         return ExitCode::SUCCESS;
     }
     let labels: Vec<String> = status.menu.iter().map(|(l, _)| l.clone()).collect();
-    let Some(index) = crate::pick::choose(&ui, &mut stdin.lock(), &mut std::io::stdout(), None, &labels, "Quit") else { return ExitCode::SUCCESS };
+    let picked = if status.enter {
+        crate::pick::choose_first(&ui, &mut stdin.lock(), &mut std::io::stdout(), &labels, "Quit")
+    } else {
+        crate::pick::choose(&ui, &mut stdin.lock(), &mut std::io::stdout(), None, &labels, "Quit")
+    };
+    let Some(index) = picked else { return ExitCode::SUCCESS };
     println!();
     match &status.menu[index].1 {
         Action::Run(args) => run_own(repo, args),

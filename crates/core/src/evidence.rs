@@ -31,9 +31,9 @@ pub struct TrustedKey {
 #[derive(Debug, Clone, Default)]
 pub struct Trust {
     pub keys: Vec<TrustedKey>,
-    /// The key id of this machine's approver key, when this machine's keys are trusted: the
-    /// person work started here is recorded under (D71).
-    pub this_person: Option<String>,
+    /// The key ids of this machine's approver keys (passphrase and Touch ID), when this
+    /// machine's keys are trusted: the person work started here is recorded under (D71, D91).
+    pub this_person: Vec<String>,
 }
 
 impl Trust {
@@ -57,14 +57,18 @@ impl Trust {
                 keys.push(TrustedKey { name: entry.name.clone(), role: entry.role, id: key.id(), key, holder });
             }
         }
-        let mut this_person = None;
+        let mut this_person = Vec::new();
         if include_machine_keys {
             if let Some(key) = keys::local_public().map(PublicKey::Ed25519) {
                 keys.push(TrustedKey { name: "this machine".into(), role: Role::Local, id: key.id(), key, holder: Holder::Unnamed });
             }
             if let Some(key) = keys::approver_public().map(PublicKey::Ed25519) {
-                this_person = Some(key.id());
+                this_person.push(key.id());
                 keys.push(TrustedKey { name: "you (approver)".into(), role: Role::Approver, id: key.id(), key, holder: Holder::ThisMachine });
+            }
+            if let Some(key) = keys::touch_id_public().map(PublicKey::Passkey) {
+                this_person.push(key.id());
+                keys.push(TrustedKey { name: "you (Touch ID)".into(), role: Role::Approver, id: key.id(), key, holder: Holder::ThisMachine });
             }
             for (name, passkey) in keys::pinned_passkeys() {
                 let key = PublicKey::Passkey(passkey);

@@ -154,7 +154,8 @@ mod file_tests {
 }
 
 /// The remote receipts travel through: `origin` if there is one, else the only remote.
-fn remote_name(top: &Path) -> Result<String> {
+/// The remote 05 pushes to: `origin`, or the only remote there is.
+pub fn remote_name(top: &Path) -> Result<String> {
     let remotes = git::text(top, &["remote"])?;
     let names: Vec<&str> = remotes.lines().filter(|l| !l.is_empty()).collect();
     if names.contains(&"origin") {

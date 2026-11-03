@@ -66,6 +66,41 @@ pub fn passkey_challenge(payload_type: &str, body: &[u8]) -> [u8; 32] {
     Sha256::digest(pae(payload_type, body)).into()
 }
 
+/// The site a Touch ID approver key signs for. It is not a website: it names the Mac's Secure
+/// Enclave as the authenticator, so the same checks as for any passkey apply (D91).
+pub const TOUCH_ID_SITE: &str = "touch-id";
+
+/// What a passkey on this machine signs for a statement, when no browser is involved (a Touch ID
+/// key in the Mac's Secure Enclave): authenticator data that says the person was present and
+/// verified, the client data naming the challenge, and the message to sign over both. The
+/// signature over `message`, with the first two, is an ordinary passkey signature (D91).
+pub struct LocalAssertion {
+    pub authenticator_data: Vec<u8>,
+    pub client_data_json: Vec<u8>,
+    pub message: Vec<u8>,
+}
+
+pub fn local_assertion(rp_id: &str, payload_type: &str, body: &[u8]) -> LocalAssertion {
+    let mut auth = Sha256::digest(rp_id.as_bytes()).to_vec();
+    auth.push(USER_PRESENT | USER_VERIFIED);
+    auth.extend_from_slice(&[0, 0, 0, 0]);
+    let challenge = URL_SAFE_NO_PAD.encode(passkey_challenge(payload_type, body));
+    let client = serde_json::json!({ "type": "webauthn.get", "challenge": challenge, "origin": format!("https://{rp_id}"), "crossOrigin": false });
+    let client = serde_json::to_vec(&client).expect("serialises");
+    let mut message = auth.clone();
+    message.extend_from_slice(&Sha256::digest(&client));
+    LocalAssertion { authenticator_data: auth, client_data_json: client, message }
+}
+
+/// The envelope entry for a passkey signature (DER ECDSA) made over [`LocalAssertion::message`].
+pub fn passkey_entry(key: &PasskeyKey, assertion: &LocalAssertion, der: &[u8]) -> EnvelopeSignature {
+    EnvelopeSignature {
+        keyid: Some(crate::PublicKey::Passkey(key.clone()).id()),
+        sig: STANDARD.encode(der),
+        webauthn: Some(WebAuthnSig { authenticator_data: STANDARD.encode(&assertion.authenticator_data), client_data_json: STANDARD.encode(&assertion.client_data_json) }),
+    }
+}
+
 fn mismatch() -> Fault {
     Fault::invalid("SIGNATURE_MISMATCH", "the signature does not match this receipt and the key you supplied")
 }
@@ -146,6 +181,22 @@ mod tests {
     use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD};
     use p256::ecdsa::signature::Signer;
     use sha2::{Digest, Sha256};
+
+    #[test]
+    fn a_local_assertion_verifies_as_a_passkey_signature_and_only_for_its_statement() {
+        let sk = authenticator();
+        let key = key_of(&sk, TOUCH_ID_SITE);
+        let body = approval_body("t1");
+        let a = local_assertion(TOUCH_ID_SITE, PAYLOAD_TYPE, &body);
+        let sig: p256::ecdsa::Signature = sk.sign(&a.message);
+        let envelope = Envelope { payload: STANDARD.encode(&body), payload_type: PAYLOAD_TYPE.into(), signatures: vec![passkey_entry(&key, &a, sig.to_der().as_bytes())] };
+        assert!(verify_any_with(&envelope.to_json_bytes(), &PublicKey::Passkey(key.clone())).is_ok());
+        // The same signature over another statement does not count.
+        let other = Envelope { payload: STANDARD.encode(approval_body("t2")), ..envelope.clone() };
+        assert!(verify_any_with(&other.to_json_bytes(), &PublicKey::Passkey(key.clone())).is_err());
+        // Nor for a key made for another site.
+        assert!(verify_any_with(&envelope.to_json_bytes(), &PublicKey::Passkey(key_of(&sk, "console.example"))).is_err());
+    }
 
     const RP: &str = "console.example";
     const ORIGIN: &str = "https://console.example";

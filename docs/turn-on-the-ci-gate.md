@@ -48,6 +48,8 @@ person = "Alex Example"                # the machine that prepares the approvals
 public = "use05-ed25519-public:..."    # the "machine" line of `use05 key show` on that machine
 ```
 
+A Touch ID approver key from a Mac (`use05 key new --approver`) is trusted the same way: its public key is the "Touch ID" line of `use05 key show` (`use05-passkey-p256-public:touch-id:...`), with that Mac's machine key beside it. Reading it needs nothing newer than a phone's passkey does.
+
 `person` needs use05 0.0.7 or later wherever the policy is read, so set `[use05] min_version = "0.0.7"`. Without the machine's key the brief says `no machine that prepared it co-signed it`. Keep `[evidence] accept = ["runner"]`: with `local` accepted, a machine key listed here could also sign check results that CI would believe.
 
 With a CI token from the console's Machines page stored as the secret `USE05_CI`, CI can also file approvals signed on a phone and report its verdict to the console. Around the gate step:

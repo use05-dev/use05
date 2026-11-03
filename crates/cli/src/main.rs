@@ -3,7 +3,7 @@
 //! Humans own the intent and the outcome; agents own everything in between; 05 keeps the middle
 //! in check. This binary parses arguments and renders results. The decisions are made in
 //! `use05-core`.
-#![forbid(unsafe_code)]
+#![deny(unsafe_code)] // allowed only in touchid.rs, for the Secure Enclave
 
 mod cmd;
 mod ctx;
@@ -13,6 +13,7 @@ mod pick;
 mod policy_edit;
 mod prompt;
 mod report;
+mod touchid;
 mod ui;
 
 use std::path::PathBuf;
@@ -244,6 +245,9 @@ struct ApproveCli {
     /// Push the receipts branch to origin afterwards
     #[arg(long)]
     push: bool,
+    /// Land the approved change straight away when 05 allows it, without asking
+    #[arg(long)]
+    land: bool,
     #[command(flatten)]
     common: Common,
 }
@@ -398,9 +402,15 @@ enum KeyCmd {
     New {
         /// Where to write the key (not with --approver)
         path: Option<PathBuf>,
-        /// Make your approval key, opened only by a passphrase
+        /// Make your approval key: Touch ID on a Mac that has it, else opened by a passphrase
         #[arg(long)]
         approver: bool,
+        /// With --approver: keep it in the Mac's Secure Enclave, used with Touch ID
+        #[arg(long, conflicts_with = "passphrase")]
+        touch_id: bool,
+        /// With --approver: protect it with a passphrase instead of Touch ID
+        #[arg(long)]
+        passphrase: bool,
         /// Read the passphrase from the first line of stdin instead of the terminal
         #[arg(long)]
         passphrase_stdin: bool,
@@ -421,6 +431,9 @@ struct LandCli {
     /// A task id (default: the current task)
     #[arg(long)]
     task: Option<String>,
+    /// Push the landing branch to origin afterwards, without asking
+    #[arg(long)]
+    push: bool,
     #[command(flatten)]
     common: Common,
 }
@@ -502,7 +515,7 @@ fn main() -> ExitCode {
         ),
         Cmd::Brief(a) => cmd::brief::run(&a.common.repo, a.task.as_deref(), a.tree.as_deref(), a.fetch, a.common.json),
         Cmd::Approve(a) => emit(
-            &cmd::approve::run_approve(cmd::approve::ApproveArgs { intent: a.intent, outcome: a.outcome, interactive: terminal() && !a.common.json && !a.passphrase_stdin, reject: a.reject, reason: a.reason, task: a.task, tree: a.tree, passphrase_stdin: a.passphrase_stdin, push: a.push, unsigned: a.unsigned, signed: a.signed, tested: a.tested, skip_testing: a.skip_testing, note: a.note, approver: a.approver, repo: a.common.repo }),
+            &cmd::approve::run_approve(cmd::approve::ApproveArgs { intent: a.intent, outcome: a.outcome, interactive: terminal() && !a.common.json && !a.passphrase_stdin, reject: a.reject, reason: a.reason, task: a.task, tree: a.tree, passphrase_stdin: a.passphrase_stdin, push: a.push, land: a.land, unsigned: a.unsigned, signed: a.signed, tested: a.tested, skip_testing: a.skip_testing, note: a.note, approver: a.approver, repo: a.common.repo }),
             a.common.json,
         ),
         Cmd::Verify(a) => emit(&cmd::verify::run(cmd::verify::Args { receipt: a.receipt, key: a.key, tree: a.tree, repo: a.common.repo }), a.common.json),
@@ -527,11 +540,14 @@ fn main() -> ExitCode {
         ),
         Cmd::Hook(a) => cmd::hook::run(&a.agent, &a.event),
         Cmd::Gate(a) => cmd::gate::run(cmd::gate::Args { git_hook: a.git_hook, ci: a.ci, tree: a.tree, push: a.push, repo: a.common.repo, json: a.common.json }),
-        Cmd::Land(a) => emit(&cmd::land::run(&a.common.repo, a.task.as_deref()), a.common.json),
+        Cmd::Land(a) => emit(&cmd::land::run(&a.common.repo, a.task.as_deref(), a.push, terminal() && !a.common.json), a.common.json),
         Cmd::Discard(a) => emit(&cmd::discard::run(&a.common.repo, a.task.as_deref(), a.unsigned, a.signed.as_deref()), a.common.json),
         Cmd::Finish(a) => emit(&cmd::start::finish(&a.common.repo, a.task.as_deref(), a.outcome.as_deref()), a.common.json),
         Cmd::Key { action } => match action {
-            KeyCmd::New { path, approver, passphrase_stdin, json } => emit(&cmd::approve::key_new(path, approver, passphrase_stdin), json),
+            KeyCmd::New { path, approver, touch_id, passphrase, passphrase_stdin, json } => {
+                let protection = if touch_id { Some(true) } else if passphrase || passphrase_stdin { Some(false) } else { None };
+                emit(&cmd::approve::key_new(path, approver, passphrase_stdin, protection), json)
+            }
             KeyCmd::Show { json } => emit(&cmd::approve::key_show(), json),
         },
         Cmd::Uninstall(a) => emit(&cmd::init::uninstall(&a.common.repo), a.common.json),

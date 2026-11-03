@@ -53,13 +53,18 @@ pub fn prompt_secret(prompt: &str) -> io::Result<String> {
 }
 
 /// Ask a question on the controlling terminal and read the answer, echoed. Fails when there is
-/// no terminal, as under an agent's shell tool: the answer has to come from a person.
+/// no terminal, as under an agent's shell tool: the answer has to come from a person. End of
+/// input (Ctrl-D, or nothing to read) is an error too, never an empty answer: where Enter means
+/// yes, closing the input must not.
 pub fn ask(question: &str) -> io::Result<String> {
     let mut tty = OpenOptions::new().read(true).write(true).open("/dev/tty")?;
     write!(tty, "{question}")?;
     tty.flush()?;
     let mut line = String::new();
-    BufReader::new(&tty).read_line(&mut line)?;
+    if BufReader::new(&tty).read_line(&mut line)? == 0 {
+        let _ = writeln!(tty);
+        return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "no answer"));
+    }
     Ok(line.trim_end_matches(['\n', '\r']).to_string())
 }
 

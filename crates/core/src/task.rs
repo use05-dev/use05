@@ -85,9 +85,9 @@ pub struct Owner {
 
 /// This machine's approver, as the default owner of work started here (D71).
 pub fn local_owner(top: &Path) -> Option<Owner> {
-    let key = crate::keys::approver_public()?;
+    let key_id = crate::keys::owner_key_id()?;
     let name = git::text(top, &["config", "user.name"]).ok().filter(|n| !n.trim().is_empty()).unwrap_or_else(|| "this machine's approver".to_string());
-    Some(Owner { name: name.trim().to_string(), key_id: use05_receipt::key_id(&key) })
+    Some(Owner { name: name.trim().to_string(), key_id })
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]

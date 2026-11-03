@@ -14,6 +14,8 @@ use crate::report::{Report, Tone};
 
 pub struct ApproveArgs {
     pub push: bool,
+    /// Land the approved change straight away, without asking (D91).
+    pub land: bool,
     /// Print the statement for a signer elsewhere (a passkey) instead of signing it here.
     pub unsigned: bool,
     /// File an approval a signer elsewhere already signed.
@@ -71,11 +73,38 @@ fn approver_name(top: &std::path::Path) -> String {
 
 /// Open the approver key, asking for the passphrase only if the key has one.
 fn open_approver(from_stdin: bool, command: &'static str) -> Result<use05_receipt::SigningKey, Report> {
-    if !keys::approver_exists() {
+    if !keys::passphrase_approver_exists() {
+        if keys::touch_id_public().is_some() {
+            return Err(Report::error(command, "NEEDS_PASSPHRASE_KEY", "this needs the passphrase approver key; your Touch ID key cannot sign it".into(), Some("make one as well: use05 key new --approver --passphrase".into()), 6));
+        }
         return Err(Report::error(command, "NO_APPROVER_KEY", "there is no approver key on this machine".into(), Some("create one: use05 key new --approver".into()), 6));
     }
     let pass = if keys::approver_protected() { passphrase("Approver passphrase: ", from_stdin, command)? } else { String::new() };
     keys::load_approver(&pass).map_err(|e| Report::error(command, e.code, e.message, e.next, 2))
+}
+
+/// A person's statement, signed: with the Touch ID key when this Mac has one (D91), else with the
+/// passphrase key. Either way it needs a person at a terminal; under an agent there is none.
+/// Returns the envelope and the id of the person's key that signed it.
+pub(crate) fn sign_as_person<P: use05_receipt::Predicate>(statement: &Statement<P>, reason: &str, from_stdin: bool, command: &'static str) -> Result<(Envelope, String), Report> {
+    if !from_stdin && crate::touchid::supported() {
+        if let Some(key) = keys::touch_id_public() {
+            if !tty::has_tty() {
+                return Err(Report::error(command, "NEEDS_A_PERSON", "this needs a person at a terminal to confirm with Touch ID".into(), Some("run it yourself in a terminal; an agent cannot approve its own work".into()), 3));
+            }
+            let body = serde_json::to_vec(statement).expect("statement serialises");
+            eprintln!("Confirm with {}.", crate::touchid::method());
+            match crate::touchid::seal(&body, reason) {
+                Ok(envelope) => return Ok((envelope, use05_receipt::PublicKey::Passkey(key).id())),
+                Err(crate::touchid::Failure::Cancelled) => return Err(Report::error(command, "CANCELLED", "cancelled; nothing was signed".into(), None, 1)),
+                // Over SSH, or a key from another Mac: the passphrase key, if there is one.
+                Err(f) if keys::passphrase_approver_exists() => eprintln!("05: {}; using your passphrase key instead.", f.message()),
+                Err(f) => return Err(Report::error(command, "TOUCH_ID_FAILED", f.message(), Some("make a passphrase key for these times: use05 key new --approver --passphrase".into()), 2)),
+            }
+        }
+    }
+    let key = open_approver(from_stdin, command)?;
+    Ok((seal(statement, &key), key_id(&key.verifying_key())))
 }
 
 fn expiry(days: u32, hours: u32) -> String {
@@ -153,8 +182,17 @@ fn locate_task(args: &mut ApproveArgs) {
 }
 
 pub fn run_approve(mut args: ApproveArgs) -> Report {
+    // Where the person ran it: landing from there can also clean up the task's own checkout.
+    let asked_from = args.repo.clone();
     if let Some(file) = &args.signed {
-        return run_signed(file, args.push, &args.repo);
+        let mut report = run_signed(file, args.push, &args.repo);
+        // An approval from a phone lands the work when the policy lands on its own (D91).
+        if report.code == "APPROVED" && report.details["counts"] == true && report.details["scope"] == "outcome" {
+            if let Some(task) = report.details["task"].as_str().map(str::to_string) {
+                land_after(&args.repo, &task, &mut report, args.land, false);
+            }
+        }
+        return report;
     }
     if args.task.is_none() && args.tree.is_none() && !args.tested && !args.skip_testing {
         if let Err(r) = choose_task(&mut args) {
@@ -225,18 +263,22 @@ pub fn run_approve(mut args: ApproveArgs) -> Report {
     if args.unsigned {
         return unsigned(&statement, &store_key, &target.oid, &what);
     }
-    let key = match open_approver(args.passphrase_stdin, "approve") {
-        Ok(k) => k,
+    let reason = format!("{} \"{}\"", if vote == Decision::Approve { "approve" } else { "reject" }, ctx.task.as_ref().map_or_else(|| target.oid[..12].to_string(), |t| t.title.clone()));
+    let (envelope, signer_id) = match sign_as_person(&statement, &reason, args.passphrase_stdin, "approve") {
+        Ok(signed) => signed,
         Err(r) => return r,
     };
-    let signer_id = key_id(&key.verifying_key());
-    let envelope = seal(&statement, &key).to_json_bytes();
+    let envelope = envelope.to_json_bytes();
     let branch = match store::put(ctx.top(), &store_key, &envelope, &signer_id) {
         Ok(b) => b,
         Err(e) => return Report::from_core("approve", e),
     };
     if let Some(task) = &ctx.task {
         let _ = use05_core::log::append(&ctx.store.state_dir(), &task.id, json!({ "event": "approval", "vote": vote, "scope": scope, "by": approver }));
+    }
+    // Which rules asked for this person, so a rule that is always approved can be pointed out (D91).
+    if let Some(g) = &gate {
+        use05_core::asked::record(&ctx.store.state_dir(), vote == Decision::Approve, &g.findings, now_secs());
     }
 
     let counts = ctx.trust.by_id(&signer_id).is_some_and(|k| k.role == use05_core::policy::Role::Approver);
@@ -245,18 +287,52 @@ pub fn run_approve(mut args: ApproveArgs) -> Report {
     if !counts {
         notes.push("Warning: this key is not in the policy's trusted keys, so the gate will not count this approval. Add it under [[trust.key]] with role = \"approver\".".to_string());
     }
-    Report {
+    let mut report = Report {
         command: "approve",
         outcome: if vote == Decision::Approve { "approved" } else { "rejected" },
         code: if vote == Decision::Approve { "APPROVED" } else { "REJECTED" },
         tone: if vote == Decision::Approve { Tone::Good } else { Tone::Bad },
         headline: format!("{} {what}", if vote == Decision::Approve { "Approved" } else { "Rejected" }),
-        rows: vec![("by".into(), approver), ("reason".into(), args.reason.unwrap_or_else(|| "(none given)".into())), ("expires".into(), expiry(ctx.policy.approvals.expire_days, 0))],
+        rows: vec![("by".into(), approver), ("reason".into(), args.reason.clone().unwrap_or_else(|| "(none given)".into())), ("expires".into(), expiry(ctx.policy.approvals.expire_days, 0))],
         notes,
         next: Some(format!("use05 brief   (share it: git push origin {branch})")),
         excerpt: vec![],
         details: json!({ "scope": scope, "vote": vote, "key_id": signer_id, "branch": branch, "counts": counts }),
         exit: 0,
+    };
+    if vote == Decision::Approve && scope == ApprovalScope::Outcome && counts {
+        if let Some(task) = ctx.task.as_ref().map(|t| t.id.clone()) {
+            land_after(&asked_from, &task, &mut report, args.land, args.interactive);
+        }
+    }
+    report
+}
+
+/// Approving is the last thing a person does (D91): once the gate allows the task's work, it
+/// lands, when the policy lands on its own, `--land` said so, or the person says yes at the
+/// terminal; then it is pushed the same way. Otherwise the next step says how to land it.
+fn land_after(repo: &std::path::Path, task: &str, report: &mut Report, flag: bool, interactive: bool) {
+    use crate::cmd::land::{self, Then};
+    use use05_core::policy::LandMode;
+    // Opened again, so the approval just filed is part of what the gate reads.
+    let Ok(ctx) = Ctx::open_judging(repo, Some(task)) else { return };
+    let Some(current) = ctx.task.clone().filter(|t| t.id == task) else { return };
+    let Some((_, target)) = land::ready(&ctx, &current) else { return };
+    let then = Then::choose(ctx.policy.branches.land == LandMode::Auto, flag, interactive);
+    if !then.settle(&format!("Land \"{}\" on {target} now?", current.title)) {
+        report.next = Some(format!("use05 land --task {task}   it is allowed now"));
+        return;
+    }
+    let mut landed = land::land_task(&ctx, current);
+    land::push_after(&ctx, &mut landed, Then::choose(ctx.policy.branches.push == LandMode::Auto, false, interactive), !interactive);
+    report.rows.extend(landed.rows);
+    report.notes.extend(landed.notes);
+    report.next = landed.next;
+    report.details["landed"] = json!(landed.code == "LANDED");
+    if landed.code == "LANDED" {
+        report.headline = format!("{}, and landed it on {target}", report.headline);
+    } else {
+        report.notes.push(format!("It did not land: {}", landed.headline));
     }
 }
 
@@ -352,12 +428,11 @@ fn run_testing(ctx: &Ctx, args: ApproveArgs) -> Report {
         return unsigned_body(&body, &target.oid, &target.oid, &format!("sign that you {what}"), json!({ "kind": "testing", "outcome": outcome, "note": note, "task": statement.predicate.task }));
     }
     eprintln!("You are about to sign that you {what}: \"{note}\".");
-    let key = match open_approver(args.passphrase_stdin, "approve") {
-        Ok(k) => k,
+    let (envelope, signer_id) = match sign_as_person(&statement, &format!("sign that you {what}"), args.passphrase_stdin, "approve") {
+        Ok(signed) => signed,
         Err(r) => return r,
     };
-    let signer_id = key_id(&key.verifying_key());
-    let envelope = seal(&statement, &key).to_json_bytes();
+    let envelope = envelope.to_json_bytes();
     let branch = match store::put(ctx.top(), &target.oid, &envelope, &signer_id) {
         Ok(b) => b,
         Err(e) => return Report::from_core("approve", e),
@@ -485,7 +560,7 @@ fn run_signed(file: &std::path::Path, push: bool, repo: &std::path::Path) -> Rep
         notes,
         next: Some(format!("use05 brief   (share it: git push origin {branch})")),
         excerpt: vec![],
-        details: json!({ "scope": a.scope, "vote": a.decision, "key_id": signed.signer.key_id, "branch": branch, "counts": void.is_none(), "void": void }),
+        details: json!({ "scope": a.scope, "vote": a.decision, "task": a.task, "key_id": signed.signer.key_id, "branch": branch, "counts": void.is_none(), "void": void }),
         exit: 0,
     }
 }
@@ -553,9 +628,20 @@ pub fn run_bypass(args: BypassArgs) -> Report {
     }
 }
 
-pub fn key_new(path: Option<PathBuf>, approver: bool, passphrase_stdin: bool) -> Report {
+/// How the approver key is protected: `Some(true)` Touch ID, `Some(false)` a passphrase, `None`
+/// Touch ID where this Mac has it (asked first at a terminal), else a passphrase.
+pub fn key_new(path: Option<PathBuf>, approver: bool, passphrase_stdin: bool, touch_id: Option<bool>) -> Report {
     if approver {
-        if keys::approver_exists() {
+        let wants_touch_id = match touch_id {
+            Some(choice) => choice,
+            None if passphrase_stdin || !crate::touchid::supported() => false,
+            None if tty::has_tty() && std::io::IsTerminal::is_terminal(&std::io::stdin()) => !matches!(tty::ask(&format!("Protect it with {} instead of a passphrase? [Y/n] ", crate::touchid::method())).map(|a| a.trim().to_ascii_lowercase()), Ok(ref a) if a == "n" || a == "no"),
+            None => true,
+        };
+        if wants_touch_id {
+            return touch_id_key_new();
+        }
+        if keys::passphrase_approver_exists() {
             return Report::error("key", "KEY_EXISTS", "an approver key already exists on this machine".into(), Some("use05 key show".into()), 6);
         }
         let first = match passphrase("New approver passphrase (empty for none): ", passphrase_stdin, "key") {
@@ -644,6 +730,41 @@ pub fn key_new(path: Option<PathBuf>, approver: bool, passphrase_stdin: bool) ->
     }
 }
 
+/// Make the Touch ID approver key (D91).
+fn touch_id_key_new() -> Report {
+    if !crate::touchid::supported() {
+        return Report::error("key", "TOUCH_ID_UNAVAILABLE", "Touch ID keys need a Mac with a Secure Enclave and a build of 05 that has them".into(), Some("use a passphrase: use05 key new --approver --passphrase".into()), 6);
+    }
+    if keys::touch_id_public().is_some() {
+        return Report::error("key", "KEY_EXISTS", "a Touch ID approver key already exists on this Mac".into(), Some("use05 key show".into()), 6);
+    }
+    let key = match crate::touchid::create() {
+        Ok(k) => k,
+        Err(e) => return Report::error("key", "KEY_NOT_CREATED", e, None, 4),
+    };
+    let id = use05_receipt::PublicKey::Passkey(key.clone()).id();
+    let public = use05_receipt::passkey_public_text(&key);
+    let mut notes = vec![format!("Approving now asks for {}: the Secure Enclave signs, and only with you there. The key never leaves this Mac.", crate::touchid::method())];
+    if !keys::passphrase_approver_exists() {
+        notes.push("Break glass (use05 bypass) still needs a passphrase key: use05 key new --approver --passphrase, if you ever want it.".into());
+    }
+    notes.push("For CI to count your approvals, trust this key and this machine's key in the policy (see the guide: Phone approvals in CI):".into());
+    notes.push(format!("[[trust.key]]  name = \"you (Touch ID)\"  role = \"approver\"  person = \"<your git user.name>\"  public = \"{}\"", public.trim()));
+    Report {
+        command: "key",
+        outcome: "created",
+        code: "KEY_CREATED",
+        tone: Tone::Good,
+        headline: format!("Created your Touch ID approver key {}", &id[..12]),
+        rows: vec![("protected".into(), format!("yes: by the Secure Enclave, with {}", crate::touchid::method()))],
+        notes,
+        next: Some("use05 approve".into()),
+        excerpt: vec![],
+        details: json!({ "key_id": id, "protected": true, "touch_id": true, "public": public.trim() }),
+        exit: 0,
+    }
+}
+
 pub fn key_show() -> Report {
     let mut rows = Vec::new();
     let mut details = json!({});
@@ -654,6 +775,11 @@ pub fn key_show() -> Report {
     if let Some(k) = keys::approver_public() {
         rows.push(("approver".to_string(), format!("{}   ({})\n{}", key_id(&k), if keys::approver_protected() { "passphrase-protected" } else { "NO passphrase" }, public_key_text(&k).trim())));
         details["approver"] = json!(public_key_text(&k).trim());
+    }
+    if let Some(k) = keys::touch_id_public() {
+        let public = use05_receipt::passkey_public_text(&k);
+        rows.push(("Touch ID".to_string(), format!("{}   (Secure Enclave)\n{}", use05_receipt::PublicKey::Passkey(k).id(), public.trim())));
+        details["touch_id"] = json!(public.trim());
     }
     if rows.is_empty() {
         return Report::error("key", "NO_KEYS", "no keys on this machine yet".into(), Some("use05 init".into()), 6);

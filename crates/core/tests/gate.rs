@@ -939,7 +939,7 @@ fn passkey_case(seed: u8, holder: Holder, owner: Option<(&str, &str)>, this_pers
     let machine = key(seed.wrapping_add(100));
     let mut phone = trusted_passkey("phone", &pk);
     phone.holder = holder;
-    let trust = Trust { keys: vec![phone, trusted("this machine", Role::Local, &machine)], this_person: this_person.map(str::to_string) };
+    let trust = Trust { keys: vec![phone, trusted("this machine", Role::Local, &machine)], this_person: this_person.map(str::to_string).into_iter().collect() };
     let task = owner.map(|(name, key_id)| {
         let mut t = task_with(None, None);
         t.owner = Some(use05_core::task::Owner { name: name.into(), key_id: key_id.into() });

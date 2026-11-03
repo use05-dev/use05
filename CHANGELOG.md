@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.0.13
+
+05 now asks for less than a pull request did: nothing when the work matches its plan and its checks pass, and one action, where you already are, when it does not.
+
+- **The verdict comes to the agent's window.** When Claude Code stops and 05 has nothing to ask of it, you see one line: whether the work landed, is allowed with nothing to read, still has checks to run, needs you (and why), or is blocked, with the one command to run. It is said again only when it changes. `hook generic` carries it as `message`.
+- **Approving lands the work.** Once your approval counts and the gate allows the task's work, it lands: on its own with `[branches] land = "auto"`, with `use05 approve --land`, or after "Land it on main now?" at the terminal. An approval from your console lands it too, when the policy lands on its own.
+- **Landing pushes.** After landing, 05 asks "Push main to origin now?" at a terminal; `use05 land --push` pushes without asking, and the new `[branches] push = "auto"` pushes every time. The push goes through the pre-push hook, after your receipts, so CI finds the approvals.
+- **Touch ID approvals on macOS.** `use05 key new --approver` offers a key made in the Mac's Secure Enclave, used with Touch ID (or the Mac's password where there is no sensor). The Secure Enclave refuses to sign without you, so an agent running as you cannot approve. Its signatures are passkey signatures co-signed by the machine, so CI and `use05 verify` check them as they check a phone's. Break glass still needs the passphrase key; `USE05_NO_TOUCH_ID` turns it off.
+- **By hand, it is commit and push.** When a push needs a person and you are at the terminal, the pre-push hook shows why and asks "Approve it now?", then lets the push go on.
+- **Setup in one run.** At a terminal `use05 init` makes your approver key and offers to commit the setup; the first push asks for the one approval of 05's rules right there.
+- **Working alone lands on its own.** The "just you" setup sets `land = "auto"`.
+- **Rules that only cost you attention are named.** A rule that held five or more changes back for you in 30 days, all approved, shows under Tip on the bare page and in `use05 doctor`, with `use05 policy --edit`. 05 counts; it never changes a rule itself.
+- **The bare page acts.** Its first menu entry is the next thing to do (approve, land, run the checks), and Enter does it.
+
 ## 0.0.12
 
 - **Fixed: Home scrolled sideways.** A repository with a long name made its chip refuse to shrink, and the whole page grew with it. Chips now truncate and wrap, and long strings break everywhere in the content area. Checked on every page at widths from 1440 down to 320.

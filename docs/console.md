@@ -115,7 +115,7 @@ When an agent's work needs a person (a protected file, a risky change, a plan yo
 1. Open it. You see the plan, the files touched (names only), what 05 found, and the checks.
 2. Tap **Approve with passkey**. Before your passkey is asked, the page reads the statement your machine prepared and checks that it is an approval of exactly what is shown: this task, this tree, under the policy in force now. It shows until when it lasts.
 3. Your passkey signs exactly that statement, which your machine has already co-signed with its own key. The helper files it on your machine within seconds.
-4. Tell the agent to carry on, in the app you prompt it from. Nothing wakes it by itself.
+4. If the policy lands work on its own (`[branches] land = "auto"`, the default when you work alone), the helper lands it as it files your approval, and pushes it when `[branches] push = "auto"`: nothing is left for you at a terminal. Otherwise it is ready to land (`use05 land`, or Enter on the bare `use05` page). An agent still waiting on you is not woken: tell it to carry on, in the app you prompt it from.
 
 If the work changes after you approve, the approval stops counting and 05 asks again. To say no, choose **Reject it instead…** on the task and give a reason: your machine prepares the rejection and your passkey signs it, as for an approval. Work held for you that its machine never asked about has **Ask for my approval** (and the same reject) on its page: the statement is prepared and appears there to sign, with no terminal. At a terminal, `use05 approve --reject --reason "…"` does the same.
 

@@ -61,19 +61,16 @@ It works with the agents you already run (Claude Code, Codex, and any agent with
 ```sh
 curl -fsSL https://use05.dev/install.sh | sh        # or: npm install -g @use05/cli
 cd your-repo
-use05 init                                          # a few questions, then rules and hooks
-git add .05 AGENTS.md && git commit -m "Set up 05"  # your rules count once committed (add .codex too if init wrote it)
-use05 key new --approver                            # your approval key, behind a passphrase no agent has
+use05 init                                          # a few questions; makes your approval key (Touch ID on a Mac) and commits the setup
 ```
 
-Then work with Claude Code or Codex as you do now. When an agent is done:
+Then work with Claude Code or Codex as you do now. When an agent stops, 05 tells you in the agent's window where the work stands. Work that matches its plan and passes its checks lands on its own when you work alone; nothing to read means nothing to do. When a change needs you:
 
 ```sh
-use05 brief                   # one page: what was asked, what changed, what was proved
-use05 approve --outcome       # only when the brief asks for a person
-use05 land                    # the agent's branch lands on main and is cleaned up
-git push origin main          # checked again on the way out; no pull request
+use05 approve                 # one page of why, then Touch ID or your passphrase; it lands and offers to push
 ```
+
+Working by hand is `git commit` and `git push`: the pre-push hook runs the checks and, if the push needs you, asks right there. No pull request.
 
 macOS and Linux, x86_64 and arm64. The [guide](docs/guide.md) covers the rest, including working without an agent.
 
@@ -83,7 +80,7 @@ macOS and Linux, x86_64 and arm64. The [guide](docs/guide.md) covers the rest, i
 |---|---|
 | <img src="docs/assets/brief-large.png" alt="use05 brief on a 497-file, 52,475-line feature build: areas with line counts, 26 files outside the declared scope, refusals by reason, the test check failing then passing during the session, two subagents, and the verdict approval required."> | <img src="docs/assets/prove-verify.png" alt="use05 prove signs a receipt for a check on the exact tree; use05 verify checks it offline."> |
 | **A 497-file build, one page.** What changed by area, what fell outside the plan, what 05 refused and why. | **Prove, then verify.** A check on the exact tree, signed, verifiable offline. |
-| <img src="docs/assets/land-and-clean-up.png" alt="use05 land fast-forwards an agent's branch onto main, removes its worktree and deletes the branch."> | <img src="docs/assets/hook-denied.png" alt="A Claude Code hook refuses an agent's edit to 05's own policy file until a person approves."> |
+| <img src="docs/assets/land-and-clean-up.png" alt="use05 land --push fast-forwards an agent's branch onto main, removes its worktree, deletes the branch and pushes main."> | <img src="docs/assets/hook-denied.png" alt="A Claude Code hook refuses an agent's edit to 05's own policy file until a person approves."> |
 | **Land it**, and the agent's branch and worktree are cleaned up. | **Agents are held to the rules** by their own hooks. |
 
 ## Documentation

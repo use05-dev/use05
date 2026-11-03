@@ -56,6 +56,7 @@ fn apply_team(s: &mut Settings, team: Team) {
     s.overlap = p.overlap;
     s.tests = p.tests;
     s.approvals_min = p.approvals_min;
+    s.land = p.land;
 }
 
 /// The answers given as flags, with no questions.
@@ -249,7 +250,8 @@ fn summary(s: &Settings) -> Vec<(&'static str, String)> {
         ("Dependency changes", sev(s.dependencies)),
         ("Two agents, one file", sev(s.overlap)),
         ("Approvals needed", s.approvals_min.to_string()),
-        ("Finished changes", if s.land == LandMode::Auto { "automatically when 05 allows it".into() } else { "when you run use05 land".into() }),
+        ("Finished changes", if s.land == LandMode::Auto { "land automatically when 05 allows it".into() } else { "land when you run use05 land".into() }),
+        ("Then", if s.push == LandMode::Auto { "05 pushes them to origin".into() } else { "you push them".into() }),
     ]
 }
 
@@ -439,6 +441,8 @@ pub fn ask<R: BufRead, W: Write>(a: &mut Asker<R, W>, top: &Path, current: &Poli
     s.fresh_base = severity_choice(a, "When an agent starts from older code than origin has (05 fetches origin when a session starts):", &FRESH_OPTIONS, s.fresh_base)?;
     let land = a.choice("How should a finished change land?", &["I run use05 land", "Automatically, when 05 allows it"], usize::from(s.land == LandMode::Auto))?;
     s.land = if land == 1 { LandMode::Auto } else { LandMode::Manual };
+    let push = a.choice("Once a change has landed, who pushes it?", &["I do (git push, or yes when 05 asks)", "05 pushes it to origin"], usize::from(s.push == LandMode::Auto))?;
+    s.push = if push == 1 { LandMode::Auto } else { LandMode::Manual };
 
     // 7. Confirm.
     a.step(7, STEPS, "Review");
