@@ -427,7 +427,7 @@ async fn edit_cancel(State(app): State<Shared>, me: Member, Path(id): Path<Uuid>
 
 async fn machines(State(app): State<Shared>, me: Member) -> Res {
     let admin = me.role == crate::team::Role::Admin;
-    let machines = json(&app, &format!("select m.id, m.name, m.created_at, m.last_seen, m.use05_version, m.revoked, {ONLINE} as online, (select count(*) from repo_machines rm where rm.machine_id = m.id) as repos, mb.name as person, ({admin} or m.member_id = '{}') as yours, m.kind <> 'machine' and coalesce(m.team_version, 0) < (select coalesce(max(version), 0) from team) as stale from machines m left join members mb on mb.id = m.member_id order by m.revoked, m.last_seen desc nulls last", me.id)).await?;
+    let machines = json(&app, &format!("select m.id, m.name, m.created_at, m.last_seen, m.use05_version, m.revoked, {ONLINE} as online, (select count(*) from repo_machines rm where rm.machine_id = m.id) as repos, mb.name as person, ({admin} or m.member_id = '{}') as yours, m.kind <> 'machine' and coalesce(m.team_version, 0) < (select coalesce(max(version), 0) from team) as stale from machines m left join members mb on mb.id = m.member_id order by m.revoked, m.created_at desc", me.id)).await?;
     let pairings = json(&app, &format!("select id, machine_name, created_at, claimed_by is not null as claimed, claimed_by = '{me}' as mine, {} as commit_hash, {} as x_pub, {} as ed_pub, {} as machine_nonce, {} as browser_nonce from pairings where not approved and not denied and created_at > strftime('%Y-%m-%dT%H:%M:%fZ', 'now', '-15 minutes') order by created_at", "commit_hash", "x_pub", "ed_pub", "machine_nonce", "browser_nonce", me = me.id)).await?;
     let refusals = json(&app, "select at, actor, detail from audit where action = 'refused' order by at desc limit 20").await?;
     let waiting = json(&app, "select m.id as machine_id, m.name as machine, rm.repo_id, rm.last_seen from repo_machines rm join machines m on m.id = rm.machine_id join repos r on r.id = rm.repo_id where not rm.allowed and not m.revoked order by rm.last_seen desc").await?;
@@ -510,10 +510,25 @@ async fn pairing_approve(State(app): State<Shared>, me: Member, Path(id): Path<U
     let sealed_id_key = crate::keys::unb64(&body.sealed_id_key)?;
     let machine = Uuid::new_v4();
     let secret = token();
-    sqlx::query("insert into machines (id, name, token_hash, member_id, x_pub, ed_pub, pin, team_version, sealed_id_key) values (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)").bind(machine).bind(&name).bind(hash(&secret)).bind(me.id).bind(x_pub).bind(ed_pub).bind(body.pin.trim()).bind(team_version).bind(sealed_id_key).execute(&app.db).await?;
+    sqlx::query("insert into machines (id, name, token_hash, member_id, x_pub, ed_pub, pin, team_version, sealed_id_key) values (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)").bind(machine).bind(&name).bind(hash(&secret)).bind(me.id).bind(x_pub).bind(ed_pub.clone()).bind(body.pin.trim()).bind(team_version).bind(sealed_id_key).execute(&app.db).await?;
     sqlx::query("update pairings set approved = true, token = ?2, machine_id = ?3 where id = ?1").bind(id).bind(&secret).bind(machine).execute(&app.db).await?;
     audit(&app, &me.name, "machine_paired", json!({ "machine": name })).await;
+    // Pairing a Mac again leaves its earlier pairings behind as offline duplicates that nothing
+    // will ever use. Retire them here, so nobody has to pick the right one out of a list.
+    if let Some(keys) = &ed_pub {
+        let retired = retire_older_pairings(&app.db, me.id, keys, machine).await?;
+        if retired > 0 {
+            audit(&app, &me.name, "machine_pairings_retired", json!({ "machine": name, "count": retired })).await;
+        }
+    }
     ok()
+}
+
+/// Revoke this person's other, older pairings of the same machine (the same signing key). Only
+/// the machine itself can pair again with that key, so these tokens are stale by definition.
+async fn retire_older_pairings(db: &sqlx::SqlitePool, member: Uuid, ed_pub: &[u8], keep: Uuid) -> Result<u64, Fail> {
+    let done = sqlx::query("update machines set revoked = true where member_id = ?1 and ed_pub = ?2 and id <> ?3 and not revoked and kind = 'machine'").bind(member).bind(ed_pub).bind(keep).execute(db).await?;
+    Ok(done.rows_affected())
 }
 
 async fn pairing_deny(State(app): State<Shared>, me: Member, Path(id): Path<Uuid>) -> Res {
@@ -587,6 +602,28 @@ mod tests {
         let left: Vec<String> = sqlx::query_scalar("select ref_key from records").fetch_all(&db).await.unwrap();
         assert_eq!(left, vec!["t2".to_string()]);
         assert_eq!(forget_records(&db, me, true, "r1", &refs, &[]).await.unwrap(), 1, "an admin may clear anyone's");
+    }
+
+    #[tokio::test]
+    async fn pairing_a_machine_again_retires_only_its_older_pairings() {
+        let db = sqlx::sqlite::SqlitePoolOptions::new().max_connections(1).connect("sqlite::memory:").await.unwrap();
+        sqlx::migrate!("./migrations").run(&db).await.unwrap();
+        let (me, them) = (Uuid::new_v4(), Uuid::new_v4());
+        for (m, who) in [(me, "Alex"), (them, "Sam")] {
+            sqlx::query("insert into members (id, name, role) values (?1, ?2, 'member')").bind(m).bind(who).execute(&db).await.unwrap();
+        }
+        let key_mac: &[u8] = &[1; 32];
+        let key_laptop: &[u8] = &[2; 32];
+        let (old_a, old_b, current, laptop, theirs) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
+        for (id, owner, key) in [(old_a, me, key_mac), (old_b, me, key_mac), (current, me, key_mac), (laptop, me, key_laptop), (theirs, them, key_mac)] {
+            sqlx::query("insert into machines (id, name, token_hash, member_id, ed_pub) values (?1, 'm', ?2, ?3, ?4)").bind(id).bind(id.0.to_string()).bind(owner).bind(key).execute(&db).await.unwrap();
+        }
+        assert_eq!(retire_older_pairings(&db, me, key_mac, current).await.unwrap(), 2, "the two older pairings of this machine");
+        let live: Vec<Uuid> = sqlx::query_scalar("select id from machines where not revoked order by id").fetch_all(&db).await.unwrap();
+        for kept in [current, laptop, theirs] {
+            assert!(live.contains(&kept), "{kept} must stay paired: a different machine, someone else's, or the new pairing");
+        }
+        assert!(!live.contains(&old_a) && !live.contains(&old_b));
     }
 
     #[tokio::test]

@@ -626,6 +626,18 @@ fn listen(me: &str) -> Result<()> {
     Ok(())
 }
 
+/// Where the developer tools are, as this shell sees them: `DEVELOPER_DIR` if set, else what
+/// `xcode-select -p` says. The background helper is given the same, so its git runs like yours.
+fn developer_dir() -> Option<String> {
+    if !cfg!(target_os = "macos") {
+        return None;
+    }
+    std::env::var("DEVELOPER_DIR").ok().filter(|d| !d.is_empty()).or_else(|| {
+        let out = std::process::Command::new("xcode-select").arg("-p").output().ok().filter(|o| o.status.success())?;
+        Some(String::from_utf8_lossy(&out.stdout).trim().to_string()).filter(|d| !d.is_empty())
+    })
+}
+
 fn install() -> Result<()> {
     let c = load()?;
     let me = std::env::current_exe()?.canonicalize()?.to_string_lossy().to_string();
@@ -637,7 +649,7 @@ fn install() -> Result<()> {
         let agents = PathBuf::from(std::env::var("HOME")?).join("Library/LaunchAgents");
         fs::create_dir_all(&agents)?;
         let plist = agents.join("dev.use05.cloud.plist");
-        fs::write(&plist, cloud::service::launchd_plist(&me, &path_env, &log_s))?;
+        fs::write(&plist, cloud::service::launchd_plist(&me, &path_env, developer_dir().as_deref(), &log_s))?;
         let uid = String::from_utf8(std::process::Command::new("id").arg("-u").output()?.stdout)?.trim().to_string();
         let _ = std::process::Command::new("launchctl").args(["bootout", &format!("gui/{uid}/dev.use05.cloud")]).output();
         let loaded = std::process::Command::new("launchctl").args(["bootstrap", &format!("gui/{uid}"), &plist.to_string_lossy()]).status()?;

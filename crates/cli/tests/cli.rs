@@ -664,7 +664,13 @@ fn bare_use05_never_waits_for_a_terminal() {
     snapshot("status", &s, &status);
 
     let elsewhere = tempfile::tempdir().unwrap();
-    let out = Command::new(BIN).current_dir(elsewhere.path()).env_clear().env("PATH", "/usr/bin:/bin").stdin(Stdio::null()).output().unwrap();
+    let mut bare = Command::new(BIN);
+    bare.current_dir(elsewhere.path()).env_clear().env("PATH", "/usr/bin:/bin").stdin(Stdio::null());
+    // Where the developer tools are is part of what lets git run on a Mac, so it is kept.
+    if let Ok(d) = std::env::var("DEVELOPER_DIR") {
+        bare.env("DEVELOPER_DIR", d);
+    }
+    let out = bare.output().unwrap();
     assert_eq!(code(&out), 0, "outside a repository it explains instead of failing:\n{}", text(&out));
     assert!(text(&out).contains("use05 init"));
 }
@@ -1937,9 +1943,12 @@ fn an_approval_counts_at_the_push_when_the_policy_file_was_never_committed() {
 }
 
 #[test]
-fn a_push_held_despite_an_approval_says_why_the_approval_does_not_count() {
-    // An approval given under other rules does not count. The push says so, rather than
-    // claiming nobody approved.
+fn a_policy_edit_approved_under_the_rules_that_judge_it_goes_through() {
+    // A change that edits the policy is approved under origin's rules, the ones that will judge
+    // it, so a change cannot loosen its own. Before, it was approved under its own edited rules,
+    // which the push then voided ("given under a different policy") however often it was approved.
+    // (The message for an approval that does not count is covered by the signed-approval and
+    // gate tests.)
     let s = Sandbox::initialised();
     s.approver();
     let remote = tempfile::tempdir().unwrap();
@@ -1953,19 +1962,16 @@ fn a_push_held_despite_an_approval_says_why_the_approval_does_not_count() {
         cmd.output().unwrap()
     };
     assert!(push().status.success());
-    // The change edits the policy and is approved here, where that edit is already the rules
-    // (no task, so the base is HEAD), while the push is held to origin's.
     assert_eq!(code(&s.run(&["policy", "set", "approvals.expire_days", "3"])), 0);
     s.commit_all("shorter approvals");
-    for _ in 0..2 {
-        let approve = s.run_with_stdin(&["approve", "--outcome", "--tree", "HEAD", "--passphrase-stdin"], "correct horse\n");
-        assert_eq!(code(&approve), 0, "{}", text(&approve));
-    }
     let held = push();
-    let said = String::from_utf8_lossy(&held.stderr).to_string();
-    assert!(!held.status.success(), "{said}");
-    assert!(said.contains("does not count") && said.contains("policy"), "the push says why the approval does not count:\n{said}");
-    assert_eq!(said.matches("does not count").count(), 1, "one person approving twice is said once:\n{said}");
+    assert!(!held.status.success(), "a change to the rules is held until a person approves it");
+    let approve = s.run_with_stdin(&["approve", "--outcome", "--tree", "HEAD", "--passphrase-stdin"], "correct horse\n");
+    assert_eq!(code(&approve), 0, "{}", text(&approve));
+    let landed = push();
+    let said = String::from_utf8_lossy(&landed.stderr).to_string();
+    assert!(!said.contains("does not count"), "the approval counts under the rules that judge the push:\n{said}");
+    assert!(landed.status.success(), "the approved change goes through:\n{said}");
 }
 
 // ----------------------------------------------------------------------------- declarations reach CI (D65)
@@ -3638,6 +3644,40 @@ fn verify_refuses_a_passkey_signed_bypass() {
     let out = s.run(&["verify", "bypass.json", "--key", "phone.pub", "--json"]);
     assert_eq!(code(&out), 2, "{}", text(&out));
     assert_eq!(json(&out)["code"], "PASSKEY_APPROVALS_ONLY");
+}
+
+/// The policy digest an unsigned approval of the current task's intent would carry.
+fn approval_policy_digest(s: &Sandbox) -> String {
+    use base64::Engine;
+    let unsigned = json(&s.run(&["approve", "--unsigned", "--intent", "--json"]));
+    let body = base64::engine::general_purpose::STANDARD.decode(unsigned["details"]["payload"].as_str().unwrap_or_else(|| panic!("an unsigned approval has a payload: {unsigned}"))).unwrap();
+    let statement: Value = serde_json::from_slice(&body).unwrap();
+    statement["predicate"]["policy_sha256"].as_str().unwrap().to_string()
+}
+
+#[test]
+fn an_approval_is_signed_under_the_rules_a_push_will_be_judged_by() {
+    // A task that began before the policy changed must still be approved under the policy on the
+    // remote, which is what the pre-push gate reads. Before, the task's own start commit was used,
+    // so every approval was voided ("given under a different policy") however often it was given.
+    let s = Sandbox::initialised();
+    let remote = tempfile::tempdir().unwrap();
+    let remote_path = remote.path().display().to_string();
+    assert!(Command::new("git").args(["init", "-q", "--bare", "-b", "main", &remote_path]).status().unwrap().success());
+    s.git(&["remote", "add", "origin", &remote_path]);
+    s.git(&["push", "-q", "--no-verify", "origin", "HEAD:refs/heads/main"]);
+    assert_eq!(code(&s.run(&["start", "Add a page", "--scope", "src/**"])), 0);
+    let at_start = approval_policy_digest(&s);
+
+    // The rules change and land on the remote after the task began.
+    let policy = fs::read_to_string(s.path(".05/policy.toml")).unwrap();
+    assert!(policy.contains("expire_days = 7"), "the template this test edits has changed");
+    s.write(".05/policy.toml", &policy.replace("expire_days = 7", "expire_days = 3"));
+    s.commit_all("tighten approvals");
+    s.git(&["push", "-q", "--no-verify", "origin", "HEAD:refs/heads/main"]);
+
+    let after = approval_policy_digest(&s);
+    assert_ne!(at_start, after, "the approval still signs under the rules the task began with");
 }
 
 #[test]

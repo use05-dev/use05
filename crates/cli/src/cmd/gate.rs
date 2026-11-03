@@ -37,12 +37,7 @@ fn base_for_push(top: &Path, remote_sha: &str, local_sha: &str) -> Option<String
     if git::list_refs(top, &["refs/remotes/"]).is_empty() {
         return None;
     }
-    ["@{upstream}", "origin/HEAD", "origin/main", "origin/master"]
-        .iter()
-        .find_map(|u| git::resolve_commit(top, u))
-        .and_then(|u| git::merge_base(top, &u, local_sha))
-        .filter(|b| b != local_sha)
-        .or_else(|| git::resolve_commit(top, &format!("{local_sha}^")))
+    git::fork_from_remote(top, local_sha).filter(|b| b != local_sha).or_else(|| git::resolve_commit(top, &format!("{local_sha}^")))
 }
 
 /// Tell event extensions what the gate decided: the verdict and its finding codes, nothing more.

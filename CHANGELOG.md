@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.0.10
+
+- **Fixed: an approval that could never clear a push.** `use05 approve`, the brief and the other judging commands read the rules at the task's start commit, but the pre-push hook and CI read them where the work forks from the remote. A task that began before the policy was committed, or before it changed, signed every approval under other rules, so the push held with "given under a different policy" however often it was approved. They now all read the rules from the same place.
+- **Fixed: the console helper saw no repository.** Started by launchd without your shell's `DEVELOPER_DIR`, `git` refused to run on a Mac whose Xcode licence was not accepted, and 05 reported "not inside a git work tree". Only git's own "not a repository" says that now; any other failure shows git's message. `use05 cloud install` passes the developer tools' location to the helper.
+- **Fixed: removing an old machine from the console could cut off the live one.** The Machines list re-sorted by last heard every few seconds, so a click could land on a different row. It is now ordered by when each was paired, the confirmation says whether the machine is online now or when it was last heard, and pairing a machine again retires its earlier pairings (same signing key) instead of leaving offline duplicates.
+
 ## 0.0.9
 
 - **Setup you can follow.** `use05 init` ends by telling you to commit what it wrote (`git add .05 AGENTS.md && git commit -m "Set up 05"`, with `.codex` when it wrote one) until it is committed, since the rules count at a push and in CI only then. The README, the guide and the site walk the real first run: commit the setup, create your approver key, approve the first push once (it changes 05's own rules), and work on a branch of your own when you work by hand.

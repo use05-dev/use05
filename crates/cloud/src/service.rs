@@ -2,9 +2,13 @@
 //! where neither is there, the command to run under whatever supervisor you have.
 
 /// The launchd job (macOS): run at login, kept alive, logging to `log`.
-pub fn launchd_plist(exe: &str, path_env: &str, log: &str) -> String {
+/// `developer_dir` is where the command line developer tools are. A login shell usually sets it; a
+/// launchd job starts without it, and on a Mac whose Xcode licence is not accepted `/usr/bin/git`
+/// then refuses to run, so the helper could see no repository.
+pub fn launchd_plist(exe: &str, path_env: &str, developer_dir: Option<&str>, log: &str) -> String {
+    let dev = developer_dir.map(|d| format!("<key>DEVELOPER_DIR</key><string>{d}</string>")).unwrap_or_default();
     format!(
-        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n<plist version=\"1.0\"><dict>\n<key>Label</key><string>dev.use05.cloud</string>\n<key>ProgramArguments</key><array><string>{exe}</string><string>run</string></array>\n<key>EnvironmentVariables</key><dict><key>PATH</key><string>{path_env}</string></dict>\n<key>RunAtLoad</key><true/>\n<key>KeepAlive</key><true/>\n<key>StandardOutPath</key><string>{log}</string>\n<key>StandardErrorPath</key><string>{log}</string>\n</dict></plist>\n"
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n<plist version=\"1.0\"><dict>\n<key>Label</key><string>dev.use05.cloud</string>\n<key>ProgramArguments</key><array><string>{exe}</string><string>run</string></array>\n<key>EnvironmentVariables</key><dict><key>PATH</key><string>{path_env}</string>{dev}</dict>\n<key>RunAtLoad</key><true/>\n<key>KeepAlive</key><true/>\n<key>StandardOutPath</key><string>{log}</string>\n<key>StandardErrorPath</key><string>{log}</string>\n</dict></plist>\n"
     )
 }
 
@@ -31,8 +35,15 @@ mod tests {
 
     #[test]
     fn the_mac_job_keeps_the_helper_alive() {
-        let plist = launchd_plist("/usr/local/bin/use05-cloud", "/usr/bin:/bin", "/Users/a/.config/05/cloud.log");
+        let plist = launchd_plist("/usr/local/bin/use05-cloud", "/usr/bin:/bin", None, "/Users/a/.config/05/cloud.log");
         assert!(plist.contains("<string>dev.use05.cloud</string>") && plist.contains("<key>KeepAlive</key><true/>"), "{plist}");
         assert!(plist.contains("<string>/usr/local/bin/use05-cloud</string><string>run</string>"));
+    }
+
+    #[test]
+    fn the_mac_job_hands_the_helper_the_developer_tools() {
+        let plist = launchd_plist("/x/use05-cloud", "/usr/bin:/bin", Some("/Library/Developer/CommandLineTools"), "/l");
+        assert!(plist.contains("<key>DEVELOPER_DIR</key><string>/Library/Developer/CommandLineTools</string>"), "{plist}");
+        assert!(!launchd_plist("/x/use05-cloud", "/usr/bin:/bin", None, "/l").contains("DEVELOPER_DIR"));
     }
 }

@@ -59,6 +59,13 @@ pub fn dirs(dir: &Path) -> Result<Dirs> {
         .output()
         .map_err(|e| Error::new("GIT_MISSING", format!("git could not be started ({e})")))?;
     if !out.status.success() {
+        // Only "not a repository" means that. Any other failure (an unaccepted Xcode licence, a
+        // repository owned by someone else) is git's own message, which says what to fix.
+        let why = String::from_utf8_lossy(&out.stderr);
+        let why = why.trim();
+        if !why.is_empty() && !why.contains("not a git repository") {
+            return Err(Error::new("GIT_FAILED", format!("git could not read {}: {why}", dir.display())));
+        }
         return Err(Error::new("NOT_A_REPO", format!("{} is not inside a git work tree", dir.display()))
             .with_next("run it inside a git repository, or pass --repo <dir>"));
     }
@@ -411,6 +418,17 @@ pub fn count_commits(top: &Path, base: &str, head: &str) -> usize {
 
 pub fn merge_base(top: &Path, a: &str, b: &str) -> Option<String> {
     text(top, &["merge-base", a, b]).ok().filter(|s| !s.is_empty())
+}
+
+/// Where `commit` forks from the remote's tip of the branch it is bound for: the commit a push
+/// of it is measured against, and so the commit whose rules judge it. `None` when there is no
+/// remote to compare with. The pre-push gate, CI and approvals all read their rules from here, so
+/// an approval is signed under the rules that will judge it.
+pub fn fork_from_remote(top: &Path, commit: &str) -> Option<String> {
+    if list_refs(top, &["refs/remotes/"]).is_empty() {
+        return None;
+    }
+    ["@{upstream}", "origin/HEAD", "origin/main", "origin/master"].iter().find_map(|u| resolve_commit(top, u)).and_then(|u| merge_base(top, &u, commit))
 }
 
 #[cfg(test)]

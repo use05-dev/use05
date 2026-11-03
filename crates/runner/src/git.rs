@@ -37,6 +37,11 @@ pub(crate) fn toplevel(dir: &Path) -> Result<PathBuf, RunnerError> {
         .output()
         .map_err(RunnerError::GitMissing)?;
     if !out.status.success() {
+        // Only "not a repository" means that; anything else is git's own message (see core's `dirs`).
+        let why = String::from_utf8_lossy(&out.stderr).trim().to_string();
+        if !why.is_empty() && !why.contains("not a git repository") {
+            return Err(RunnerError::GitFailed { what: "finding the repository", stderr: why });
+        }
         return Err(RunnerError::NotARepo(dir.display().to_string()));
     }
     Ok(PathBuf::from(String::from_utf8_lossy(&out.stdout).trim().to_string()))

@@ -199,7 +199,8 @@ The console works for one person by default. To bring in others, go to **Team**:
 
 ## When something is stuck
 
-- **A machine shows offline.** A machine is online when it was heard from in the last 90 seconds. Is it awake? `use05 cloud status` says whether it reaches the console; the log is `~/.config/05/cloud.log`. If the helper is not running, `use05 cloud install`.
+- **A machine shows offline.** A machine is online when it was heard from in the last 90 seconds. Is it awake? `use05 cloud status` says whether it reaches the console; the log is `~/.config/05/cloud.log`. If the helper is not running, `use05 cloud install`. If its log says a repository "could not be read" with a message from git (on a Mac, that the Xcode licence is not accepted), fix what git says (`sudo xcodebuild -license accept`), then run `use05 cloud install` again so the helper knows where the developer tools are.
+- **Old copies of a machine are listed.** Pairing a machine again retires its earlier pairings (the same signing key), so they no longer pile up. Machines are listed newest first and do not move while you read. Before revoking, read the confirmation: it says whether that machine is online now or when it was last heard. Revoke the one that was heard long ago, never the one that is online now.
 - **"Nothing needs you", but work is held.** Home counts both approvals asked for and work held without a request; each held task says how to unblock it. If a task waits for an approval that never appears, the machine that did the work is offline or the passkey is not pinned there.
 - **An approval is filed but does not count.** The work or the policy changed after it was prepared. Ask the agent to finish again; a fresh request appears.
 - **The machine could not file an approval.** Usually the passkey is not pinned there yet: run `use05 cloud enrol` on that machine.

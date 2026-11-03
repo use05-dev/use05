@@ -74,7 +74,12 @@ impl Ctx {
                 store.save(t)?;
             }
         }
-        let base = policy_rev.map(str::to_string).or_else(|| task.as_ref().and_then(|t| t.base_commit.clone())).or_else(|| git::head_commit(&top));
+        // Whatever decides acceptance reads its rules where a push would be judged: the commit the
+        // work forks from on the remote. Approving must sign under those same rules, or a task that
+        // began before the policy changed could never be approved in a way a push counts. With no
+        // remote, or when the hooks are only watching, the task's own base is used.
+        let judged_at = if strict && policy_rev.is_none() { git::head_commit(&top).and_then(|h| git::fork_from_remote(&top, &h)) } else { None };
+        let base = policy_rev.map(str::to_string).or(judged_at).or_else(|| task.as_ref().and_then(|t| t.base_commit.clone())).or_else(|| git::head_commit(&top));
         // A change's rules come from its base. If there is no committed policy yet, the hooks
         // and `prove` follow the working file, so a fresh `init` works before its first commit;
         // a push, CI and whatever decides acceptance hold the change to the defaults.

@@ -67,7 +67,7 @@ export function Machines() {
                 {m.stale && !m.revoked && <div className="sub">Made before your console's key changed, so the console refuses it. Make a new token and revoke this one.</div>}
                 <div className="sub">{m.online ? "online" : `last heard ${ago(m.last_seen)}`}, {m.repos} repositor{m.repos === "1" || m.repos === 1 ? "y" : "ies"}{m.use05_version ? `, use05 ${m.use05_version}` : ""}</div>
               </div>
-              {!m.revoked && m.yours && <button className="btn small danger" onClick={async () => { if (confirm(`Revoke ${m.name}? It stops reporting until paired again.`)) { await post(`/machines/${m.id}/revoke`); reload(); } }}>Revoke</button>}
+              {!m.revoked && m.yours && <button className="btn small danger" onClick={async () => { if (confirm(`Revoke ${m.name}${m.person ? `, ${m.person}'s` : ""} (${m.online ? "online now" : `last heard ${ago(m.last_seen)}`})? It stops reporting until paired again.`)) { await post(`/machines/${m.id}/revoke`); reload(); } }}>Revoke</button>}
             </div>
           ))}
         </div>
