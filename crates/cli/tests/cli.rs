@@ -1946,12 +1946,15 @@ fn a_push_held_despite_an_approval_says_why_the_approval_does_not_count() {
     // (no task, so the base is HEAD), while the push is held to origin's.
     assert_eq!(code(&s.run(&["policy", "set", "approvals.expire_days", "3"])), 0);
     s.commit_all("shorter approvals");
-    let approve = s.run_with_stdin(&["approve", "--outcome", "--tree", "HEAD", "--passphrase-stdin"], "correct horse\n");
-    assert_eq!(code(&approve), 0, "{}", text(&approve));
+    for _ in 0..2 {
+        let approve = s.run_with_stdin(&["approve", "--outcome", "--tree", "HEAD", "--passphrase-stdin"], "correct horse\n");
+        assert_eq!(code(&approve), 0, "{}", text(&approve));
+    }
     let held = push();
     let said = String::from_utf8_lossy(&held.stderr).to_string();
     assert!(!held.status.success(), "{said}");
     assert!(said.contains("does not count") && said.contains("policy"), "the push says why the approval does not count:\n{said}");
+    assert_eq!(said.matches("does not count").count(), 1, "one person approving twice is said once:\n{said}");
 }
 
 // ----------------------------------------------------------------------------- declarations reach CI (D65)

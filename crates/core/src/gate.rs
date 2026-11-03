@@ -711,11 +711,17 @@ pub fn evaluate(input: &GateInput<'_>) -> Result<GateResult> {
     } else if findings.iter().any(|f| f.approvable && f.effect == Effect::Approval) {
         // An approval that is there but does not count is named, with why, never passed over
         // as if nobody had approved.
+        let mut said = Vec::new();
         for a in approval_info.iter().filter(|a| a.vote == Vote::Approve) {
             if let Some(why) = a.void {
                 let what = if a.scope == ApprovalScope::Intent { "intent" } else { "outcome" };
+                // Approving twice is one person's approval, said once.
+                if said.contains(&(a.by.key_id.clone(), what, why)) {
+                    continue;
+                }
+                said.push((a.by.key_id.clone(), what, why));
                 findings.push(
-                    Finding::new("APPROVAL_NOT_COUNTED", Effect::Approval, format!("{}'s approval of the {what} does not count: {why}", a.by.name))
+                    Finding::new("APPROVAL_NOT_COUNTED", Effect::Approval, format!("an approval of the {what} by {} does not count: {why}", a.by.name))
                         .approvable()
                         .next(format!("use05 approve --{what}")),
                 );
