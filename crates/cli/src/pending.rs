@@ -126,7 +126,9 @@ pub fn survey_with(base: &Ctx, limit: usize) -> Survey {
     let (store, top) = (&base.store, base.top());
     let now = now_secs();
     let mut all: Vec<(Task, u64)> = store.list().into_iter().filter(|t| t.status != Status::Discarded).map(|t| { let at = store.last_activity(&t); (t, at) }).collect();
-    all.sort_by_key(|(_, a)| std::cmp::Reverse(*a));
+    // Newest activity first; tasks touched in the same second keep a fixed order (newest created, then id),
+    // so the same list reads the same on every machine.
+    all.sort_by(|(ta, a), (tb, b)| b.cmp(a).then_with(|| tb.created.cmp(&ta.created)).then_with(|| ta.id.cmp(&tb.id)));
     let recent = all.iter().take_while(|(_, a)| now.saturating_sub(*a) <= WINDOW_SECS).count();
     let keep = if recent == 0 { all.len().min(1) } else { recent }.min(limit);
     let left_out = all.len() - keep;

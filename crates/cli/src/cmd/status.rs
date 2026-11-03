@@ -61,7 +61,7 @@ fn machine(ui: &Ui) -> Option<Status> {
             Err(_) => (seen.path.clone(), 0, 0, seen.seen),
         })
         .collect();
-    rows.sort_by_key(|(_, waiting, working, last)| (std::cmp::Reverse(*waiting), std::cmp::Reverse(*working), std::cmp::Reverse(*last)));
+    rows.sort_by_key(|(path, waiting, working, last)| (std::cmp::Reverse(*waiting), std::cmp::Reverse(*working), std::cmp::Reverse(*last), path.clone()));
     let more = rows.len().saturating_sub(SHOWN);
     rows.truncate(SHOWN);
 

@@ -4127,6 +4127,8 @@ fn number_of(screen: &str, title: &str) -> String {
 fn two_waiting() -> (Sandbox, String, String) {
     let s = Sandbox::waiting_for_approval();
     let first = json(&s.run(&["approve", "--unsigned", "--json"]))["details"]["task"].as_str().unwrap().to_string();
+    // Tasks are ordered by when they last changed, to the second: the second one is made a second later.
+    std::thread::sleep(std::time::Duration::from_millis(1100));
     let out = s.run(&["start", "Second change", "--scope", ".05/**", "--json"]);
     assert_eq!(code(&out), 0, "{}", text(&out));
     let second = json(&out)["details"]["task"].as_str().unwrap().to_string();
