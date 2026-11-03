@@ -1,0 +1,19 @@
+[package]
+name = "use05-policy-wasm"
+description = "The policy editor's checks, compiled to WebAssembly for the console's web app."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+use05-policy-edit = { path = "../policy-edit" }
+use05-core = { path = "../core" }
+serde_json = "1"
+wasm-bindgen = "0.2"
+# Nothing here draws random numbers, but a dependency links getrandom; in a browser it would use crypto.getRandomValues.
+getrandom = { version = "0.2", features = ["js"] }

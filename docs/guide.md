@@ -45,7 +45,7 @@ git clone https://github.com/use05-dev/use05 && cd use05
 cargo build --release -p use05     # the binary is target/release/use05
 ```
 
-Check it worked: `use05 --version`.
+Check it worked: `use05 --version`. Each way also installs `use05-cloud`, the helper for [your own console](#your-own-console) (`use05 cloud …`); from source, build it with `cargo build --release -p use05-cloud`.
 
 ## Set up a repository
 
@@ -178,15 +178,38 @@ use05 approve --outcome      # approve the finished change (the default)
 use05 approve --reject --reason "Retries must stay at five"
 ```
 
-You are asked for your approver passphrase. An approval is signed, tied to the exact content and the policy, and expires after `approvals.expire_days` (7 by default). If the change moves on, the approval no longer counts and the brief says so.
+You are asked for your approver passphrase. An approval is signed, tied to the exact content and the policy, and expires after `approvals.expire_days` (7 by default). If the change moves on, the approval no longer counts and the brief says so. So does an approval prepared elsewhere that is dated ahead or made to last longer than `approvals.expire_days`: 05 checks the dates against your policy, not against what the approval says.
 
 **Across machines and CI.** Approvals and receipts live on ordinary git branches (`05-receipts/<key>`). Add `--push` to `approve`, `bypass` or `prove` to push that branch to `origin`, and `use05 brief --fetch` pulls everyone else's first. In scripts, `--passphrase-stdin` reads the passphrase from the first line of stdin instead of the terminal (for `approve`, `bypass` and `key new --approver`).
+
+**Approving with a passkey, or anything that signs elsewhere.** A person can also approve with a passkey (Face ID, a fingerprint, a security key), from a page that holds it. 05 prepares the statement and files the signed result; the signing happens elsewhere:
+```sh
+use05 approve --unsigned --json      # the exact statement and the passkey challenge; nothing is signed or stored
+use05 approve --signed approval.json # file it, if a key you trust as an approver signed it
+```
+`--unsigned` takes the same `--intent`, `--reject`, `--reason`, `--task` and `--tree` as a normal approval. `--signed` refuses an approval no trusted approver key signed (`APPROVAL_NOT_TRUSTED`) and files it under the tree or plan it names, whatever task is current. A passkey counts on your machine when its public key is a line in `passkeys.pub` in 05's per-user directory (`<public key> <name>`, one per line); for the CI gate, list it under `[[trust.key]]` with `role = "approver"` and `person` set to the owner's name, and list the preparing machine's key (the "machine" line of `use05 key show` on that machine) with `role = "local"`. `--unsigned` includes this machine's co-signature (`details.cosignature`); the signer puts it in the envelope next to the passkey's own entry. A passkey approval counts only with that co-signature and only for the person who owns the work; otherwise it is filed but does not count, and `--signed` and the brief say why. Passkeys approve and reject; they cannot bypass.
 
 **Break glass.** To let one exact change through a block, with a reason:
 ```sh
 use05 bypass --reason "Hotfix for the outage, reviewed on the call"
 ```
 It lasts 4 hours by default (`--hours`), needs your passphrase, is logged, and shows in the brief. A folder or file listed in `absolute`, or any rule when `bypass = false`, cannot be bypassed. Agents can never bypass.
+
+## Testing before a push
+
+A policy can ask that the developer tried the change in their own development environment before it is pushed to chosen branches. In the policy:
+```toml
+[testing]
+local = "required"          # off | skippable | required
+branches = ["main"]         # optional; by default the branch changes land on
+```
+When you have tried it, sign off with a short note of what you tried:
+```sh
+use05 approve --tested --note "Signed up, paid an invoice, checked the receipt email"
+```
+Where the policy says `skippable`, you may skip it instead, saying why: `use05 approve --skip-testing --reason "Only a comment changed"`. Both need your approver passphrase, so an agent cannot sign off for you, and both are bound to the exact code: change it afterwards, and sign off again.
+
+The pre-push hook holds a push to those branches until there is a sign-off (`TESTING_REQUIRED`), and so does the CI gate, for the branch a pull request or a merge queue merges into, or the branch pushed, so skipping the hook does not get around it. Without `branches`, the landing branch is the policy's `[branches] target`, else the host's default branch (in GitHub Actions), else origin's; never the target an agent declares. A CI run that names no branch at all is held as if it went to the landing branch. An approval never counts as a sign-off: accepting a change is not trying it. The sign-off, with its note, is filed with the change's receipts, shows in the brief under Tested, and, with your own console, on the task's page, where the person driving the work can also sign off from their phone with their passkey (`--unsigned` and `--signed` work for testing as they do for approvals).
 
 ## Long sessions, large changes and subagents
 
@@ -208,9 +231,18 @@ Run as many agents as you like on one repository:
 
 `[drift] overlap` sets how strict this is (`warn` by default), and `reservation_idle_hours` (2 by default) frees an idle session's area.
 
+**Work left behind.** An agent that stopped halfway leaves its worktree and branch, and the task keeps asking for a person. `use05 discard <task>` throws it away: it shows what would go (the worktree, the branch here and on origin) and what would be lost that exists nowhere else (commits on no remote branch and not landed, files never committed), and asks you at the terminal. Then it removes them and records the task as discarded, so briefs and gates stop asking about it. It never deletes the branch where work lands or one the policy keeps, never discards while an agent's session is still working on it, and does nothing if the work moved since you looked. An agent cannot discard: it needs a person at a terminal, or your passkey from your console (**Discard this work** on the task's page, where work untouched for a week is marked as looking abandoned). Receipts already pushed stay as they are.
+
 ## Configure: `.05/policy.toml`
 
-`use05 init` writes the file with comments, and `use05 policy --edit` changes it by asking the setup questions again, so you rarely need to edit it by hand. `use05 policy` shows the effective value of every setting and where it came from. A change is held to the rules at its **base**, never its own, so editing the policy is itself a change a person approves before it takes effect.
+`use05 init` writes the file with comments, and `use05 policy --edit` changes it by asking the setup questions again, so you rarely need to edit it by hand. To change one rule, change just that rule; the rest of the file, comments included, stays as it is:
+```sh
+use05 policy set testing.local required
+use05 policy add protect.paths "billing/**"
+use05 policy add require '{ when = ["src/api/**"], also = ["docs/api/**"], why = "the API docs" }'
+use05 policy remove require 1           # a rule by its number, or by its name
+```
+Each prints the setting before and after, and says so when the change makes the rules less strict. `use05 policy` shows the effective value of every setting and where it came from. A change is held to the rules at its **base**, never its own, so editing the policy is itself a change a person approves before it takes effect.
 
 | Setting | Default | What it does |
 |---|---|---|
@@ -245,8 +277,10 @@ Run as many agents as you like on one repository:
 | `[record] middle` | `"local"` | What agents did is recorded on this machine and never uploaded. `off` records nothing. |
 | `[enforce] on_error` | `"open"` | If 05 itself fails: `open` lets the change through and says so loudly; `closed` refuses it. |
 | `[env] allow` | unrestricted | If set, the only environment variables any check may be passed. |
-| `[[trust.key]]` `name`, `role`, `public`, `expires` | none | A public key whose signatures count: `role = "runner"` for a CI runner (authoritative), `"approver"` for a person's approval key, `"local"` for another machine (advisory). `public` is the contents of the `.pub` file; `expires` (for example `"2027-12-31"`) stops trusting it after that date. See the CI gate guide. |
+| `[[trust.key]]` `name`, `role`, `public`, `expires`, `person` | none | A public key whose signatures count: `role = "runner"` for a CI runner (authoritative), `"approver"` for a person's approval key, `"local"` for another machine (advisory). `public` is the contents of the `.pub` file; `expires` (for example `"2027-12-31"`) stops trusting it after that date. `person` (0.0.7 and later) is whose key it is, as git records their name: a passkey approves only that person's work, and a machine key prepares approvals only for them. Use 0.0.7 or later everywhere that reads the policy (set `[use05] min_version = "0.0.7"`): an older use05 refuses a policy with `person`. See the CI gate guide. |
 | `[[require]]` `when`, `also` | none | Files that must change together. A change that touches anything in `when` must also touch something in `also`, or the brief reports `ALSO_CHANGE_MISSING`. For example `when = ["src/api/**"]`, `also = ["docs/api/**"]`; `when = ["**"]` means every change. Optional: `severity` (`approval` by default; `warn` or `deny`) and `why`, which the agent and the brief are told. 05 checks only that a file there changed, not what the change says. Any number of rules. |
+| `[testing] local` | `"off"` | Whether a person must try a change in their own environment before it is pushed: `skippable` asks for a sign-off and lets them skip it with a reason; `required` takes only a sign-off. See [Testing before a push](#testing-before-a-push). |
+| `[testing] branches` | the landing branch | Which pushed-to branches need it, as patterns such as `main` or `release/*`. |
 | `[[environment]]` `name`, `branch`, `level` | none | Which branch is which environment, e.g. `name = "dev"`, `branch = "main"`. `level` (`dev`, `uat`, `pre-prod` or `prod`) is needed only when the name is not a level, such as a second dev environment `dev-eu`. Shown by `use05` and the brief, levels side by side; environment branches are never deleted. |
 
 An organisation can add a signed layer of rules on top. Repositories can tighten that layer, but never loosen it. `use05 policy` shows which settings came from it.
@@ -278,6 +312,71 @@ An organisation can set a minimum for every repository: rules a repository can t
 
 Hooks and the pre-push hook run on your machine, where an agent running as you can reach them, so they are advisory. The CI gate is what enforces: a runner the agent cannot reach runs the checks and signs the result, and your Git host refuses a push without it. It takes about ten minutes, once per repository: see [Turn on the CI gate](turn-on-the-ci-gate.md).
 
+## Your own console
+
+The console is a web app you host yourself, for you or your team. From your phone you see what every agent on your machines is doing, approve the work that waits for you with a passkey, edit policies, and get an email when something needs you. There is no 05-run service: your console holds your team's activity and nobody else's.
+
+**What it can read: none of your work.** Everything is encrypted end to end. Each machine seals what it reports (plans, file and folder names, checks and verdicts, the policy) to your team's key and signs it with its own; your browser checks the signature, opens it, and builds every page itself. The policy editor runs in your browser too. The console keeps sealed bytes and what it needs to route them: which machine, which repository (by an opaque id), what kind, when, and who must approve what. Emails say only that something needs you. Code, diffs, prompts and the agent's messages never leave the machine at all.
+
+**What it cannot do.** Machines connect out to it; it never reaches into a machine. A machine runs nothing it is sent: it files a signed approval only of a statement it prepared itself, co-signed with its own key, and applies only policy edits that tighten the rules, checked again on the machine. So someone who took over the console could not read your work, run anything on your machines, or approve anything a machine did not ask for.
+
+**The honest limit.** The web app's code comes from the console. Whoever controls the host could serve a page that reads what you unlock in that browser, or that shows you one thing and asks your passkey to sign another: a real approval, a policy edit, or a new team key for your machines. Host it where only you or your team can change it. Machines and CI keep their own checks even then: nothing runs that a machine did not prepare, and a policy edit only tightens. Two smaller limits: the console can show an older copy of a record to a browser that never saw the newer one (a browser that did refuses it), and someone who left could, working with whoever runs the host at the moment the key changes, take the copy of the new key meant for one member; that member then cannot unlock, and the admin's browser refuses it outright if it saw that member's key before.
+
+**Run it.** One container image. Its data is one SQLite file, so give it a volume:
+
+```sh
+docker run -p 8080:8080 -v console-data:/data \
+  -e ORIGIN=https://console.example.com \
+  ghcr.io/use05-dev/use05-console
+```
+
+| Setting | What it is |
+|---|---|
+| `DATABASE` | The database file. In the image, `/data/console.db`; the console creates it and its tables on start. |
+| `ORIGIN` | The address people open, with `https://`. Passkeys are tied to its host name, so choose it before anyone signs up: moving later means adding passkeys again. |
+| `RP_ID` | The passkey site, if not `ORIGIN`'s host. |
+| `SETUP_SECRET` | Optional: a claim code of your own. Without it, the console makes one each time it starts while it has no owner, and writes it to its log. |
+| `CLOUDFLARE_ACCOUNT_ID` and `CLOUDFLARE_API_TOKEN`, or `SMTP_URL` | Email: Cloudflare Email Service, or any SMTP server (`smtps://user:password@host:465`). Without either, alerts show in the console only. |
+| `ALERT_FROM` | The address emails come from. |
+| `PORT` | Default 8080. |
+
+Put it behind HTTPS (passkeys need it), on a host only you or your team control. To back it up, copy the file while the console runs with `sqlite3 /data/console.db ".backup /data/backup.db"`; it holds sealed records the backup cannot read either. A host that mounts volumes owned by root (Railway, for one) needs the container to run as root to write there: on Railway, attach a volume at `/data` and set `RAILWAY_RUN_UID=0`.
+
+**Claim it, then invite people if you want.** Until someone has made a passkey, whoever signs up first would own the console, so the first sign-up needs the claim code the console writes to its log when it starts (`05 console has no owner yet … claim code: ABCDE-FGH23`; on Railway, the service's deploy logs; with Docker, `docker logs`). Run `use05 cloud login ORIGIN` on your machine: it asks for the code, opens a one-time link where you give your name and make your passkey, and then pairs the machine. (Or open `ORIGIN` and type the code there.) You are the console's admin. You stay signed in until you have not used it for an hour, also when you open it from a link in an email; after that, or in a new browser, one passkey tap signs you in again. Open pages update as soon as anything changes.
+
+If you work with others, admins invite people from **Team**. Admins invite people from **Team**: an invitation is a link that works once, for 48 hours, and each person makes their own passkey. Admins remove people, which ends their sessions and cuts off their machines at once. The person removed still holds the team's key, so removing them also makes a new one (one passkey tap by the admin), sealed to everyone who stays; the team still reads what came before. Each person then confirms the new key for their own machines from **Home**, with their passkey. A machine takes it only from a passkey pinned on it with `use05 cloud enrol`; until then it keeps sealing to the old key. Each person sets and confirms their own email under **Settings**, and uses the name git records them under (`git config user.name`), so approvals from their phone match their own work in CI.
+
+**Passkeys and the recovery code.** Your passkey signs you in, approves, and unlocks your key to the team's records, which needs a passkey with the PRF feature: iCloud Keychain on iOS 18 or macOS 15 and later, Google Password Manager, a recent Chrome, 1Password, or a YubiKey 5. When you join you get a recovery code, 32 letters and digits, shown once. Keep it somewhere safe: it unlocks your key on a device whose passkey cannot (a passkey without PRF still signs you in), and it is the only way back if you lose your passkeys. Make a new one under **Settings**; it replaces the old.
+
+**Pair a machine.** `use05-cloud` comes with 05 (0.0.7 and later). On each Mac or Linux machine:
+
+```sh
+use05 cloud login https://console.example.com   # shows a word to type under Machines, then a code
+use05 cloud add                                   # in each repository you want to see
+use05 cloud enrol                                 # pin your passkeys here, at the terminal
+use05 cloud install                               # keep it running in the background
+```
+
+Run `login` inside a repository and it does the other three for that repository too, asking you to confirm each passkey; elsewhere, or with no person at the terminal, it says what is next.
+
+`install` keeps the helper running: a launchd job on macOS, a `systemd --user` service on Linux (run `loginctl enable-linger $USER` to keep it running while you are logged out). Where there is neither, such as a container, it prints the command to run under your own supervisor. `use05 cloud status` says which, and where its keys are: files only you can read, which an agent running as you can still reach.
+
+`login` shows a word; type it in the console, which only someone at that terminal can do. Then the terminal and your browser each show a code, worked out from your console's key, the machine's keys and a random number from each side; pair only if the two are the same, or the console has swapped a key. A machine belongs to whoever pairs it: only they can approve the work done on it. Another machine reporting a repository that one already reports waits until an admin allows it.
+
+**For phone approvals to count in CI,** list each person's passkey under `[[trust.key]]` with `role = "approver"` and their `person`, and the machine that prepares their approvals with `role = "local"` and the same `person`; see [Turn on the CI gate](turn-on-the-ci-gate.md).
+
+**Cloud agent sessions.** For 05 to hold work done in Claude Code or Codex in the cloud, it has to travel with the repository: run `use05 init --shared-hooks` and commit `.claude/settings.json`. In a Claude Code cloud session (and only there) the first hook installs this version of 05 when the session lacks it, and, when the session has a token, reports to your console. Make the token under **Machines**, *Cloud sessions and CI*, for one repository; in Claude Code store it in the cloud environment as `USE05_SESSION`. A session's token reports for that repository only, as you, and is sent nothing to run; what it reports shows as coming from the cloud session, and never replaces what a machine paired at a terminal reported. When someone leaves and the team's key changes, every token made before stops working (the Machines page says which): make new ones. The agent can read it, so treat what a session reports as the session's word. Codex cloud runs its agent offline by default, so there the work's receipts travel in the repository and CI reports for it (below). In both, CI is the strong control: local hooks are advisory everywhere.
+
+**CI on the console.** Make a token for CI the same way and store it as the CI secret `USE05_CI`, next to `USE05_RUNNER_KEY`. Around the CI gate:
+```sh
+use05-cloud ci collect                            # file approvals signed on the console since the last run
+use05 gate --ci --json > gate.json || true        # the gate, as before
+use05-cloud ci report gate.json                   # the verdict, sealed to your team
+```
+The repository's page then shows CI's latest verdict, or "CI gate not seen" while nothing has come. When CI holds work for a person and no machine can prepare the approval (a cloud session that has ended, work done without 05), `report` prepares it for the person who made the token, co-signed by the runner key, and asks on the console; they approve with their passkey, and the next run's `collect` files it. It asks only when an approval would clear something: a missing testing sign-off is given at a terminal. For it to count, the policy lists their passkey with their `person` and the runner key with `role = "runner"`. Asking someone other than the token's person is not built yet.
+
+**Edits from the phone only tighten.** The console may change where agents may work and how strictly 05 holds them, and only to make it stricter: protect or lock more, raise a strictness, require more. Anything that loosens a rule, and anything that decides what runs, what is trusted or what counts as proof, is changed at a terminal.
+
 ## Commands
 
 | Command | What it does |
@@ -288,11 +387,12 @@ Hooks and the pre-push hook run on your machine, where an agent running as you c
 | `use05 finish --outcome "<text>"` | Record what was done, in the author's words. Treated as a claim, never a fact. |
 | `use05 prove [names] [-- command]` | Run checks on the change and sign the result. |
 | `use05 brief` | The one page a person reads. `--json` for data, `--fetch` to pull others' receipts first. |
-| `use05 approve` | Approve or reject a plan (`--intent`) or a finished change (`--outcome`). |
+| `use05 approve` | Approve or reject a plan (`--intent`) or a finished change (`--outcome`); `--tested --note` signs off that you tried it, `--skip-testing --reason` skips that where allowed; `--unsigned` and `--signed` for a passkey or another signer. |
 | `use05 bypass --reason "<text>"` | Let one exact change through a block, for a stated reason. Logged. |
 | `use05 land` | Move an allowed change into its target branch, then clean up its branch and worktree. |
+| `use05 discard <task>` | Throw abandoned work away: its worktree and branch, here and on origin, after showing what would be lost. Needs a person at the terminal; `--unsigned` and `--signed` for a passkey. |
 | `use05 verify <receipt>` | Check a receipt offline: no account, no network. |
-| `use05 policy` | The effective policy, and where each setting came from. `--edit` changes it through the setup questions. |
+| `use05 policy` | The effective policy, and where each setting came from. `set`, `add` and `remove` change one rule; `--edit` changes it through the setup questions. |
 | `use05 doctor` | Check the setup, and how strongly each control is enforced. |
 | `use05 key new --approver` | Create your passphrase-protected approver key. `use05 key show` lists this machine's keys. |
 | `use05 gate` | The gate on its own: `--git-hook pre-push` is what the pre-push hook runs; `--ci` proves the required checks with the runner key, then gates (what the CI workflow runs; `--push` keeps the runner's receipts). |

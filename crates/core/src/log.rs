@@ -83,11 +83,16 @@ fn append_line(state_dir: &Path, task_id: &str, event: Value, t: String) -> Resu
 
 #[allow(unsafe_code)]
 fn lock(file: &fs::File) {
-    use std::os::unix::io::AsRawFd;
-    // SAFETY: flock on a descriptor this function borrows; it only blocks until the lock is ours.
-    unsafe {
-        libc::flock(file.as_raw_fd(), libc::LOCK_EX);
+    #[cfg(unix)]
+    {
+        use std::os::unix::io::AsRawFd;
+        // SAFETY: flock on a descriptor this function borrows; it only blocks until the lock is ours.
+        unsafe {
+            libc::flock(file.as_raw_fd(), libc::LOCK_EX);
+        }
     }
+    #[cfg(not(unix))]
+    let _ = file;
 }
 
 pub fn read(state_dir: &Path, task_id: &str) -> Vec<Value> {

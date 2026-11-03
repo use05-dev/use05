@@ -24,6 +24,8 @@ const AGENT_COMMAND_PREFIX: &str = "use05 hook ";
 pub struct Args {
     pub ci: Option<String>,
     pub no_hooks: bool,
+    /// Claude Code's hooks in the committed settings, so they travel with the repository (D86).
+    pub shared_hooks: bool,
     pub no_agents_md: bool,
     pub repo: PathBuf,
     /// Ask the setup questions (on a terminal, or with --guided).
@@ -102,7 +104,7 @@ pub fn inspect(top: &Path) -> Setup {
     let pre_push = hooks_dir(top).join("pre-push");
     Setup {
         policy_file: top.join(POLICY_PATH).exists(),
-        claude_hooks: has_agent_hooks(&top.join(".claude/settings.local.json")),
+        claude_hooks: has_agent_hooks(&top.join(".claude/settings.local.json")) || has_agent_hooks(&top.join(".claude/settings.json")),
         codex_hooks: has_agent_hooks(&top.join(".codex/hooks.json")),
         pre_push: match fs::read_to_string(&pre_push) {
             Ok(t) if t.contains(HOOK_MARK) => Hook::Ours,
@@ -208,12 +210,20 @@ fn hook_runner() -> String {
     if local { format!("{LOCAL_BIN_PATH} ") } else { String::new() }
 }
 
+/// In a Claude Code cloud session (D86): install this 05 when the session lacks it, and report to
+/// your console when the session has a token (`USE05_SESSION`). Nothing happens on your own
+/// machine. The trailing comment marks it as 05's, so `uninstall` takes it out with the rest.
+fn cloud_session_hook() -> Value {
+    let version = env!("CARGO_PKG_VERSION");
+    json!({ "type": "command", "command": format!("[ \"$CLAUDE_CODE_REMOTE\" = true ] || exit 0; command -v use05 >/dev/null 2>&1 || npm install -g --silent @use05/cli@{version} >/dev/null 2>&1; [ -z \"$USE05_SESSION\" ] || use05-cloud session --background; exit 0 # {AGENT_COMMAND_PREFIX}cloud-session"), "timeout": 120 })
+}
+
 fn claude_hook_json() -> Value {
     // The Stop hook may prove the change before the agent finishes (D65), so it gets longer.
     let run = hook_runner();
     let hook = |event: &str| json!({ "type": "command", "command": format!("{run}{AGENT_COMMAND_PREFIX}claude-code {event}"), "timeout": if event == "Stop" { 90 } else { 10 } });
     json!({
-        "SessionStart": [ { "hooks": [hook("SessionStart")] } ],
+        "SessionStart": [ { "hooks": [cloud_session_hook(), hook("SessionStart")] } ],
         "UserPromptSubmit": [ { "hooks": [hook("UserPromptSubmit")] } ],
         "PreToolUse":   [ { "matcher": "Write|Edit|MultiEdit|NotebookEdit|Bash|Read|Grep|Glob", "hooks": [hook("PreToolUse")] } ],
         "PostToolUse":  [ { "matcher": "Write|Edit|MultiEdit|NotebookEdit|Bash", "hooks": [hook("PostToolUse")] } ],
@@ -458,13 +468,14 @@ pub fn run(args: Args) -> Report {
         let has = |p: &str| top.join(p).exists() || home.as_ref().is_some_and(|h| h.join(p).exists());
         // Claude Code
         if has(".claude") {
-            let path = top.join(".claude/settings.local.json");
+            let file = if args.shared_hooks { ".claude/settings.json" } else { ".claude/settings.local.json" };
+            let path = top.join(file);
             match merge_agent_hooks(&path, &claude_hook_json(), &allowed_rules()) {
                 Ok(()) => {
-                    if !manifest.items.iter().any(|i| matches!(i, Item::AgentHooks { path } if path.ends_with("settings.local.json"))) {
-                        manifest.items.push(Item::AgentHooks { path: ".claude/settings.local.json".into() });
+                    if !manifest.items.iter().any(|i| matches!(i, Item::AgentHooks { path } if path == file)) {
+                        manifest.items.push(Item::AgentHooks { path: file.into() });
                     }
-                    changed.push("installed Claude Code hooks in .claude/settings.local.json (advisory: they fail open) and let the agent run start, prove, finish, brief and land without a prompt once you have trusted this folder in Claude Code (never approve or bypass)".into());
+                    changed.push(format!("installed Claude Code hooks in {file} (advisory: they fail open) and let the agent run start, prove, finish, brief and land without a prompt once you have trusted this folder in Claude Code (never approve or bypass){}", if args.shared_hooks { "; commit it, so every checkout and cloud session runs under 05" } else { "" }));
                 }
                 Err(e) => gaps.push(format!("Claude Code hooks not installed: {e}")),
             }

@@ -118,6 +118,8 @@ pub fn unmerged(store: &Store, top: &Path, own: &crate::task::Task, changed: &[S
         let pending = match t.status {
             // Only a session that is still busy is in the way.
             Status::Active => now.saturating_sub(log::last_activity(&state, &t.id)) <= idle_secs,
+            // Thrown away: in nobody's way.
+            Status::Discarded => false,
             // Finished work is in the way until its last commit is in this change's base.
             Status::Finished => {
                 let recent = t.finished.as_deref().and_then(crate::time::parse_rfc3339).is_some_and(|f| now.saturating_sub(f) <= FINISHED_WINDOW);

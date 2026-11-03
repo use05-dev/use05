@@ -5,8 +5,8 @@
   "license": "Apache-2.0",
   "homepage": "https://use05.dev",
   "repository": { "type": "git", "url": "git+https://github.com/use05-dev/use05.git" },
-  "bin": { "use05": "bin/use05.js" },
-  "files": ["bin/use05.js", "README.md"],
+  "bin": { "use05": "bin/use05.js", "use05-cloud": "bin/use05-cloud.js" },
+  "files": ["bin/use05.js", "bin/use05-cloud.js", "README.md"],
   "engines": { "node": ">=18" },
   "optionalDependencies": {
     "@use05/cli-darwin-arm64": "0.0.0",

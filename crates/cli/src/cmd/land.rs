@@ -47,11 +47,14 @@ pub fn land_task(ctx: &Ctx, mut task: Task) -> Report {
         return Report::error("land", "BRANCH_NOT_FOUND", format!("there is no branch {branch}"), None, 6);
     };
     let base = use05_core::git::merge_base(top, &format!("refs/heads/{target}"), &head);
-    let gate = match ctx.target_from(&head, base.as_deref()).and_then(|t| ctx.gate(&t)) {
-        Ok(g) => g,
+    let (landing, gate) = match ctx.target_from(&head, base.as_deref()).and_then(|t| ctx.gate_for(&t, Some(&target)).map(|g| (t, g))) {
+        Ok(found) => found,
         Err(e) => return Report::from_core("land", e),
     };
     if gate.decision != Decision::Allow {
+        if let Some(listeners) = crate::extend::listening("approval_needed") {
+            crate::extend::approval_needed_to(&listeners, top, Some(&task.id), &landing.oid, task.intent_sha256.as_deref(), &gate);
+        }
         let first = gate.findings.iter().find(|f| f.effect >= use05_core::gate::Effect::Wait);
         return Report::error(
             "land",

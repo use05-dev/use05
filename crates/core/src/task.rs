@@ -19,6 +19,8 @@ use crate::time::now_rfc3339;
 pub enum Status {
     Active,
     Finished,
+    /// A person threw its work away (D89).
+    Discarded,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]

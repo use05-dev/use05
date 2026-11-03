@@ -119,6 +119,17 @@ impl Ctx {
     }
 
     pub fn gate(&self, target: &Target) -> Result<GateResult> {
+        self.gate_for(target, None)
+    }
+
+    /// The gate for a push (or a landing, or a merge) to `branch`: what a policy asks only then,
+    /// such as a person's testing sign-off (D87), is asked too.
+    pub fn gate_for(&self, target: &Target, pushing_to: Option<&str>) -> Result<GateResult> {
+        self.gate_on_host(target, pushing_to, None)
+    }
+
+    /// As `gate_for`, where the host (CI) also says which branch is its default.
+    pub fn gate_on_host(&self, target: &Target, pushing_to: Option<&str>, default_branch: Option<&str>) -> Result<GateResult> {
         let late = self.task.as_ref().map(|t| use05_core::task::declared_late(&self.store, t)).unwrap_or_default();
         let log = self.task.as_ref().and_then(|t| use05_core::logseal::check(self.top(), Some(&self.store.state_dir()), self.task_found().expect("a task"), &t.id));
         let overlaps = match &self.task {
@@ -147,6 +158,8 @@ impl Ctx {
             overlaps: &overlaps,
             log: log.as_ref(),
             stale_base: stale.as_ref(),
+            pushing_to,
+            default_branch,
         })
     }
 }

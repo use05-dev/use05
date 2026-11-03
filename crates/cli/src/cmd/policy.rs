@@ -8,6 +8,49 @@ use use05_core::policy::{Floor, POLICY_PATH, Policy, explain};
 use crate::ctx::Ctx;
 use crate::report::{Report, Tone};
 
+/// One rule at a time (D88): change a single setting of this repository's policy file, keeping
+/// everything else in the file as it was, and say what it was and becomes.
+pub fn one_rule(repo: &Path, op: use05_policy_edit::edit::Op, setting: &str, value: &str) -> Report {
+    let top = match use05_core::git::dirs(repo) {
+        Ok(d) => d.top,
+        Err(e) => return Report::from_core("policy", e),
+    };
+    let path = top.join(POLICY_PATH);
+    let current = match std::fs::read_to_string(&path) {
+        Ok(t) => t,
+        Err(_) => return Report::error("policy", "NO_POLICY", format!("this repository has no {POLICY_PATH}"), Some("use05 init".into()), 6),
+    };
+    let one = match use05_policy_edit::edit::one_rule(&current, op, setting, value) {
+        Ok(o) => o,
+        Err(e) => return Report::error("policy", "POLICY_INVALID", format!("{setting}: {e}"), Some("use05 policy   (shows every setting and its value)".into()), 6),
+    };
+    if let Err(e) = std::fs::write(&path, &one.preview.toml) {
+        return Report::error("policy", "IO_ERROR", format!("cannot write {}: {e}", path.display()), None, 4);
+    }
+    let show = |v: &serde_json::Value| match v {
+        serde_json::Value::Null => "(not set)".to_string(),
+        serde_json::Value::String(s) => s.clone(),
+        other => other.to_string(),
+    };
+    let mut notes = vec![format!("This changes {POLICY_PATH}, which 05 protects: commit it, and a person approves the change. It counts once merged, since a change is held to the rules at its base.")];
+    if !one.preview.loosens.is_empty() {
+        notes.insert(0, format!("This makes the rules less strict: {}. Only a terminal can do that; the console only tightens.", one.preview.loosens.join(", ")));
+    }
+    Report {
+        command: "policy",
+        outcome: "changed",
+        code: "POLICY_CHANGED",
+        tone: if one.preview.loosens.is_empty() { Tone::Good } else { Tone::Warn },
+        headline: format!("Changed {setting}"),
+        rows: vec![("before".into(), show(&one.before)), ("after".into(), show(&one.after))],
+        notes,
+        next: Some(format!("git add {POLICY_PATH} && git commit -m \"policy: {setting}\"")),
+        excerpt: vec![],
+        details: json!({ "setting": setting, "before": one.before, "after": one.after, "loosens": one.preview.loosens, "file": path }),
+        exit: 0,
+    }
+}
+
 pub fn run(repo: &Path) -> Report {
     let ctx = match Ctx::open(repo, None) {
         Ok(c) => c,

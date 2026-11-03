@@ -3,7 +3,7 @@
 //! - a program named `use05-<name>` on PATH is the command `use05 <name>`;
 //! - `use05 hook generic <event>` lets any agent use 05's hooks, with a plain answer;
 //! - programs listed in this machine's `extensions.toml` hear what happened (a declaration
-//!   sealed, a change finished, a gate decision, a landing).
+//!   sealed, a change finished, a gate decision, a landing, a task waiting for a person's approval).
 //!
 //! Event extensions are chosen per machine, by the person, never by a repository: a repository
 //! could otherwise make every hook run code its author chose. They hear identifiers and
@@ -18,7 +18,7 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 
 const PREFIX: &str = "use05-";
-pub const EVENTS: [&str; 4] = ["sealed", "finished", "gate", "landed"];
+pub const EVENTS: [&str; 7] = ["sealed", "finished", "gate", "landed", "approval_needed", "tested", "discarded"];
 
 /// Every `use05-<name>` program on PATH, first one wins, sorted by name.
 pub fn commands() -> Vec<(String, PathBuf)> {
@@ -119,17 +119,78 @@ pub fn emit(event: &str, top: &Path, fields: Value) {
 /// Like `emit`, to listeners read earlier. A gate reads them before the change's own code runs,
 /// so that code cannot choose what runs after it.
 pub fn emit_to(listeners: &[Listener], event: &str, top: &Path, fields: Value) {
-    let wanted: Vec<&Listener> = listeners.iter().filter(|l| l.events.iter().any(|e| e == event)).collect();
-    if wanted.is_empty() {
-        return;
+    emit_all(listeners, top, &[(event, fields)]);
+}
+
+/// Several events at once, every delivery at the same time: the slowest listener is waited for
+/// once, however many of the events it hears.
+pub fn emit_all(listeners: &[Listener], top: &Path, events: &[(&str, Value)]) {
+    let mut jobs: Vec<(&Listener, String)> = Vec::new();
+    for (event, fields) in events {
+        let mut message = json!({ "v": 1, "event": event, "at": use05_core::time::now_rfc3339(), "repo": top.to_string_lossy() });
+        if let (Some(m), Some(f)) = (message.as_object_mut(), fields.as_object()) {
+            m.extend(f.clone());
+        }
+        let line = format!("{message}\n");
+        jobs.extend(listeners.iter().filter(|l| l.events.iter().any(|e| e == event)).map(|l| (l, line.clone())));
     }
-    let mut message = json!({ "v": 1, "event": event, "at": use05_core::time::now_rfc3339(), "repo": top.to_string_lossy() });
-    if let (Some(m), Some(f)) = (message.as_object_mut(), fields.as_object()) {
-        m.extend(f.clone());
+    std::thread::scope(|s| {
+        for (l, line) in &jobs {
+            s.spawn(move || {
+                let _ = deliver(l, top, line);
+            });
+        }
+    });
+}
+
+/// This machine's listeners, if any of them wants `event`: so a caller can skip work nobody hears.
+pub fn listening(event: &str) -> Option<Vec<Listener>> {
+    listeners().ok().filter(|ls| ls.iter().any(|l| l.events.iter().any(|e| e == event)))
+}
+
+/// Tell listeners that a task waits for a person's approval, when the gate says so: which task,
+/// which tree, whether the plan (intent) or the result (outcome) needs it, and the finding codes.
+pub fn approval_needed_to(listeners: &[Listener], top: &Path, task: Option<&str>, tree: &str, intent_sha256: Option<&str>, r: &use05_core::gate::GateResult) {
+    if let Some(fields) = approval_needed(task, tree, intent_sha256, r) {
+        emit_to(listeners, "approval_needed", top, fields);
     }
-    let line = format!("{message}\n");
-    for l in wanted {
-        let _ = deliver(l, top, &line);
+}
+
+/// What `approval_needed` says, if the gate waits for a person.
+pub fn approval_needed(task: Option<&str>, tree: &str, intent_sha256: Option<&str>, r: &use05_core::gate::GateResult) -> Option<Value> {
+    use use05_core::gate::{Decision, Effect};
+    if r.decision != Decision::ApprovalRequired {
+        return None;
+    }
+    let asking: Vec<&use05_core::gate::Finding> = r.findings.iter().filter(|f| f.effect == Effect::Approval).collect();
+    let scope = if asking.iter().any(|f| f.next.as_deref() == Some("use05 approve --intent")) { "intent" } else { "outcome" };
+    let codes: Vec<&str> = asking.iter().map(|f| f.code).collect();
+    Some(json!({ "task": task, "scope": scope, "tree": tree, "intent_sha256": intent_sha256, "findings": codes }))
+}
+
+/// A task finished: tell listeners, and in the same breath whether it now waits for a person.
+pub fn announce_finished(ctx: &crate::ctx::Ctx, task: &use05_core::task::Task, agent: Option<&str>, tree: &str) {
+    let Ok(listeners) = listeners() else { return };
+    let mut events = vec![("finished", json!({ "task": task.id, "agent": agent, "tree": tree }))];
+    if listeners.iter().any(|l| l.events.iter().any(|e| e == "approval_needed")) {
+        if let Ok(target) = ctx.target(None) {
+            if let Ok(r) = ctx.gate(&target) {
+                if let Some(fields) = approval_needed(Some(&task.id), &target.oid, task.intent_sha256.as_deref(), &r) {
+                    events.push(("approval_needed", fields));
+                }
+            }
+        }
+    }
+    emit_all(&listeners, ctx.top(), &events);
+}
+
+/// After a task's decision is known outside the gate (finish, the Stop hook): work out the
+/// decision only if someone listens, and tell them if it waits for a person.
+pub fn announce_approval_needed(ctx: &crate::ctx::Ctx, task: &use05_core::task::Task) {
+    let Some(listeners) = listening("approval_needed") else { return };
+    let Ok(target) = ctx.target(None) else { return };
+    if let Ok(r) = ctx.gate(&target) {
+        approval_needed_to(&listeners, ctx.top(), Some(&task.id), &target.oid, task.intent_sha256.as_deref(), &r);
     }
 }
 
@@ -157,4 +218,18 @@ fn deliver(l: &Listener, top: &Path, line: &str) -> std::io::Result<()> {
     let _ = child.kill();
     let _ = child.wait();
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn events_told_together_wait_for_the_slowest_listener_once() {
+        let slow = Listener { events: vec!["finished".into(), "approval_needed".into()], run: vec!["/bin/sh".into(), "-c".into(), "sleep 1".into()], timeout_secs: 2 };
+        let started = Instant::now();
+        emit_all(&[slow], Path::new("/"), &[("finished", json!({})), ("approval_needed", json!({}))]);
+        let took = started.elapsed();
+        assert!(took >= Duration::from_millis(900) && took < Duration::from_millis(1800), "{took:?}");
+    }
 }

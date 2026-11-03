@@ -8,13 +8,14 @@
 
 use std::fs::{self, OpenOptions};
 use std::io::{Read, Write};
+#[cfg(unix)]
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::PathBuf;
 
 use base64::{Engine, engine::general_purpose::STANDARD};
 use chacha20poly1305::aead::{Aead, KeyInit};
 use chacha20poly1305::XChaCha20Poly1305;
-use use05_receipt::{SigningKey, VerifyingKey, parse_public_key, parse_secret_key, public_key_text, secret_key_text};
+use use05_receipt::{PasskeyKey, PublicKey, SigningKey, VerifyingKey, parse_any_public_key, parse_public_key, parse_secret_key, public_key_text, secret_key_text};
 
 use crate::error::{Error, Result};
 
@@ -43,12 +44,14 @@ fn random(buf: &mut [u8]) -> Result<()> {
 fn write_private(path: &PathBuf, text: &str) -> Result<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).map_err(|e| Error::io("creating the key directory", e))?;
+        #[cfg(unix)]
         let _ = fs::set_permissions(parent, fs::Permissions::from_mode(0o700));
     }
-    OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o600)
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    options.mode(0o600);
+    options
         .open(path)
         .and_then(|mut f| f.write_all(text.as_bytes()))
         .map_err(|e| Error::io(&format!("writing {}", path.display()), e))
@@ -105,6 +108,9 @@ pub fn decrypt_secret(text: &str, passphrase: &str) -> Result<SigningKey> {
 /// not a secret any more.
 pub fn read_secret_file(path: &std::path::Path) -> Result<SigningKey> {
     let meta = fs::metadata(path).map_err(|e| Error::new("KEY_UNUSABLE", format!("cannot read {}: {e}", path.display())))?;
+    #[cfg(not(unix))]
+    let _ = &meta;
+    #[cfg(unix)]
     if meta.permissions().mode() & 0o077 != 0 {
         return Err(Error::new("KEY_TOO_OPEN", format!("the secret key {} can be read by other users", path.display())).with_next(format!("chmod 600 {}", path.display())));
     }
@@ -184,9 +190,84 @@ pub fn approver_public() -> Option<VerifyingKey> {
     parse_public_key(&fs::read_to_string(public).ok()?).ok()
 }
 
+// ----------------------------------------------------------------------------- passkeys
+
+/// Passkeys this person pinned on this machine as approvers, one per line:
+/// `<public key text> <name>`. They count for this machine's gate like `approver.pub` does.
+pub fn passkeys_path() -> Result<PathBuf> {
+    Ok(user_dir()?.join("passkeys.pub"))
+}
+
+/// Every readable passkey line, with its name. Comments, blank lines and anything unreadable
+/// are skipped: a damaged line must never stop a hook or the gate.
+pub fn parse_pinned_passkeys(text: &str) -> Vec<(String, PasskeyKey)> {
+    text.lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty() && !l.starts_with('#'))
+        .filter_map(|line| {
+            let (key, name) = line.split_once(char::is_whitespace).map_or((line, ""), |(k, n)| (k, n.trim()));
+            match parse_any_public_key(key) {
+                Ok(PublicKey::Passkey(p)) => Some((if name.is_empty() { "passkey".to_string() } else { name.to_string() }, p)),
+                _ => None,
+            }
+        })
+        .collect()
+}
+
+/// The passkeys pinned here, and how many lines were not a passkey (so doctor can say so).
+#[derive(Debug, Default)]
+pub struct Pinned {
+    pub keys: Vec<(String, PasskeyKey)>,
+    pub skipped: usize,
+}
+
+/// Read a passkeys file, whatever bytes it holds: a line that is not text is one bad line, not a
+/// reason to drop the good ones.
+pub fn read_pinned_passkeys(bytes: &[u8]) -> Pinned {
+    let text = String::from_utf8_lossy(bytes);
+    let keys = parse_pinned_passkeys(&text);
+    let lines = text.lines().map(str::trim).filter(|l| !l.is_empty() && !l.starts_with('#')).count();
+    Pinned { skipped: lines - keys.len(), keys }
+}
+
+pub fn pinned_passkeys_file() -> Pinned {
+    passkeys_path().ok().and_then(|p| fs::read(p).ok()).map(|b| read_pinned_passkeys(&b)).unwrap_or_default()
+}
+
+pub fn pinned_passkeys() -> Vec<(String, PasskeyKey)> {
+    pinned_passkeys_file().keys
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pinned_passkeys_skip_comments_blank_and_bad_lines() {
+        let a = use05_receipt::PasskeyKey::from_sec1("localhost", &p256_point(1)).unwrap();
+        let b = use05_receipt::PasskeyKey::from_sec1("console.example", &p256_point(2)).unwrap();
+        let text = format!(
+            "# my passkeys\n\n{} iPhone 15\nnot a key at all\n{} YubiKey\n",
+            use05_receipt::passkey_public_text(&a).trim(),
+            use05_receipt::passkey_public_text(&b).trim()
+        );
+        let got = parse_pinned_passkeys(&text);
+        assert_eq!(got, vec![("iPhone 15".to_string(), a), ("YubiKey".to_string(), b)]);
+    }
+
+    #[test]
+    fn a_damaged_passkeys_file_keeps_its_good_lines_and_counts_the_rest() {
+        let a = use05_receipt::PasskeyKey::from_sec1("localhost", &p256_point(1)).unwrap();
+        let mut bytes = format!("{} iPhone\n", use05_receipt::passkey_public_text(&a).trim()).into_bytes();
+        bytes.extend_from_slice(b"\xff\xfe not text\nnot a key either\n# a comment\n");
+        let pinned = read_pinned_passkeys(&bytes);
+        assert_eq!(pinned.keys, vec![("iPhone".to_string(), a)]);
+        assert_eq!(pinned.skipped, 2);
+    }
+
+    fn p256_point(seed: u8) -> Vec<u8> {
+        p256::ecdsa::SigningKey::from_slice(&[seed; 32]).unwrap().verifying_key().to_encoded_point(false).as_bytes().to_vec()
+    }
 
     #[test]
     fn a_protected_key_opens_only_with_its_passphrase() {

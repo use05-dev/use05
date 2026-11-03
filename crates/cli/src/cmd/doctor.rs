@@ -175,6 +175,13 @@ fn keys_section(d: &mut Diagnosis) {
         Ok(_) => d.keys.push(Line::ok("no local key yet; one is made the first time you run `use05 prove`")),
         Err(e) => d.keys.push(Line::problem(e.message)),
     }
+    let pinned = keys::pinned_passkeys_file();
+    for (name, key) in &pinned.keys {
+        d.keys.push(Line::ok(format!("passkey {name} ({}) pinned here: approves on this machine, when the machine co-signed what it approves", key.rp_id)));
+    }
+    if pinned.skipped > 0 {
+        d.keys.push(Line::problem(format!("{} line(s) of passkeys.pub are not a passkey and are ignored", pinned.skipped)));
+    }
     if keys::approver_exists() {
         let id = keys::approver_public().map(|k| short(&use05_receipt::key_id(&k))).unwrap_or_else(|| "unknown".into());
         if keys::approver_protected() {
@@ -182,7 +189,7 @@ fn keys_section(d: &mut Diagnosis) {
         } else {
             d.keys.push(Line::note(format!("approver key {id} has no passphrase: anything that can read the file can approve. Make a new one with a passphrase")));
         }
-    } else {
+    } else if keys::pinned_passkeys().is_empty() {
         d.keys.push(Line::note("no approver key; you cannot approve changes from this machine"));
         if d.next.is_none() {
             d.next = Some("use05 key new --approver".into());

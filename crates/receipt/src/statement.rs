@@ -1,7 +1,8 @@
 //! The statements a receipt can carry: in-toto Statement v1 with a 05 predicate.
 //!
-//! Four predicate types exist: `Evidence` (a check ran on a tree), `Approval` (a person decided),
-//! `Bypass` (a person overrode a block, with a reason) and `OrgLayer` (a signed policy floor).
+//! Predicate types: `Evidence` (a check ran on a tree), `Approval` (a person decided), `Bypass` (a
+//! person overrode a block, with a reason), `Testing` (a person tried a tree themselves, or skipped
+//! it), `Discard` (a person threw a task's work away), `OrgLayer` (a signed policy floor), and the task's declaration, outcome and log seals.
 
 use std::collections::BTreeMap;
 
@@ -18,6 +19,8 @@ pub const ORG_TYPE: &str = "https://use05.dev/org-layer/v0";
 pub const INTENT_TYPE: &str = "https://use05.dev/intent/v0";
 pub const OUTCOME_TYPE: &str = "https://use05.dev/outcome/v0";
 pub const LOG_TYPE: &str = "https://use05.dev/log/v0";
+pub const TESTING_TYPE: &str = "https://use05.dev/testing/v0";
+pub const DISCARD_TYPE: &str = "https://use05.dev/discard/v0";
 
 /// A predicate has a fixed type URI.
 pub trait Predicate: Serialize + DeserializeOwned {
@@ -184,6 +187,63 @@ impl Predicate for Bypass {
     }
 }
 
+// ----------------------------------------------------------------------------- testing
+
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum Tested {
+    /// The person tried the change in their own development environment.
+    Tested,
+    /// The person did not, and said why. Counts only where the policy lets testing be skipped.
+    Skipped,
+}
+
+/// A person's word that they tried one exact tree themselves before it is pushed (D87), or that
+/// they skipped it and why. Never an approval: it says nothing about accepting the change.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct Testing {
+    pub outcome: Tested,
+    pub task: String,
+    /// What they tried, or why they skipped, in their words.
+    pub note: String,
+    pub tester: String,
+    pub created: String,
+}
+
+impl Predicate for Testing {
+    const TYPE: &'static str = TESTING_TYPE;
+    fn check(subject: &[Subject]) -> Result<(), &'static str> {
+        if has_tree(subject) { Ok(()) } else { Err("a testing sign-off needs a tree subject") }
+    }
+}
+
+// ----------------------------------------------------------------------------- discards
+
+/// A person's word to throw a task's work away: its worktree, its branch here and on origin, and
+/// what the console holds about it (D89). It says what would be lost that exists nowhere else, so
+/// whoever signs it has seen that. Subject: the work (the task, and its branch's head).
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct Discard {
+    pub task: String,
+    /// The task's own branch, when it has one 05 may delete.
+    pub branch: Option<String>,
+    /// That branch's head when the discard was prepared: if it moves, the discard does not apply.
+    pub head: Option<String>,
+    /// Commits on the branch that are on no remote branch and not in where work lands.
+    pub unpushed: u32,
+    /// Changed or new files in its worktree that were never committed.
+    pub uncommitted: u32,
+    pub by: String,
+    pub created: String,
+}
+
+impl Predicate for Discard {
+    const TYPE: &'static str = DISCARD_TYPE;
+    fn check(subject: &[Subject]) -> Result<(), &'static str> {
+        if subject.iter().any(|s| s.name == "work") { Ok(()) } else { Err("a discard needs a work subject") }
+    }
+}
+
 // ----------------------------------------------------------------------------- declarations
 
 /// An agent's sealed declaration of what it will do (D65). Subject: the intent card digest.
@@ -307,6 +367,12 @@ impl<P: Predicate> Statement<P> {
         Some((digest.get("task")?, digest.get("sha256")?))
     }
 
+    /// The work a discard is about: `(task, branch head)`, the head empty when there is no branch.
+    pub fn work_subject(&self) -> Option<(&str, &str)> {
+        let digest = self.digest_of("work")?;
+        Some((digest.get("task")?, digest.get("gitCommit").map(String::as_str).unwrap_or("")))
+    }
+
     /// The intent-card digest this statement is about.
     pub fn intent_subject(&self) -> Option<&str> {
         self.digest_of("intent")?.get("sha256").map(String::as_str)
@@ -318,6 +384,15 @@ pub fn tree_subject(oid: &str, content_sha256: &str) -> Subject {
     digest.insert("gitTree".to_string(), oid.to_string());
     digest.insert("sha256".to_string(), content_sha256.to_string());
     Subject { name: "tree".to_string(), digest }
+}
+
+pub fn work_subject(task: &str, head: Option<&str>) -> Subject {
+    let mut digest = BTreeMap::new();
+    digest.insert("task".to_string(), task.to_string());
+    if let Some(head) = head {
+        digest.insert("gitCommit".to_string(), head.to_string());
+    }
+    Subject { name: "work".to_string(), digest }
 }
 
 pub fn log_subject(task: &str, head: &str) -> Subject {
@@ -370,7 +445,7 @@ fn check_types(value: &Value, want: Option<&str>) -> Result<(), Fault> {
         ));
     }
     let predicate_type = value.get("predicateType").and_then(Value::as_str).unwrap_or("");
-    let known = [PREDICATE_TYPE, APPROVAL_TYPE, BYPASS_TYPE, ORG_TYPE, INTENT_TYPE, OUTCOME_TYPE, LOG_TYPE].contains(&predicate_type);
+    let known = [PREDICATE_TYPE, APPROVAL_TYPE, BYPASS_TYPE, ORG_TYPE, INTENT_TYPE, OUTCOME_TYPE, LOG_TYPE, TESTING_TYPE, DISCARD_TYPE].contains(&predicate_type);
     if !known || want.is_some_and(|w| w != predicate_type) {
         return Err(Fault::invalid(
             "PREDICATE_TYPE_UNSUPPORTED",
@@ -390,6 +465,8 @@ pub enum AnyStatement {
     Declaration(Statement<Declaration>),
     Completion(Statement<Completion>),
     LogSeal(Statement<LogSeal>),
+    Testing(Statement<Testing>),
+    Discard(Statement<Discard>),
 }
 
 pub(crate) fn parse_any(payload: &[u8]) -> Result<AnyStatement, Fault> {
@@ -407,6 +484,8 @@ pub(crate) fn parse_any(payload: &[u8]) -> Result<AnyStatement, Fault> {
         INTENT_TYPE => parse_as::<Declaration>(payload).map(AnyStatement::Declaration),
         OUTCOME_TYPE => parse_as::<Completion>(payload).map(AnyStatement::Completion),
         LOG_TYPE => parse_as::<LogSeal>(payload).map(AnyStatement::LogSeal),
+        TESTING_TYPE => parse_as::<Testing>(payload).map(AnyStatement::Testing),
+        DISCARD_TYPE => parse_as::<Discard>(payload).map(AnyStatement::Discard),
         _ => parse_as::<OrgLayer>(payload).map(AnyStatement::OrgLayer),
     }
 }

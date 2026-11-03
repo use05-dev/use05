@@ -1,5 +1,6 @@
 pub mod approve;
 pub mod brief;
+pub mod discard;
 pub mod doctor;
 pub mod gate;
 pub mod hook;

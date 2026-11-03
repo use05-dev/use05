@@ -1,5 +1,5 @@
 #!/bin/sh
-# Install use05 from a release: download, verify the checksum, put the binary on your PATH.
+# Install use05 from a release: download, verify the checksum, put the binaries on your PATH.
 #
 #   curl -fsSL https://use05.dev/install.sh | sh
 #
@@ -59,5 +59,11 @@ bin="$(find "$tmp" -type f -name use05 | head -n 1)"
 mkdir -p "$DIR"
 install -m 0755 "$bin" "$DIR/use05"
 say "Installed $("$DIR/use05" --version) to $DIR/use05"
+# The helper for your own console comes in the same archive (0.0.7 and later).
+cloud="$(find "$tmp" -type f -name use05-cloud | head -n 1)"
+if [ -n "$cloud" ]; then
+  install -m 0755 "$cloud" "$DIR/use05-cloud"
+  say "Installed use05-cloud to $DIR/use05-cloud (for use05 cloud, if you run your own console)"
+fi
 case ":$PATH:" in *":$DIR:"*) ;; *) say "Add it to your PATH:  export PATH=\"$DIR:\$PATH\"" ;; esac
 say "Next: cd into a repository and run: use05 init"

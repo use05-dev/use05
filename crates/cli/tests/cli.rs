@@ -18,6 +18,17 @@ struct Sandbox {
     home: TempDir,
 }
 
+/// A folder holding only `use05`, for PATH: the build folder beside it also holds other `use05-*`
+/// programs (the helper, the console), which would show up as extension commands.
+fn bin_dir() -> &'static str {
+    static DIR: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    DIR.get_or_init(|| {
+        let dir = tempfile::tempdir().unwrap().keep();
+        std::os::unix::fs::symlink(BIN, dir.join("use05")).unwrap();
+        dir.display().to_string()
+    })
+}
+
 impl Sandbox {
     fn new() -> Sandbox {
         let sandbox = Sandbox { dir: tempfile::tempdir().unwrap(), home: tempfile::tempdir().unwrap() };
@@ -56,7 +67,7 @@ impl Sandbox {
         cmd.current_dir(self.dir.path())
             .args(args)
             .env_clear()
-            .env("PATH", format!("{}:{}", Path::new(BIN).parent().unwrap().display(), std::env::var("PATH").unwrap()))
+            .env("PATH", format!("{}:{}", bin_dir(), std::env::var("PATH").unwrap()))
             .env("HOME", self.home.path())
             .env("USE05_HOME", self.home.path())
             .env("LANG", "C.UTF-8")
@@ -896,7 +907,7 @@ fn the_pre_push_hook_stops_a_push_the_gate_denies_and_no_verify_is_the_stated_wa
     s.git(&["remote", "add", "origin", &remote_path]);
     s.git(&["branch", "-M", "main"]);
     let push = |extra: &[&str]| {
-        let bin_dir = Path::new(BIN).parent().unwrap().display().to_string();
+        let bin_dir = bin_dir();
         let mut cmd = Command::new("git");
         cmd.arg("-C").arg(s.dir.path()).arg("push").args(extra).args(["origin", "main"]);
         cmd.env("PATH", format!("{bin_dir}:{}", std::env::var("PATH").unwrap())).env("USE05_HOME", s.home.path()).env("HOME", s.home.path()).env("LANG", "C.UTF-8").env("COLUMNS", "100");
@@ -953,7 +964,13 @@ fn agent_hooks_deny_the_risky_and_the_protected_and_fail_open_loudly() {
 fn doctor_reports_problems_with_a_nonzero_exit_and_never_changes_anything() {
     let s = Sandbox::initialised();
     let before = s.snapshot_files();
-    let healthy = s.run(&["doctor"]);
+    // PATH without the folders holding extensions (use05-*) installed on this computer: they are
+    // not the test's, and doctor lists them.
+    let path = std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default())
+        .filter(|d| !fs::read_dir(d).into_iter().flatten().flatten().any(|e| e.file_name().to_string_lossy().starts_with("use05-")))
+        .collect::<Vec<_>>();
+    let path = std::env::join_paths(path).unwrap();
+    let healthy = s.run_env(&["doctor"], &[("PATH", path.to_str().unwrap())]);
     assert_eq!(code(&healthy), 0, "{}", text(&healthy));
     assert!(text(&healthy).contains("advisory"), "it must be honest about enforcement strength");
     snapshot("doctor", &s, &healthy);
@@ -1851,7 +1868,7 @@ fn the_pre_push_hook_proves_what_is_missing_before_it_gates() {
     s.git(&["remote", "add", "origin", &remote_path]);
     s.git(&["branch", "-M", "main"]);
     let push = || {
-        let bin_dir = Path::new(BIN).parent().unwrap().display().to_string();
+        let bin_dir = bin_dir();
         let mut cmd = Command::new("git");
         cmd.arg("-C").arg(s.dir.path()).args(["push", "origin", "main"]);
         cmd.env("PATH", format!("{bin_dir}:{}", std::env::var("PATH").unwrap())).env("USE05_HOME", s.home.path()).env("HOME", s.home.path()).env("LANG", "C.UTF-8").env("COLUMNS", "100");
@@ -3348,4 +3365,585 @@ fn the_stop_reminder_sees_unstaged_updates_and_still_comes_after_a_failed_check(
     let second = json(&stop(true));
     assert!(second["reason"].as_str().unwrap().contains("docs/** must change"), "{second}");
     assert!(stop(true).stdout.is_empty(), "never asked twice");
+}
+
+// ---------------------------------------------------------------- passkeys and outside signers
+
+/// A test passkey made for localhost, and its public key.
+fn test_passkey(seed: u8) -> (p256::ecdsa::SigningKey, use05_receipt::PasskeyKey) {
+    let sk = p256::ecdsa::SigningKey::from_slice(&[seed; 32]).unwrap();
+    let key = use05_receipt::PasskeyKey::from_sec1("localhost", sk.verifying_key().to_encoded_point(false).as_bytes()).unwrap();
+    (sk, key)
+}
+
+impl Sandbox {
+    fn pin_passkey(&self, key: &use05_receipt::PasskeyKey, name: &str) {
+        fs::write(self.home.path().join("passkeys.pub"), format!("{} {name}\n", use05_receipt::passkey_public_text(key).trim())).unwrap();
+    }
+
+    /// A change to a protected path, proved, waiting for a person.
+    fn waiting_for_approval() -> Sandbox {
+        let s = Sandbox::initialised();
+        s.run(&["start", "Tighten the policy", "--scope", ".05/**"]);
+        s.write(".05/policy.toml", &(fs::read_to_string(s.path(".05/policy.toml")).unwrap() + "\n# edited\n"));
+        s.git(&["add", "-A"]);
+        assert_eq!(code(&s.run(&["prove"])), 0);
+        assert_eq!(code(&s.run(&["brief"])), 3);
+        s
+    }
+}
+
+/// What a browser returns for the challenge `approve --unsigned` printed, as an envelope that also
+/// carries the machine's co-signature, as a signer must.
+fn sign_with_passkey(unsigned: &Value, sk: &p256::ecdsa::SigningKey) -> String {
+    let mut envelope: Value = serde_json::from_str(&sign_with_passkey_only(unsigned, sk)).unwrap();
+    envelope["signatures"].as_array_mut().unwrap().insert(0, unsigned["details"]["cosignature"].clone());
+    envelope.to_string()
+}
+
+/// The passkey's signature alone, without the machine's co-signature.
+fn sign_with_passkey_only(unsigned: &Value, sk: &p256::ecdsa::SigningKey) -> String {
+    use base64::Engine;
+    use base64::engine::general_purpose::STANDARD;
+    use p256::ecdsa::signature::Signer;
+    use sha2::{Digest, Sha256};
+    let d = &unsigned["details"];
+    let mut auth = Sha256::digest(b"localhost").to_vec();
+    auth.extend_from_slice(&[0x05, 0, 0, 0, 1]);
+    let client = format!(r#"{{"type":"webauthn.get","challenge":"{}","origin":"http://localhost:8080"}}"#, d["challenge"].as_str().unwrap());
+    let mut message = auth.clone();
+    message.extend_from_slice(&Sha256::digest(client.as_bytes()));
+    let sig: p256::ecdsa::Signature = sk.sign(&message);
+    serde_json::json!({
+        "payload": d["payload"],
+        "payloadType": d["payload_type"],
+        "signatures": [{ "sig": STANDARD.encode(sig.to_der().as_bytes()), "webauthn": { "authenticatorData": STANDARD.encode(&auth), "clientDataJSON": STANDARD.encode(client.as_bytes()) } }],
+    })
+    .to_string()
+}
+
+#[test]
+fn approve_unsigned_prints_the_exact_statement_and_stores_nothing() {
+    use base64::Engine;
+    let s = Sandbox::waiting_for_approval();
+    let before = s.stored_receipts();
+    let out = s.run(&["approve", "--unsigned", "--reason", "from my phone", "--json"]);
+    assert_eq!(code(&out), 0, "{}", text(&out));
+    let v = json(&out);
+    assert_eq!(v["code"], "UNSIGNED");
+    let d = &v["details"];
+    let body = base64::engine::general_purpose::STANDARD.decode(d["payload"].as_str().unwrap()).unwrap();
+    let statement: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(statement["predicate"]["scope"], "outcome");
+    assert_eq!(statement["predicate"]["decision"], "approve");
+    assert_eq!(statement["predicate"]["rationale"], "from my phone");
+    assert_eq!(statement["predicate"]["task"], d["task"]);
+    assert_eq!(d["scope"], "outcome");
+    assert_eq!(d["subject"], d["tree"]);
+    let challenge = use05_receipt::passkey_challenge(d["payload_type"].as_str().unwrap(), &body);
+    assert_eq!(d["challenge"], base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(challenge));
+    assert_eq!(s.stored_receipts(), before, "nothing is signed or stored");
+    assert_eq!(code(&s.run(&["brief"])), 3);
+}
+
+#[test]
+fn approve_signed_files_a_passkey_approval_and_the_brief_allows() {
+    let s = Sandbox::waiting_for_approval();
+    let (sk, key) = test_passkey(31);
+    s.pin_passkey(&key, "iPhone");
+    let unsigned = json(&s.run(&["approve", "--unsigned", "--json"]));
+    s.write("signed.json", &sign_with_passkey(&unsigned, &sk));
+    let out = s.run(&["approve", "--signed", "signed.json", "--json"]);
+    assert_eq!(code(&out), 0, "{}", text(&out));
+    let v = json(&out);
+    assert_eq!(v["code"], "APPROVED");
+    let id = use05_receipt::PublicKey::Passkey(key).id();
+    assert_eq!(v["details"]["branch"], format!("05-receipts/{id}"));
+    let brief = s.run(&["brief"]);
+    assert_eq!(code(&brief), 0, "{}", text(&brief));
+}
+
+#[test]
+fn approve_unsigned_cosigns_with_this_machines_key() {
+    let s = Sandbox::waiting_for_approval();
+    let d = json(&s.run(&["approve", "--unsigned", "--json"]))["details"].clone();
+    let machine = use05_receipt::parse_public_key(&fs::read_to_string(s.home.path().join("local.pub")).unwrap()).unwrap();
+    assert_eq!(d["cosignature"]["keyid"], use05_receipt::key_id(&machine));
+    assert!(d["cosignature"]["webauthn"].is_null());
+    let alone = serde_json::json!({ "payload": d["payload"], "payloadType": d["payload_type"], "signatures": [d["cosignature"]] }).to_string();
+    assert!(use05_receipt::verify_any(alone.as_bytes(), &machine).is_ok(), "the co-signature covers the statement");
+}
+
+#[test]
+fn approve_signed_says_an_uncosigned_passkey_approval_will_not_count() {
+    let s = Sandbox::waiting_for_approval();
+    let (sk, key) = test_passkey(34);
+    s.pin_passkey(&key, "iPhone");
+    let unsigned = json(&s.run(&["approve", "--unsigned", "--json"]));
+    s.write("signed.json", &sign_with_passkey_only(&unsigned, &sk));
+    let before = s.stored_receipts().len();
+    let out = s.run(&["approve", "--signed", "signed.json", "--json"]);
+    assert_eq!(code(&out), 0, "{}", text(&out));
+    let v = json(&out);
+    assert_eq!(v["details"]["counts"], false);
+    assert_eq!(v["details"]["void"], "no machine that prepared it co-signed it");
+    assert_eq!(s.stored_receipts().len(), before + 1, "filed, as the gate would read it");
+    assert_eq!(code(&s.run(&["brief"])), 3);
+}
+
+#[test]
+fn approve_signed_refuses_an_untrusted_key_and_stores_nothing() {
+    let s = Sandbox::waiting_for_approval();
+    let (sk, _) = test_passkey(32);
+    let unsigned = json(&s.run(&["approve", "--unsigned", "--json"]));
+    s.write("signed.json", &sign_with_passkey(&unsigned, &sk));
+    let before = s.stored_receipts();
+    let out = s.run(&["approve", "--signed", "signed.json", "--json"]);
+    assert_eq!(code(&out), 2, "{}", text(&out));
+    assert_eq!(json(&out)["code"], "APPROVAL_NOT_TRUSTED");
+    assert_eq!(s.stored_receipts(), before, "nothing is stored");
+    assert_eq!(code(&s.run(&["brief"])), 3);
+}
+
+#[test]
+fn approve_signed_files_under_its_own_subject() {
+    let s = Sandbox::waiting_for_approval();
+    let (sk, key) = test_passkey(33);
+    s.pin_passkey(&key, "iPhone");
+    let unsigned = json(&s.run(&["approve", "--unsigned", "--tree", "HEAD", "--json"]));
+    let subject = unsigned["details"]["subject"].as_str().unwrap().to_string();
+    assert_eq!(subject, s.git(&["rev-parse", "HEAD^{tree}"]));
+    s.write("signed.json", &sign_with_passkey(&unsigned, &sk));
+    assert_eq!(code(&s.run(&["approve", "--signed", "signed.json"])), 0);
+    assert!(s.stored_receipts().iter().any(|(_, p)| p.starts_with(&format!("receipts/{subject}/"))), "{:?}", s.stored_receipts());
+    assert_eq!(code(&s.run(&["brief"])), 3, "an approval of another tree does not approve this one");
+}
+
+#[test]
+fn verify_accepts_a_passkey_public_key() {
+    let s = Sandbox::waiting_for_approval();
+    let (sk, key) = test_passkey(34);
+    let unsigned = json(&s.run(&["approve", "--unsigned", "--json"]));
+    s.write("signed.json", &sign_with_passkey(&unsigned, &sk));
+    s.write("phone.pub", &use05_receipt::passkey_public_text(&key));
+    let out = s.run(&["verify", "signed.json", "--key", "phone.pub", "--json"]);
+    assert_eq!(code(&out), 0, "{}", text(&out));
+}
+
+/// The fields `sign_with_passkey` reads, for any statement bytes.
+fn to_sign(body: &[u8]) -> Value {
+    use base64::Engine;
+    use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD};
+    let challenge = use05_receipt::passkey_challenge(use05_receipt::PAYLOAD_TYPE, body);
+    serde_json::json!({ "details": { "payload": STANDARD.encode(body), "payload_type": use05_receipt::PAYLOAD_TYPE, "challenge": URL_SAFE_NO_PAD.encode(challenge) } })
+}
+
+#[test]
+fn verify_refuses_a_passkey_signed_bypass() {
+    let s = Sandbox::waiting_for_approval();
+    let (sk, key) = test_passkey(35);
+    let tree = s.git(&["rev-parse", "HEAD^{tree}"]);
+    let bypass = use05_receipt::Statement::new(
+        vec![use05_receipt::tree_subject(&tree, &"ab".repeat(32))],
+        use05_receipt::Bypass { reason: "r".into(), by: "b".into(), findings: vec![], created: "2026-11-01T00:00:00Z".into(), expires: "2099-01-01T00:00:00Z".into() },
+    );
+    s.write("bypass.json", &sign_with_passkey_only(&to_sign(&serde_json::to_vec(&bypass).unwrap()), &sk));
+    s.write("phone.pub", &use05_receipt::passkey_public_text(&key));
+    let out = s.run(&["verify", "bypass.json", "--key", "phone.pub", "--json"]);
+    assert_eq!(code(&out), 2, "{}", text(&out));
+    assert_eq!(json(&out)["code"], "PASSKEY_APPROVALS_ONLY");
+}
+
+#[test]
+fn approve_signed_says_when_an_approval_will_not_count() {
+    use base64::Engine;
+    let s = Sandbox::waiting_for_approval();
+    let (sk, key) = test_passkey(36);
+    s.pin_passkey(&key, "iPhone");
+    let unsigned = json(&s.run(&["approve", "--unsigned", "--json"]));
+    let body = base64::engine::general_purpose::STANDARD.decode(unsigned["details"]["payload"].as_str().unwrap()).unwrap();
+    let mut statement: Value = serde_json::from_slice(&body).unwrap();
+    statement["predicate"]["policy_sha256"] = Value::String("00".repeat(32));
+    s.write("signed.json", &sign_with_passkey_only(&to_sign(&serde_json::to_vec(&statement).unwrap()), &sk));
+    let out = s.run(&["approve", "--signed", "signed.json", "--json"]);
+    assert_eq!(code(&out), 0, "{}", text(&out));
+    let v = json(&out);
+    assert_eq!(v["details"]["counts"], false, "{v}");
+    assert!(text(&out).contains("policy changed"), "{}", text(&out));
+    assert_eq!(code(&s.run(&["brief"])), 3);
+}
+
+// ---------------------------------------------------------------- approval_needed
+
+fn edit_policy_file(s: &Sandbox) {
+    s.write(".05/policy.toml", &(fs::read_to_string(s.path(".05/policy.toml")).unwrap() + "\n# edited\n"));
+    s.git(&["add", "-A"]);
+}
+
+#[test]
+fn finish_on_a_change_needing_approval_emits_approval_needed() {
+    let s = Sandbox::initialised();
+    let heard_at = listen(&s, "\"approval_needed\", \"finished\"");
+    s.run(&["start", "Tighten the policy", "--scope", ".05/**"]);
+    edit_policy_file(&s);
+    assert_eq!(code(&s.run(&["prove"])), 0);
+    assert_eq!(code(&s.run(&["finish", "--outcome", "Tightened it"])), 0);
+    let events = heard(&heard_at);
+    let finished = events.iter().find(|e| e["event"] == "finished").expect("finished");
+    let needed: Vec<&Value> = events.iter().filter(|e| e["event"] == "approval_needed").collect();
+    assert_eq!(needed.len(), 1, "{events:?}");
+    let e = needed[0];
+    assert_eq!(e["scope"], "outcome");
+    assert_eq!(e["task"], finished["task"]);
+    assert_eq!(e["tree"], finished["tree"]);
+    assert!(e["findings"].as_array().is_some_and(|f| f.iter().any(|c| c == "PROTECTED_PATH")), "{e}");
+    let keys: Vec<&str> = e.as_object().unwrap().keys().map(String::as_str).collect();
+    assert!(keys.iter().all(|k| ["v", "event", "at", "repo", "task", "scope", "tree", "intent_sha256", "findings"].contains(k)), "only identifiers and verdicts: {keys:?}");
+}
+
+#[test]
+fn no_approval_needed_when_the_gate_allows() {
+    let s = Sandbox::initialised();
+    let heard_at = listen(&s, "\"approval_needed\", \"finished\"");
+    s.run(&["start", "Say hello", "--scope", "main.rs"]);
+    s.write("main.rs", "fn main() { println!(\"hi\"); }\n");
+    s.git(&["add", "-A"]);
+    s.run(&["prove"]);
+    assert_eq!(code(&s.run(&["finish", "--outcome", "Said hello"])), 0);
+    let events = heard(&heard_at);
+    assert!(events.iter().any(|e| e["event"] == "finished"), "{events:?}");
+    assert!(!events.iter().any(|e| e["event"] == "approval_needed"), "{events:?}");
+}
+
+#[test]
+fn the_stop_hook_emits_approval_needed() {
+    let s = Sandbox::initialised();
+    let heard_at = listen(&s, "\"approval_needed\"");
+    start_session(&s, "stops");
+    edit_policy_file(&s);
+    let payload = serde_json::json!({ "session_id": "stops", "cwd": s.dir.path(), "hook_event_name": "Stop", "stop_hook_active": false }).to_string();
+    assert_eq!(code(&s.run_with_stdin(&["hook", "claude-code", "Stop"], &payload)), 0);
+    let events = heard(&heard_at);
+    assert!(events.iter().any(|e| e["event"] == "approval_needed" && e["scope"] == "outcome"), "{events:?}");
+}
+
+#[test]
+fn a_slow_approval_listener_does_not_hold_up_finish() {
+    let s = Sandbox::initialised();
+    fs::write(s.home.path().join("extensions.toml"), "[[on]]\nevents = [\"approval_needed\"]\nrun = [\"/bin/sh\", \"-c\", \"sleep 30\"]\ntimeout_secs = 1\n").unwrap();
+    s.run(&["start", "Tighten the policy", "--scope", ".05/**"]);
+    edit_policy_file(&s);
+    s.run(&["prove"]);
+    let clock = std::time::Instant::now();
+    assert_eq!(code(&s.run(&["finish", "--outcome", "Tightened it"])), 0);
+    assert!(clock.elapsed().as_secs() < 5, "took {:?}", clock.elapsed());
+}
+
+#[test]
+fn doctor_accepts_approval_needed_in_extensions_toml() {
+    let s = Sandbox::initialised();
+    listen(&s, "\"approval_needed\"");
+    // Doctor wraps long lines; compare words, not line breaks.
+    let out = text(&s.run(&["doctor"])).split_whitespace().collect::<Vec<_>>().join(" ");
+    assert!(!out.contains("there is no event"), "{out}");
+}
+
+#[test]
+fn approve_unsigned_says_when_it_made_this_machines_key() {
+    let s = Sandbox::waiting_for_approval();
+    for f in ["local.key", "local.pub"] {
+        let _ = fs::remove_file(s.home.path().join(f));
+    }
+    let v = json(&s.run(&["approve", "--unsigned", "--json"]));
+    assert!(v["notes"].to_string().contains("one was made to co-sign it"), "{v}");
+    assert!(!v["details"]["cosignature"].is_null());
+}
+
+#[test]
+fn a_damaged_passkeys_file_keeps_its_good_passkeys_and_doctor_says_so() {
+    let s = Sandbox::waiting_for_approval();
+    let (sk, key) = test_passkey(35);
+    let mut bytes = format!("{} iPhone\n", use05_receipt::passkey_public_text(&key).trim()).into_bytes();
+    bytes.extend_from_slice(b"\xff\xfe junk\nnot a key\n");
+    fs::write(s.home.path().join("passkeys.pub"), bytes).unwrap();
+    let unsigned = json(&s.run(&["approve", "--unsigned", "--json"]));
+    s.write("signed.json", &sign_with_passkey(&unsigned, &sk));
+    assert_eq!(code(&s.run(&["approve", "--signed", "signed.json"])), 0, "the good line still counts");
+    let doctor = text(&s.run(&["doctor"])).split_whitespace().collect::<Vec<_>>().join(" ");
+    assert!(doctor.contains("passkey iPhone (localhost) pinned here"), "{doctor}");
+    assert!(doctor.contains("2 line(s) of passkeys.pub are not a passkey"), "{doctor}");
+}
+
+#[test]
+fn approve_signed_files_a_passkey_approval_of_a_plan() {
+    let s = Sandbox::waiting_for_approval();
+    let (sk, key) = test_passkey(36);
+    s.pin_passkey(&key, "iPhone");
+    let unsigned = json(&s.run(&["approve", "--intent", "--unsigned", "--json"]));
+    assert_eq!(unsigned["details"]["scope"], "intent", "{unsigned}");
+    s.write("signed.json", &sign_with_passkey(&unsigned, &sk));
+    let out = s.run(&["approve", "--signed", "signed.json", "--json"]);
+    assert_eq!(code(&out), 0, "{}", text(&out));
+    assert_eq!(json(&out)["code"], "APPROVED");
+    let subject = unsigned["details"]["subject"].as_str().unwrap().to_string();
+    assert!(s.stored_receipts().iter().any(|(_, p)| p.starts_with(&format!("receipts/{subject}/"))), "filed under the plan: {:?}", s.stored_receipts());
+}
+
+#[test]
+fn approve_signed_says_a_passkey_signed_bypass_is_not_an_approval() {
+    use base64::Engine;
+    let s = Sandbox::waiting_for_approval();
+    let (sk, key) = test_passkey(37);
+    s.pin_passkey(&key, "iPhone");
+    let body = serde_json::json!({ "_type": "https://in-toto.io/Statement/v1", "subject": [], "predicateType": "https://use05.dev/bypass/v0", "predicate": { "reason": "from a page" } }).to_string();
+    let challenge = use05_receipt::passkey_challenge(use05_receipt::PAYLOAD_TYPE, body.as_bytes());
+    let fake = serde_json::json!({ "details": { "payload": base64::engine::general_purpose::STANDARD.encode(&body), "payload_type": use05_receipt::PAYLOAD_TYPE, "challenge": base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(challenge) } });
+    s.write("signed.json", &sign_with_passkey_only(&fake, &sk));
+    let out = s.run(&["approve", "--signed", "signed.json", "--json"]);
+    assert_eq!(code(&out), 2, "{}", text(&out));
+    assert_eq!(json(&out)["code"], "NOT_AN_APPROVAL");
+}
+
+// ---------------------------------------------------------------- testing before a push (D87)
+
+impl Sandbox {
+    /// Initialised, with `[testing]` set before the first push, and a bare remote.
+    fn testing(local: &str) -> (Sandbox, tempfile::TempDir) {
+        let s = Sandbox::initialised();
+        s.approver();
+        let policy = fs::read_to_string(s.path(".05/policy.toml")).unwrap();
+        s.write(".05/policy.toml", &format!("{policy}\n[testing]\nlocal = \"{local}\"\n"));
+        s.commit_all("ask for testing");
+        let remote = tempfile::tempdir().unwrap();
+        assert!(Command::new("git").args(["init", "-q", "--bare", "-b", "main", &remote.path().display().to_string()]).status().unwrap().success());
+        s.git(&["remote", "add", "origin", &remote.path().display().to_string()]);
+        assert!(s.push("main").status.success(), "the first push sets the baseline");
+        (s, remote)
+    }
+
+    fn push(&self, branch: &str) -> Output {
+        let mut cmd = Command::new("git");
+        cmd.arg("-C").arg(self.dir.path()).args(["push", "-q", "origin", &format!("HEAD:refs/heads/{branch}")]);
+        cmd.env("PATH", format!("{}:{}", Path::new(BIN).parent().unwrap().display(), std::env::var("PATH").unwrap())).env("USE05_HOME", self.home.path()).env("HOME", self.home.path());
+        cmd.output().unwrap()
+    }
+}
+
+#[test]
+fn a_push_to_main_waits_for_the_developers_testing_sign_off() {
+    let (s, _remote) = Sandbox::testing("required");
+    s.write("main.rs", "fn main() { println!(\"hi\"); }\n");
+    s.commit_all("say hi");
+    let held = s.push("main");
+    assert!(!held.status.success());
+    assert!(text(&held).contains("TESTING_REQUIRED"), "{}", text(&held));
+    assert!(s.push("agent/hi").status.success(), "an agent's working branch is not held");
+    // A skip does not count where testing is required.
+    let skip = s.run_with_stdin(&["approve", "--skip-testing", "--reason", "no time", "--tree", "HEAD", "--passphrase-stdin", "--json"], "correct horse\n");
+    assert_eq!(code(&skip), 2, "{}", text(&skip));
+    assert_eq!(json(&skip)["code"], "TESTING_NOT_SKIPPABLE");
+    // A note is required.
+    assert_eq!(code(&s.run_with_stdin(&["approve", "--tested", "--tree", "HEAD", "--passphrase-stdin"], "correct horse\n")), 6);
+    let signed = s.run_with_stdin(&["approve", "--tested", "--note", "ran it, said hi", "--tree", "HEAD", "--passphrase-stdin", "--json"], "correct horse\n");
+    assert_eq!(code(&signed), 0, "{}", text(&signed));
+    assert_eq!(json(&signed)["code"], "TESTED");
+    assert!(s.push("main").status.success(), "signed off: it goes");
+    let brief = text(&s.run(&["brief", "--tree", "HEAD"]));
+    assert!(brief.contains("ran it, said hi"), "{brief}");
+}
+
+#[test]
+fn a_skippable_test_sign_off_can_be_skipped_with_a_reason() {
+    let (s, _remote) = Sandbox::testing("skippable");
+    s.write("main.rs", "fn main() { println!(\"docs\"); }\n");
+    s.commit_all("words only");
+    assert!(!s.push("main").status.success());
+    let skip = s.run_with_stdin(&["approve", "--skip-testing", "--reason", "a comment changed, nothing to try", "--tree", "HEAD", "--passphrase-stdin", "--json"], "correct horse\n");
+    assert_eq!(code(&skip), 0, "{}", text(&skip));
+    assert_eq!(json(&skip)["code"], "TESTING_SKIPPED");
+    assert!(s.push("main").status.success());
+}
+
+#[test]
+fn the_ci_gate_reads_where_a_push_goes_from_the_host_and_holds_one_it_cannot_place() {
+    let (s, secret, _remote) = ci_fixture_with("\n[testing]\nlocal = \"required\"\n");
+    s.write("main.rs", "fn main() { /* tried? */ }\n");
+    s.commit_all("change");
+    let event = s.path("event.json");
+    let ci = |vars: &[(&str, &str)]| {
+        let home = tempfile::tempdir().unwrap();
+        let mut cmd = s.command(&["gate", "--ci", "--json"]);
+        cmd.env("USE05_HOME", home.path()).env("HOME", home.path()).env("USE05_RUNNER_KEY", &secret).stdin(Stdio::null());
+        for v in ["GITHUB_BASE_REF", "GITHUB_REF_NAME", "GITHUB_REF_TYPE", "GITHUB_EVENT_NAME", "GITHUB_EVENT_PATH"] {
+            cmd.env_remove(v);
+        }
+        for (k, v) in vars {
+            cmd.env(k, v);
+        }
+        let out = cmd.output().unwrap();
+        let held = text(&out).contains("TESTING_REQUIRED");
+        held
+    };
+    // A pull request into another branch is not held; into main it is.
+    assert!(!ci(&[("GITHUB_BASE_REF", "release")]));
+    assert!(ci(&[("GITHUB_BASE_REF", "main")]));
+    // A merge queue's branch is named for the queue; the event says the branch it merges into.
+    fs::write(&event, r#"{"merge_group":{"base_ref":"refs/heads/main"},"repository":{"default_branch":"main"}}"#).unwrap();
+    let ev = event.display().to_string();
+    assert!(ci(&[("GITHUB_EVENT_NAME", "merge_group"), ("GITHUB_REF_NAME", "gh-readonly-queue/main/pr-1-abc"), ("GITHUB_REF_TYPE", "branch"), ("GITHUB_EVENT_PATH", &ev)]));
+    // The host's default branch is the landing branch when the policy names none (no origin/HEAD here).
+    fs::write(&event, r#"{"repository":{"default_branch":"trunk"}}"#).unwrap();
+    assert!(ci(&[("GITHUB_BASE_REF", "trunk"), ("GITHUB_EVENT_PATH", &ev)]));
+    assert!(!ci(&[("GITHUB_BASE_REF", "trunk")]), "without the host's word, trunk is not where work lands");
+    // CI that names no branch at all: held, not let through.
+    assert!(ci(&[]));
+}
+
+// ---------------------------------------------------------------- one rule at a time (D88)
+
+#[test]
+fn policy_changes_one_rule_at_a_time_and_says_what_changed() {
+    let s = Sandbox::initialised();
+    let file = s.path(".05/policy.toml");
+    let before = fs::read_to_string(&file).unwrap();
+    let set = s.run(&["policy", "set", "testing.local", "required", "--json"]);
+    assert_eq!(code(&set), 0, "{}", text(&set));
+    let v = json(&set);
+    assert_eq!(v["code"], "POLICY_CHANGED");
+    assert_eq!((v["details"]["setting"].as_str(), v["details"]["after"].as_str()), (Some("testing.local"), Some("required")));
+    let after = fs::read_to_string(&file).unwrap();
+    assert!(after.contains("[testing]") && after.contains("local = \"required\""), "{after}");
+    // Everything else in the file, comments included, is as it was.
+    for line in before.lines().filter(|l| l.starts_with('#')) {
+        assert!(after.contains(line), "lost: {line}");
+    }
+    let add = json(&s.run(&["policy", "add", "protect.paths", "billing/**", "--json"]));
+    assert!(add["details"]["after"].as_array().unwrap().iter().any(|p| p == "billing/**"), "{add}");
+    let loosen = s.run(&["policy", "remove", "protect.paths", "billing/**"]);
+    assert_eq!(code(&loosen), 0);
+    assert!(text(&loosen).contains("less strict"), "{}", text(&loosen));
+    let unchanged = fs::read_to_string(&file).unwrap();
+    let bad = s.run(&["policy", "set", "testing.sometimes", "yes", "--json"]);
+    assert_eq!(code(&bad), 6, "{}", text(&bad));
+    assert_eq!(fs::read_to_string(&file).unwrap(), unchanged, "an invalid change writes nothing");
+    let rule = s.run(&["policy", "add", "require", "{ when = [\"src/**\"], also = [\"docs/**\"], why = \"docs follow code\" }"]);
+    assert_eq!(code(&rule), 0, "{}", text(&rule));
+    assert!(text(&rule).contains("a person approves"), "{}", text(&rule));
+}
+
+// ---------------------------------------------------------------- 05 travels with the repository (D86)
+
+#[test]
+fn claude_code_cloud_sessions_install_05_and_report_only_in_the_cloud() {
+    let s = Sandbox::new();
+    fs::create_dir_all(s.path(".claude")).unwrap();
+    s.commit_all("first");
+    let init = s.run(&["init", "--shared-hooks"]);
+    assert_eq!(code(&init), 0, "{}", text(&init));
+    assert!(!s.path(".claude/settings.local.json").exists(), "the hooks are in the file that is committed");
+    let settings: Value = serde_json::from_str(&fs::read_to_string(s.path(".claude/settings.json")).unwrap()).unwrap();
+    let first = settings["hooks"]["SessionStart"][0]["hooks"][0]["command"].as_str().unwrap().to_string();
+    assert!(first.starts_with("[ \"$CLAUDE_CODE_REMOTE\" = true ] || exit 0;"), "{first}");
+    assert!(first.contains(&format!("@use05/cli@{}", env!("CARGO_PKG_VERSION"))) && first.contains("use05-cloud session --background"), "{first}");
+    // On your own machine it does nothing, and says nothing.
+    let out = Command::new("/bin/sh").arg("-c").arg(&first).env_remove("CLAUDE_CODE_REMOTE").output().unwrap();
+    assert!(out.status.success() && out.stdout.is_empty() && out.stderr.is_empty());
+}
+
+#[test]
+fn ci_prepares_a_statement_for_someone_else_co_signed_by_the_runner_key() {
+    use base64::Engine;
+    let s = Sandbox::waiting_for_approval();
+    let runner = use05_receipt::SigningKey::from_bytes(&[42; 32]);
+    let secret = use05_receipt::secret_key_text(&runner);
+    let out = s.run_env(&["approve", "--unsigned", "--approver", "Alex Rivera", "--json"], &[("USE05_RUNNER_KEY", secret.trim())]);
+    assert_eq!(code(&out), 0, "{}", text(&out));
+    let d = &json(&out)["details"];
+    assert_eq!(d["cosignature"]["keyid"], use05_receipt::key_id(&runner.verifying_key()), "the runner key co-signs, not a key made on the runner");
+    let body = base64::engine::general_purpose::STANDARD.decode(d["payload"].as_str().unwrap()).unwrap();
+    let statement: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(statement["predicate"]["approver"], "Alex Rivera");
+    // Naming someone else is only for a statement someone else signs.
+    assert_eq!(code(&s.run(&["approve", "--approver", "Alex Rivera"])), 6, "a usage error");
+}
+
+// ---------------------------------------------------------------- discarding abandoned work (D89)
+
+/// An agent's abandoned work: a worktree on its own branch, one commit made there and a file never
+/// committed.
+fn abandoned(s: &Sandbox, holder: &TempDir) -> (PathBuf, String) {
+    let wt = agent_worktree(s, holder, "claude/abandoned");
+    let id = task_in(s, &wt, "Try a new layout");
+    fs::write(wt.join("layout.txt"), "half done\n").unwrap();
+    git_at(&wt, &["add", "-A"]);
+    git_at(&wt, &["commit", "-qm", "half a layout"]);
+    fs::write(wt.join("notes.txt"), "never committed\n").unwrap();
+    (wt, id)
+}
+
+#[test]
+fn discard_shows_what_is_lost_and_needs_a_person_at_the_terminal() {
+    let s = Sandbox::initialised();
+    let holder = tempfile::tempdir().unwrap();
+    let (wt, id) = abandoned(&s, &holder);
+    // An agent's shell has no terminal: it cannot throw work away.
+    let out = s.run(&["discard", &id, "--json"]);
+    assert_eq!(code(&out), 6, "{}", text(&out));
+    assert_eq!(json(&out)["code"], "NEEDS_A_PERSON");
+    assert!(wt.exists());
+    // At a terminal, after seeing what would be lost; "no" keeps it.
+    let (no, screen) = on_a_terminal(&s, &["discard", &id[..8]], &["n"]);
+    assert_ne!(no, 0, "{screen}");
+    assert!(screen.contains("1 commit") && screen.contains("1 file"), "it says what would be lost: {screen}");
+    assert!(wt.exists());
+    let (yes, screen) = on_a_terminal(&s, &["discard", &id[..8]], &["y"]);
+    assert_eq!(yes, 0, "{screen}");
+    assert!(!wt.exists(), "the worktree is gone");
+    assert!(!s.git(&["branch", "--list", "claude/abandoned"]).contains("claude/abandoned"), "the branch is gone");
+    let task: Value = serde_json::from_str(&fs::read_to_string(s.path(&format!(".git/05/tasks/{id}.json"))).unwrap()).unwrap();
+    assert_eq!(task["status"], "discarded");
+}
+
+#[test]
+fn discard_signed_by_a_passkey_from_the_console_counts_only_as_prepared_here() {
+    let s = Sandbox::initialised();
+    let holder = tempfile::tempdir().unwrap();
+    let (wt, id) = abandoned(&s, &holder);
+    let unsigned = s.run(&["discard", &id, "--unsigned", "--json"]);
+    assert_eq!(code(&unsigned), 0, "{}", text(&unsigned));
+    let u = json(&unsigned);
+    assert_eq!((u["details"]["plan"]["unpushed"].as_u64(), u["details"]["plan"]["uncommitted"].as_u64()), (Some(1), Some(1)));
+    assert!(wt.exists(), "preparing deletes nothing");
+    let (sk, key) = test_passkey(41);
+    // A passkey this machine does not trust: nothing happens.
+    s.write("signed.json", &sign_with_passkey(&u, &sk));
+    let out = s.run(&["discard", "--signed", "signed.json", "--json"]);
+    assert_eq!(code(&out), 2, "{}", text(&out));
+    assert!(wt.exists());
+    // Pinned, but signed without this machine's co-signature (a page made it up): nothing happens.
+    s.pin_passkey(&key, "iPhone");
+    s.write("alone.json", &sign_with_passkey_only(&u, &sk));
+    let out = s.run(&["discard", "--signed", "alone.json", "--json"]);
+    assert_eq!(code(&out), 2, "{}", text(&out));
+    assert!(wt.exists());
+    // Prepared and co-signed elsewhere, by a key the policy trusts (the CI runner's), and signed
+    // by the pinned passkey: still not this machine's to act on.
+    let runner = use05_receipt::SigningKey::from_bytes(&[43; 32]);
+    let policy = fs::read_to_string(s.path(".05/policy.toml")).unwrap();
+    s.write(".05/policy.toml", &format!("{policy}\n[[trust.key]]\nname = \"ci\"\nrole = \"runner\"\npublic = \"{}\"\n", use05_receipt::public_key_text(&runner.verifying_key()).trim()));
+    s.commit_all("trust the runner");
+    let elsewhere = s.run_env(&["discard", &id, "--unsigned", "--json"], &[("USE05_RUNNER_KEY", use05_receipt::secret_key_text(&runner).trim())]);
+    assert_eq!(code(&elsewhere), 0, "{}", text(&elsewhere));
+    s.write("elsewhere.json", &sign_with_passkey(&json(&elsewhere), &sk));
+    let out = s.run(&["discard", "--signed", "elsewhere.json", "--json"]);
+    assert_eq!(code(&out), 2, "{}", text(&out));
+    assert!(wt.exists());
+    // Prepared here and signed by the pinned passkey: discarded.
+    let out = s.run(&["discard", "--signed", "signed.json", "--json"]);
+    assert_eq!(code(&out), 0, "{}", text(&out));
+    assert_eq!(json(&out)["code"], "DISCARDED");
+    assert!(!wt.exists());
+    // Signed again: it is done already.
+    let again = s.run(&["discard", "--signed", "signed.json", "--json"]);
+    assert_eq!(json(&again)["code"], "ALREADY_DISCARDED", "{}", text(&again));
 }

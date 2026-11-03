@@ -1,0 +1,5 @@
+target/
+console-web/node_modules/
+console-web/dist/
+.git
+console-web/src/wasm/

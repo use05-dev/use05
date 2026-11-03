@@ -266,6 +266,18 @@ pub fn render(ui: &Ui, b: &Brief, org: Option<&str>, overlaps: &[use05_core::ove
         }
     }).collect();
     out.section("Approvals", if approvals.is_empty() { vec![Item::dim("none")] } else { approvals });
+    // Tested by a person before a push (D87): their note, in their words.
+    if !b.gate.testing.is_empty() || b.gate.findings.iter().any(|f| f.code.starts_with("TESTING_")) {
+        let tested: Vec<Item> = b.gate.testing.iter().map(|t| {
+            let what = if t.outcome == use05_receipt::Tested::Tested { "tried it" } else { "skipped testing" };
+            match t.void {
+                Some(why) => Item::new(Glyph::Dot, Tone::Dim, format!("{} {what}: \"{}\" (does not count: {why})", t.by.name, t.note)),
+                None => Item::new(Glyph::Ok, Tone::Good, format!("{} {what}: \"{}\"", t.by.name, t.note)),
+            }
+        }).collect();
+        out.blank();
+        out.section("Tested", if tested.is_empty() { vec![Item::dim("not yet: a person tries it and signs off before it is pushed")] } else { tested });
+    }
     if let Some(sn) = b.session.as_ref().filter(|sn| sn.tool_calls + sn.turns + sn.checks.len() > 0) {
         out.blank();
         out.section("Session", session_items(sn));

@@ -4,16 +4,26 @@ use std::path::PathBuf;
 use serde_json::json;
 use use05_core::gate::Effect;
 use use05_core::keys;
-use use05_core::store;
+use use05_core::{evidence, store};
 use use05_core::time::{now_rfc3339, now_secs, rfc3339};
 use use05_core::{git, tty};
-use use05_receipt::{Approval, ApprovalScope, Bypass, Decision, Statement, intent_subject, key_id, public_key_text, secret_key_text, seal, tree_subject};
+use use05_receipt::{Approval, ApprovalScope, Bypass, Decision, Envelope, PAYLOAD_TYPE, Statement, cosignature, intent_subject, key_id, passkey_challenge, public_key_text, secret_key_text, seal, tree_subject};
 
 use crate::ctx::Ctx;
 use crate::report::{Report, Tone};
 
 pub struct ApproveArgs {
     pub push: bool,
+    /// Print the statement for a signer elsewhere (a passkey) instead of signing it here.
+    pub unsigned: bool,
+    /// File an approval a signer elsewhere already signed.
+    pub signed: Option<PathBuf>,
+    /// A testing sign-off (D87): tried it, with `note`; or skipped it, with `reason`.
+    pub tested: bool,
+    pub skip_testing: bool,
+    pub note: Option<String>,
+    /// With `unsigned`: the person the statement is for, when someone else signs it (CI).
+    pub approver: Option<String>,
     pub intent: bool,
     pub reject: bool,
     pub reason: Option<String>,
@@ -69,10 +79,16 @@ fn expiry(days: u32, hours: u32) -> String {
 }
 
 pub fn run_approve(args: ApproveArgs) -> Report {
+    if let Some(file) = &args.signed {
+        return run_signed(file, args.push, &args.repo);
+    }
     let ctx = match Ctx::open(&args.repo, args.task.as_deref()) {
         Ok(c) => c,
         Err(e) => return Report::from_core("approve", e),
     };
+    if args.tested || args.skip_testing {
+        return run_testing(&ctx, args);
+    }
     let scope = if args.intent { ApprovalScope::Intent } else { ApprovalScope::Outcome };
     let vote = if args.reject { Decision::Reject } else { Decision::Approve };
     if vote == Decision::Reject && args.reason.as_deref().is_none_or(|r| r.trim().is_empty()) {
@@ -110,12 +126,7 @@ pub fn run_approve(args: ApproveArgs) -> Report {
     }
     eprintln!("  The approval is bound to this exact content and expires in {} days.", ctx.policy.approvals.expire_days);
 
-    let key = match open_approver(args.passphrase_stdin, "approve") {
-        Ok(k) => k,
-        Err(r) => return r,
-    };
-    let signer_id = key_id(&key.verifying_key());
-    let approver = approver_name(ctx.top());
+    let approver = args.approver.clone().filter(|_| args.unsigned).unwrap_or_else(|| approver_name(ctx.top()));
     let statement = Statement::new(
         vec![subject],
         Approval {
@@ -130,6 +141,14 @@ pub fn run_approve(args: ApproveArgs) -> Report {
             expires: expiry(ctx.policy.approvals.expire_days, 0),
         },
     );
+    if args.unsigned {
+        return unsigned(&statement, &store_key, &target.oid, &what);
+    }
+    let key = match open_approver(args.passphrase_stdin, "approve") {
+        Ok(k) => k,
+        Err(r) => return r,
+    };
+    let signer_id = key_id(&key.verifying_key());
     let envelope = seal(&statement, &key).to_json_bytes();
     let branch = match store::put(ctx.top(), &store_key, &envelope, &signer_id) {
         Ok(b) => b,
@@ -156,6 +175,236 @@ pub fn run_approve(args: ApproveArgs) -> Report {
         next: Some(format!("use05 brief   (share it: git push origin {branch})")),
         excerpt: vec![],
         details: json!({ "scope": scope, "vote": vote, "key_id": signer_id, "branch": branch, "counts": counts }),
+        exit: 0,
+    }
+}
+
+/// The exact statement `approve` would sign, for a signer elsewhere: the bytes, the WebAuthn
+/// challenge a passkey signs for them, and this machine's co-signature, which the signer puts in
+/// the envelope beside its own (D86). Nothing is stored, except this machine's key the first time.
+fn unsigned(statement: &Statement<Approval>, subject: &str, tree: &str, what: &str) -> Report {
+    let body = serde_json::to_vec(statement).expect("statement serialises");
+    let a = &statement.predicate;
+    let verb = if a.decision == Decision::Approve { "approve" } else { "reject" };
+    let mut r = unsigned_body(&body, subject, tree, &format!("{verb} {what}"), json!({ "scope": a.scope, "vote": a.decision, "task": a.task, "expires": a.expires }));
+    r.rows = vec![("expires".into(), a.expires.clone())];
+    r
+}
+
+/// Any person's statement, for a signer elsewhere: the bytes, the WebAuthn challenge, and this
+/// machine's co-signature. `extra` adds what kind of statement it is to the details.
+pub(crate) fn unsigned_body(body: &[u8], subject: &str, tree: &str, what: &str, extra: serde_json::Value) -> Report {
+    use base64::Engine;
+    use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD};
+    // In CI the runner key co-signs: the key the policy already trusts there (D86).
+    let runner = std::env::var("USE05_RUNNER_KEY").ok().and_then(|k| use05_receipt::parse_secret_key(&k).ok());
+    let local = if runner.is_some() { None } else { use05_core::keys::ensure_local().ok() };
+    let machine = runner.as_ref().or(local.as_ref().map(|(key, _)| key)).map(|key| cosignature(PAYLOAD_TYPE, body, key));
+    let mut notes = vec!["The statement was not stored. Have it signed elsewhere, then file it here.".to_string()];
+    if let Some((key, true)) = &local {
+        notes.push(format!("This machine had no key of its own, so one was made to co-sign it ({}); list it in the policy for CI to trust what it prepares.", key_id(&key.verifying_key())));
+    }
+    if runner.is_some() {
+        notes.push("Co-signed with the CI runner key.".into());
+    }
+    if machine.is_none() {
+        notes.push("This machine's key could not be read, so it did not co-sign: a passkey's signature on this will not count.".into());
+    }
+    let mut details = json!({
+        "payload_type": PAYLOAD_TYPE,
+        "payload": STANDARD.encode(body),
+        "challenge": URL_SAFE_NO_PAD.encode(passkey_challenge(PAYLOAD_TYPE, body)),
+        "subject": subject,
+        "tree": tree,
+        "cosignature": machine,
+    });
+    if let (Some(d), Some(e)) = (details.as_object_mut(), extra.as_object()) {
+        d.extend(e.clone());
+    }
+    Report {
+        command: "approve",
+        outcome: "unsigned",
+        code: "UNSIGNED",
+        tone: Tone::Info,
+        headline: format!("Ready to {what}, not signed"),
+        rows: vec![],
+        notes,
+        next: Some("use05 approve --signed <file>".into()),
+        excerpt: vec![],
+        details,
+        exit: 0,
+    }
+}
+
+/// The longest testing note: a few sentences, not a report.
+const NOTE_MAX: usize = 500;
+
+/// A person's word that they tried this exact tree themselves, or skipped it (D87). Signed with
+/// the approver key, as an approval is, so an agent cannot make one; never an approval.
+fn run_testing(ctx: &Ctx, args: ApproveArgs) -> Report {
+    use use05_core::policy::LocalTesting;
+    use use05_receipt::{Tested, Testing};
+    let (outcome, text, flag) = if args.tested { (Tested::Tested, args.note.clone(), "--note") } else { (Tested::Skipped, args.reason.clone(), "--reason") };
+    let note = text.unwrap_or_default().trim().to_string();
+    if note.is_empty() {
+        let next = if args.tested { "use05 approve --tested --note \"<what you tried>\"" } else { "use05 approve --skip-testing --reason \"<why>\"" };
+        return Report::error("approve", "NOTE_REQUIRED", format!("say {} in {flag}", if args.tested { "what you tried" } else { "why you skip it" }), Some(next.into()), 6);
+    }
+    if note.chars().count() > NOTE_MAX {
+        return Report::error("approve", "NOTE_TOO_LONG", format!("keep it under {NOTE_MAX} characters: a few sentences"), None, 6);
+    }
+    if outcome == Tested::Skipped && ctx.policy.testing.local == LocalTesting::Required {
+        return Report::error("approve", "TESTING_NOT_SKIPPABLE", "the policy requires testing, so a skip would not count; nothing was signed".into(), Some("use05 approve --tested --note \"<what you tried>\"".into()), 2);
+    }
+    let target = match ctx.target(args.tree.as_deref()) {
+        Ok(t) => t,
+        Err(e) => return Report::from_core("approve", e),
+    };
+    let tester = args.approver.clone().filter(|_| args.unsigned).unwrap_or_else(|| approver_name(ctx.top()));
+    let statement = Statement::new(
+        vec![tree_subject(&target.oid, &target.digest)],
+        Testing { outcome, task: ctx.task.as_ref().map(|t| t.id.clone()).unwrap_or_else(|| "-".into()), note: note.clone(), tester: tester.clone(), created: now_rfc3339() },
+    );
+    let what = format!("{} on {} ({})", if outcome == Tested::Tested { "tried it" } else { "skipped testing" }, &target.oid[..12], target.label);
+    if args.unsigned {
+        let body = serde_json::to_vec(&statement).expect("statement serialises");
+        return unsigned_body(&body, &target.oid, &target.oid, &format!("sign that you {what}"), json!({ "kind": "testing", "outcome": outcome, "note": note, "task": statement.predicate.task }));
+    }
+    eprintln!("You are about to sign that you {what}: \"{note}\".");
+    let key = match open_approver(args.passphrase_stdin, "approve") {
+        Ok(k) => k,
+        Err(r) => return r,
+    };
+    let signer_id = key_id(&key.verifying_key());
+    let envelope = seal(&statement, &key).to_json_bytes();
+    let branch = match store::put(ctx.top(), &target.oid, &envelope, &signer_id) {
+        Ok(b) => b,
+        Err(e) => return Report::from_core("approve", e),
+    };
+    filed_testing(ctx, &statement.predicate, &target.oid, &signer_id, &branch, args.push)
+}
+
+/// After a testing sign-off is filed: the task's log, listeners, and what to say.
+fn filed_testing(ctx: &Ctx, t: &use05_receipt::Testing, tree: &str, signer_id: &str, branch: &str, push: bool) -> Report {
+    use use05_receipt::Tested;
+    if let Some(task) = ctx.task.as_ref().filter(|task| task.id == t.task) {
+        let _ = use05_core::log::append(&ctx.store.state_dir(), &task.id, json!({ "event": "tested", "outcome": t.outcome, "by": t.tester }));
+    }
+    crate::extend::emit("tested", ctx.top(), json!({ "task": t.task, "tree": tree, "outcome": t.outcome, "note": t.note, "by": t.tester }));
+    let counts = ctx.trust.by_id(signer_id).is_some_and(|k| k.role == use05_core::policy::Role::Approver);
+    let mut notes = vec![format!("Signed by key {} and stored on branch {branch}. It counts for this exact code only: change it, and sign off again.", &signer_id[..12])];
+    notes.extend(super::push_note(ctx.top(), branch, push));
+    if !counts {
+        notes.push("Warning: this key is not in the policy's trusted keys, so the gate will not count this sign-off. Add it under [[trust.key]] with role = \"approver\".".to_string());
+    }
+    let tested = t.outcome == Tested::Tested;
+    Report {
+        command: "approve",
+        outcome: if tested { "tested" } else { "testing_skipped" },
+        code: if tested { "TESTED" } else { "TESTING_SKIPPED" },
+        tone: if tested { Tone::Good } else { Tone::Warn },
+        headline: format!("{} {}", if tested { "Signed off: you tried" } else { "Testing skipped for" }, &tree[..12]),
+        rows: vec![("by".into(), t.tester.clone()), (if tested { "note" } else { "reason" }.into(), t.note.clone())],
+        notes,
+        next: Some("git push".into()),
+        excerpt: vec![],
+        details: json!({ "kind": "testing", "outcome": t.outcome, "note": t.note, "tree": tree, "key_id": signer_id, "branch": branch, "counts": counts }),
+        exit: 0,
+    }
+}
+
+/// File an approval signed elsewhere. It counts only if a key this machine or the base policy
+/// trusts as an approver signed it, and it is filed under its own subject, whatever task is current.
+fn run_signed(file: &std::path::Path, push: bool, repo: &std::path::Path) -> Report {
+    let ctx = match Ctx::open(repo, None) {
+        Ok(c) => c,
+        Err(e) => return Report::from_core("approve", e),
+    };
+    let bytes = match std::fs::read(file) {
+        Ok(b) => b,
+        Err(e) => return Report::error("approve", "RECEIPT_NOT_FOUND", format!("cannot read {}: {e}", file.display()), None, 6),
+    };
+    let Ok(envelope) = serde_json::from_slice::<Envelope>(&bytes) else {
+        return Report::error("approve", "RECEIPT_MALFORMED", format!("{} is not a signed envelope", file.display()), None, 6);
+    };
+    let bytes = envelope.to_json_bytes();
+    let raw = store::Raw { source: file.display().to_string(), path: file.display().to_string(), bytes: bytes.clone() };
+    let mut found = evidence::classify(&ctx.trust, &[raw]);
+    // A testing sign-off signed elsewhere (a passkey on a phone): filed under its tree (D87).
+    if found.approvals.is_empty() {
+        if let Some(t) = found.testing.pop() {
+            let Some(tree) = t.statement.tree_subject().map(|(oid, _)| oid.to_string()) else {
+                return Report::error("approve", "NOT_AN_APPROVAL", "the sign-off names no tree".into(), None, 2);
+            };
+            let branch = match store::put(ctx.top(), &tree, &bytes, &t.signer.key_id) {
+                Ok(b) => b,
+                Err(e) => return Report::from_core("approve", e),
+            };
+            let driver = ctx.store.load(&t.statement.predicate.task).ok().and_then(|task| task.owner);
+            let void = use05_core::gate::passkey_void_of(&t.signer, &t.cosigners, &t.statement.predicate.tester, &ctx.trust, driver.as_ref());
+            let mut r = filed_testing(&ctx, &t.statement.predicate, &tree, &t.signer.key_id, &branch, push);
+            if let Some(why) = void {
+                r.notes.push(format!("It will not count: {why}. Prepare and sign a new one."));
+                r.details["counts"] = json!(false);
+                r.details["void"] = json!(why);
+            }
+            return r;
+        }
+    }
+    let Some(signed) = found.approvals.into_iter().next() else {
+        // Whoever signed it, a statement of another kind is not an approval; say that first.
+        let kind = base64::Engine::decode(&base64::engine::general_purpose::STANDARD, &envelope.payload).ok().and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok()).and_then(|v| v["predicateType"].as_str().map(str::to_string));
+        let other = kind.is_some_and(|k| k != use05_receipt::APPROVAL_TYPE) || !found.evidence.is_empty() || !found.bypasses.is_empty() || !found.declarations.is_empty() || !found.completions.is_empty() || !found.log_seals.is_empty();
+        return if other {
+            Report::error("approve", "NOT_AN_APPROVAL", "it is signed, but it is not an approval".into(), None, 2)
+        } else {
+            Report::error(
+                "approve",
+                "APPROVAL_NOT_TRUSTED",
+                "no key this machine or the policy trusts as an approver signed it, so it was not filed".into(),
+                Some("pin the signer's passkey in passkeys.pub, or list it under [[trust.key]] with role = \"approver\"".into()),
+                2,
+            )
+        };
+    };
+    let statement = &signed.statement;
+    let Some(subject) = statement.tree_subject().map(|(oid, _)| oid).or_else(|| statement.intent_subject()) else {
+        return Report::error("approve", "NOT_AN_APPROVAL", "the approval names no tree or intent".into(), None, 2);
+    };
+    let branch = match store::put(ctx.top(), subject, &bytes, &signed.signer.key_id) {
+        Ok(b) => b,
+        Err(e) => return Report::from_core("approve", e),
+    };
+    let a = &statement.predicate;
+    if let Some(task) = ctx.task.as_ref().filter(|t| t.id == a.task) {
+        let _ = use05_core::log::append(&ctx.store.state_dir(), &task.id, json!({ "event": "approval", "vote": a.decision, "scope": a.scope, "by": a.approver }));
+    }
+    let approved = a.decision == Decision::Approve;
+    // Filed either way, as the gate would read it; but say now if the gate will not count it.
+    let driver = ctx.store.load(&a.task).ok().and_then(|t| t.owner);
+    let void = use05_core::gate::approval_void(a, &ctx.policy, now_secs())
+        .map(|why| match why {
+            "expired" => "it has expired",
+            "the policy changed since" => "the policy changed since it was prepared",
+            other => other,
+        })
+        .or_else(|| use05_core::gate::passkey_void(&signed, &ctx.trust, driver.as_ref()));
+    let mut notes = vec![format!("Signed by {} (key {}) and stored on branch {branch}.", signed.signer.name, &signed.signer.key_id[..12])];
+    if let Some(why) = void {
+        notes.push(format!("It will not count: {why}. Prepare and sign a new one."));
+    }
+    notes.extend(super::push_note(ctx.top(), &branch, push));
+    Report {
+        command: "approve",
+        outcome: if approved { "approved" } else { "rejected" },
+        code: if approved { "APPROVED" } else { "REJECTED" },
+        tone: if void.is_some() { Tone::Warn } else if approved { Tone::Good } else { Tone::Bad },
+        headline: format!("Filed {} for task {}", if approved { "an approval" } else { "a rejection" }, a.task),
+        rows: vec![("by".into(), a.approver.clone()), ("reason".into(), if a.rationale.is_empty() { "(none given)".into() } else { a.rationale.clone() }), ("expires".into(), a.expires.clone())],
+        notes,
+        next: Some(format!("use05 brief   (share it: git push origin {branch})")),
+        excerpt: vec![],
+        details: json!({ "scope": a.scope, "vote": a.decision, "key_id": signed.signer.key_id, "branch": branch, "counts": void.is_none(), "void": void }),
         exit: 0,
     }
 }

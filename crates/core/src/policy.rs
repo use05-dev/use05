@@ -97,6 +97,10 @@ pub struct TrustKey {
     /// After this date (`2027-01-31`, or an RFC 3339 time) the key is no longer trusted, so what
     /// it signed stops counting. A leaked CI key therefore cannot stay trusted forever.
     pub expires: Option<String>,
+    /// Whose key this is, for a passkey: the person whose work it may approve (D86). Compared with
+    /// the name the work's owner was recorded under, ignoring case and surrounding spaces.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub person: Option<String>,
 }
 
 impl TrustKey {
@@ -110,7 +114,7 @@ impl TrustKey {
 
 impl Default for TrustKey {
     fn default() -> TrustKey {
-        TrustKey { name: String::new(), role: Role::Runner, public: String::new(), expires: None }
+        TrustKey { name: String::new(), role: Role::Runner, public: String::new(), expires: None, person: None }
     }
 }
 
@@ -141,6 +145,37 @@ pub struct Policy {
     /// Not written out when empty, so existing digests hold.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub require: Vec<Require>,
+    /// Whether a person must have tried a change themselves before it is pushed (D87). Not written
+    /// out while off, so existing digests hold.
+    #[serde(skip_serializing_if = "TestingPolicy::is_off")]
+    pub testing: TestingPolicy,
+}
+
+/// A person tries the change in their own development environment and signs off before it is
+/// pushed to one of `branches` (D87). The pre-push gate and the CI gate both hold it until they do.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, Default)]
+#[serde(deny_unknown_fields, default)]
+pub struct TestingPolicy {
+    pub local: LocalTesting,
+    /// Branch patterns a push to which needs the sign-off; empty means the landing branch.
+    pub branches: Vec<String>,
+}
+
+impl TestingPolicy {
+    pub fn is_off(&self) -> bool {
+        self.local == LocalTesting::Off && self.branches.is_empty()
+    }
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum LocalTesting {
+    #[default]
+    Off,
+    /// A sign-off is asked for; a skip with a reason also counts.
+    Skippable,
+    /// Only a sign-off counts.
+    Required,
 }
 
 /// A rule that some files change together: docs with the code they describe, say. 05 checks only
@@ -514,6 +549,7 @@ impl Default for Policy {
             branches: BranchPolicy::default(),
             environment: Vec::new(),
             require: Vec::new(),
+            testing: TestingPolicy::default(),
         }
     }
 }
@@ -871,6 +907,19 @@ pub fn detect_checks(top: &Path) -> Vec<CheckDef> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn testing_before_a_push_is_off_unless_said_and_then_read() {
+        let off = Policy::default();
+        assert_eq!(off.testing.local, LocalTesting::Off);
+        assert!(!toml::to_string(&off).unwrap().contains("[testing]"), "off is not written, so existing digests hold");
+        let on = Policy::parse("[testing]\nlocal = \"required\"\nbranches = [\"main\", \"release/*\"]\n").unwrap();
+        assert_eq!(on.testing.local, LocalTesting::Required);
+        assert_eq!(on.testing.branches, vec!["main".to_string(), "release/*".to_string()]);
+        assert_eq!(Policy::parse("[testing]\nlocal = \"skippable\"\n").unwrap().testing.local, LocalTesting::Skippable);
+        assert!(Policy::parse("[testing]\nlocal = \"sometimes\"\n").is_err());
+        assert_ne!(on.digest(), off.digest());
+    }
 
     fn parse(text: &str) -> Policy {
         Policy::parse(text).unwrap()

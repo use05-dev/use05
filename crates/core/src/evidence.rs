@@ -1,23 +1,39 @@
 //! Who is trusted, and what their receipts say.
 
 use serde::Serialize;
-use use05_receipt::{AnyStatement, Approval, Bypass, Evidence, Statement, VerifyingKey, key_id, parse_public_key, verify_any};
+use use05_receipt::{AnyStatement, Approval, Bypass, Evidence, PublicKey, Statement, parse_any_public_key, verify_any_with};
 
 use crate::keys;
 use crate::policy::{Policy, Role};
 use crate::store::Raw;
 
+/// Whose approval key this is (D86).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Holder {
+    /// Named in the policy (`person`).
+    Person(String),
+    /// Pinned on this machine (`passkeys.pub`): the person this machine works for.
+    ThisMachine,
+    /// Nobody said.
+    Unnamed,
+}
+
 #[derive(Debug, Clone)]
 pub struct TrustedKey {
     pub name: String,
     pub role: Role,
-    pub key: VerifyingKey,
+    /// An Ed25519 key, or a passkey (which only ever counts for approvals).
+    pub key: PublicKey,
     pub id: String,
+    pub holder: Holder,
 }
 
 #[derive(Debug, Clone, Default)]
 pub struct Trust {
     pub keys: Vec<TrustedKey>,
+    /// The key id of this machine's approver key, when this machine's keys are trusted: the
+    /// person work started here is recorded under (D71).
+    pub this_person: Option<String>,
 }
 
 impl Trust {
@@ -32,19 +48,30 @@ impl Trust {
             if entry.expires.is_some() && entry.expires_at().is_none_or(|t| t < now) {
                 continue;
             }
-            if let Ok(key) = parse_public_key(&entry.public) {
-                keys.push(TrustedKey { name: entry.name.clone(), role: entry.role, id: key_id(&key), key });
+            if let Ok(key) = parse_any_public_key(&entry.public) {
+                // A passkey is only ever a person's approval key, whatever role it was given.
+                if key.is_passkey() && entry.role != Role::Approver {
+                    continue;
+                }
+                let holder = entry.person.as_deref().map(str::trim).filter(|p| !p.is_empty()).map_or(Holder::Unnamed, |p| Holder::Person(p.to_string()));
+                keys.push(TrustedKey { name: entry.name.clone(), role: entry.role, id: key.id(), key, holder });
             }
         }
+        let mut this_person = None;
         if include_machine_keys {
-            if let Some(key) = keys::local_public() {
-                keys.push(TrustedKey { name: "this machine".into(), role: Role::Local, id: key_id(&key), key });
+            if let Some(key) = keys::local_public().map(PublicKey::Ed25519) {
+                keys.push(TrustedKey { name: "this machine".into(), role: Role::Local, id: key.id(), key, holder: Holder::Unnamed });
             }
-            if let Some(key) = keys::approver_public() {
-                keys.push(TrustedKey { name: "you (approver)".into(), role: Role::Approver, id: key_id(&key), key });
+            if let Some(key) = keys::approver_public().map(PublicKey::Ed25519) {
+                this_person = Some(key.id());
+                keys.push(TrustedKey { name: "you (approver)".into(), role: Role::Approver, id: key.id(), key, holder: Holder::ThisMachine });
+            }
+            for (name, passkey) in keys::pinned_passkeys() {
+                let key = PublicKey::Passkey(passkey);
+                keys.push(TrustedKey { name: format!("passkey {name}"), role: Role::Approver, id: key.id(), key, holder: Holder::ThisMachine });
             }
         }
-        Trust { keys }
+        Trust { keys, this_person }
     }
 
     pub fn by_id(&self, id: &str) -> Option<&TrustedKey> {
@@ -66,6 +93,9 @@ pub struct Signed<S> {
     pub source: String,
     /// The receipt's path (it contains a hash of its bytes), so one receipt seen twice is one receipt.
     pub path: String,
+    /// For an approval or a testing sign-off: the machine or runner keys that also signed it, the
+    /// ones that prepared it.
+    pub cosigners: Vec<Signer>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -78,6 +108,10 @@ pub struct Found {
     pub completions: Vec<Signed<Statement<use05_receipt::Completion>>>,
     /// Seals on agents' action logs (D70), by a machine key or the CI runner.
     pub log_seals: Vec<Signed<Statement<use05_receipt::LogSeal>>>,
+    /// People's word that they tried a tree themselves, or skipped it (D87).
+    pub testing: Vec<Signed<Statement<use05_receipt::Testing>>>,
+    /// People's word to throw a task's work away (D89), prepared and co-signed by a machine.
+    pub discards: Vec<Signed<Statement<use05_receipt::Discard>>>,
     /// Receipts that no trusted key verified, or that were signed by a key not allowed to sign
     /// that kind of statement.
     pub unverified: usize,
@@ -129,15 +163,33 @@ pub fn classify(trust: &Trust, raws: &[Raw]) -> Found {
             continue;
         }
         let mut newer = false;
-        let verified = trust.keys.iter().find_map(|k| match verify_any(&raw.bytes, &k.key) {
-            Ok(v) => Some((k, v.statement)),
-            // The signature checked out with this key; only the kind is unknown to this version.
-            Err(use05_receipt::Fault::Invalid { code: "PREDICATE_TYPE_UNSUPPORTED", .. }) => {
-                newer = true;
-                None
+        // Every trusted key that signed it: an approval can carry a person's signature and the
+        // signature of the machine that prepared it. Anything else needs only the first.
+        let mut all: Vec<(&TrustedKey, AnyStatement)> = Vec::new();
+        for k in &trust.keys {
+            match verify_any_with(&raw.bytes, &k.key) {
+                Ok(v) => {
+                    let approval = matches!(v.statement, AnyStatement::Approval(_) | AnyStatement::Testing(_) | AnyStatement::Discard(_));
+                    all.push((k, v.statement));
+                    if !approval {
+                        break;
+                    }
+                }
+                // The signature checked out with this key; only the kind is unknown to this version.
+                Err(use05_receipt::Fault::Invalid { code: "PREDICATE_TYPE_UNSUPPORTED", .. }) => newer = true,
+                Err(_) => {}
             }
-            Err(_) => None,
-        });
+        }
+        // A testing sign-off is a person's statement too, prepared and co-signed the same way.
+        let is_approval = all.iter().any(|(_, s)| matches!(s, AnyStatement::Approval(_) | AnyStatement::Testing(_) | AnyStatement::Discard(_)));
+        let cosigners: Vec<Signer> = if is_approval {
+            all.iter().filter(|(k, _)| matches!(k.role, Role::Local | Role::Runner)).map(|(k, _)| Signer { name: k.name.clone(), role: k.role, key_id: k.id.clone() }).collect()
+        } else {
+            Vec::new()
+        };
+        // For an approval, the person's key is the signer; otherwise the first key that verified.
+        let chosen = if is_approval { all.iter().position(|(k, _)| k.role == Role::Approver).unwrap_or(0) } else { 0 };
+        let verified = all.into_iter().nth(chosen);
         let Some((key, statement)) = verified else {
             if newer && names_a_05_type(&raw.bytes) {
                 found.newer += 1;
@@ -146,16 +198,25 @@ pub fn classify(trust: &Trust, raws: &[Raw]) -> Found {
             }
             continue;
         };
+        // A passkey may approve, sign off testing or discard work from a phone, nothing else: not a bypass, a
+        // declaration, an outcome, a log seal or evidence. A page that holds it could be made to
+        // sign anything.
+        if key.key.is_passkey() && !matches!(statement, AnyStatement::Approval(_) | AnyStatement::Testing(_) | AnyStatement::Discard(_)) {
+            found.unverified += 1;
+            continue;
+        }
         let signer = Signer { name: key.name.clone(), role: key.role, key_id: key.id.clone() };
         let (source, path) = (raw.source.clone(), raw.path.clone());
         match statement {
             // People decide; machines produce evidence. A machine key cannot approve.
-            AnyStatement::Approval(statement) if key.role == Role::Approver => found.approvals.push(Signed { statement, signer, source, path }),
-            AnyStatement::Bypass(statement) if key.role == Role::Approver => found.bypasses.push(Signed { statement, signer, source, path }),
-            AnyStatement::Evidence(statement) if key.role != Role::Approver => found.evidence.push(Signed { statement, signer, source, path }),
-            AnyStatement::Declaration(statement) => found.declarations.push(Signed { statement, signer, source, path }),
-            AnyStatement::Completion(statement) => found.completions.push(Signed { statement, signer, source, path }),
-            AnyStatement::LogSeal(statement) => found.log_seals.push(Signed { statement, signer, source, path }),
+            AnyStatement::Approval(statement) if key.role == Role::Approver => found.approvals.push(Signed { statement, signer, source, path, cosigners }),
+            AnyStatement::Testing(statement) if key.role == Role::Approver => found.testing.push(Signed { statement, signer, source, path, cosigners }),
+            AnyStatement::Discard(statement) if key.role == Role::Approver => found.discards.push(Signed { statement, signer, source, path, cosigners }),
+            AnyStatement::Bypass(statement) if key.role == Role::Approver => found.bypasses.push(Signed { statement, signer, source, path, cosigners: Vec::new() }),
+            AnyStatement::Evidence(statement) if key.role != Role::Approver => found.evidence.push(Signed { statement, signer, source, path, cosigners: Vec::new() }),
+            AnyStatement::Declaration(statement) => found.declarations.push(Signed { statement, signer, source, path, cosigners: Vec::new() }),
+            AnyStatement::Completion(statement) => found.completions.push(Signed { statement, signer, source, path, cosigners: Vec::new() }),
+            AnyStatement::LogSeal(statement) => found.log_seals.push(Signed { statement, signer, source, path, cosigners: Vec::new() }),
             _ => found.unverified += 1,
         }
     }
@@ -166,12 +227,12 @@ pub fn classify(trust: &Trust, raws: &[Raw]) -> Found {
 mod expiry_tests {
     use super::*;
     use crate::policy::{Policy, TrustKey};
-    use use05_receipt::{SigningKey, public_key_text};
+    use use05_receipt::{SigningKey, key_id, public_key_text};
 
     fn policy_with(expires: Option<&str>) -> (Policy, String) {
         let key = SigningKey::from_bytes(&[5; 32]).verifying_key();
         let mut policy = Policy::default();
-        policy.trust.key.push(TrustKey { name: "ci".into(), role: Role::Runner, public: public_key_text(&key), expires: expires.map(str::to_string) });
+        policy.trust.key.push(TrustKey { name: "ci".into(), role: Role::Runner, public: public_key_text(&key), expires: expires.map(str::to_string), person: None });
         (policy, key_id(&key))
     }
 

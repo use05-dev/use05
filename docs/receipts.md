@@ -1,6 +1,6 @@
 # Receipt format
 
-A 05 receipt is a [DSSE](https://github.com/secure-systems-lab/dsse) envelope around an [in-toto Statement v1](https://github.com/in-toto/attestation/blob/main/spec/v1/statement.md), signed with Ed25519. Any DSSE implementation can verify the signature; 05's own check adds the tree comparison. The reference implementation is `crates/receipt`, and a test there fails if this page stops naming every record type, subject and field the code writes.
+A 05 receipt is a [DSSE](https://github.com/secure-systems-lab/dsse) envelope around an [in-toto Statement v1](https://github.com/in-toto/attestation/blob/main/spec/v1/statement.md), signed with Ed25519, or, for a person's approval, with a passkey. Any DSSE implementation can verify an Ed25519 signature; 05's own check adds the tree comparison. The reference implementation is `crates/receipt`, and a test there fails if this page stops naming every record type, subject and field the code writes.
 
 ## Envelope
 
@@ -9,7 +9,22 @@ A 05 receipt is a [DSSE](https://github.com/secure-systems-lab/dsse) envelope ar
   "signatures": [ { "keyid": "<hint, never trusted>", "sig": "<base64 Ed25519 signature>" } ] }
 ```
 
-The signature is over the DSSE pre-authentication encoding: `"DSSEv1" SP LEN(type) SP type SP LEN(body) SP body`. The key id is an unauthenticated hint; a verifier is always given the public key it should trust.
+`payload` is the statement's exact bytes, `payloadType` is always `application/vnd.in-toto+json`, and `signatures` holds one or more entries. The signature is over the DSSE pre-authentication encoding: `"DSSEv1" SP LEN(type) SP type SP LEN(body) SP body`. The key id (`keyid`) is an unauthenticated hint; a verifier is always given the public key it should trust.
+
+### Passkey signatures
+
+A passkey (WebAuthn) cannot sign arbitrary bytes, so an entry it made carries the rest of its assertion:
+
+```json
+{ "sig": "<base64 DER ECDSA P-256 signature>",
+  "webauthn": { "authenticatorData": "<base64>", "clientDataJSON": "<base64>" } }
+```
+
+The page asks the passkey to sign with the challenge set to the SHA-256 of the pre-authentication encoding, so `sig` still covers exactly the statement. A verifier holding the passkey's public key and the site it was made for (its relying party id) checks, in this order: that `sig` is a valid ES256 signature over `authenticatorData` followed by the SHA-256 of `clientDataJSON` (both halves of the curve order are accepted); that `authenticatorData` starts with the SHA-256 of the relying party id and has the user-present and user-verified flags set (Face ID, a fingerprint or a PIN was used); and that `clientDataJSON` has `type` `webauthn.get`, a `challenge` (base64url) equal to that SHA-256, an `origin` of `https://` and the relying party id (`http://localhost:<port>` only for `localhost`), and no `crossOrigin: true`. Entries with `webauthn` are skipped by an Ed25519 check, and entries without it by a passkey check.
+
+A passkey approval carries a second entry: the Ed25519 signature of the machine (or CI runner) that prepared the statement, made when `use05 approve --unsigned` printed it (`details.cosignature`). A page that holds a passkey could be made to sign any challenge, so a passkey approval counts only when a key trusted with `role = "local"` or `"runner"` co-signed the same statement, and only when the passkey belongs to the person driving the work: a `[[trust.key]]` passkey whose `person` matches the approver the co-signed statement names and, when the work's owner is recorded, the owner's name (ignoring case and surrounding spaces); or a passkey pinned in `passkeys.pub` on the machine whose approver owns the work. A machine key listed with a `person` prepares only for that person. Otherwise the approval is kept but void, and the brief says why: `no machine that prepared it co-signed it`, `its trust entry names no person`, `it was signed by someone other than the person driving the work`, or `it was prepared on someone else's machine`. Approvals signed with an Ed25519 approver key at a terminal need no co-signature.
+
+A passkey's public key is written `use05-passkey-p256-public:<relying party id>:<base64 of the 65-byte uncompressed point>`. 05 counts passkey signatures for approvals only: intent approvals, and outcome approvals and rejections. A bypass, evidence or any other record signed by a passkey does not count.
 
 ## Statement
 
@@ -30,16 +45,18 @@ The signature is over the DSSE pre-authentication encoding: `"DSSEv1" SP LEN(typ
 | `https://use05.dev/evidence/v0` | A command ran on that exact tree | `command` (`argv`, `cwd`), `environment` (`fingerprint`, `names`: variable names only, never values), `result` (`status`: passed, failed or timed_out; `exit_code`; `signal`; `duration_ms`; `stdout` and `stderr`, each `total_bytes`, `retained_bytes`, `truncated` and a `sha256` of the stream, never its text), `runner` (`name`, `version`, `platform`), `created`, `check` (the policy check's name, if any) |
 | `https://use05.dev/approval/v0` | A person approved or rejected an intent or an outcome | `decision` (approve or reject), `scope` (intent or outcome), `task`, `intent_sha256` (for intent approvals), `policy_sha256` (the rules in force; a policy change voids it), `rationale`, `approver`, `created`, `expires` |
 | `https://use05.dev/bypass/v0` | A logged break-glass override of one exact blocked tree | `reason`, `by`, `findings` (what it overrode), `created`, `expires` |
+| `https://use05.dev/testing/v0` | A person's word that they tried that exact tree in their own development environment, or that they skipped it and why. Signed by their approver key or passkey; never an approval | `outcome` (tested or skipped), `task`, `note` (what they tried, or why not, in their words), `tester`, `created` |
+| `https://use05.dev/discard/v0` | A person's word to throw a task's work away: its worktree, its branch here and on origin, and what the console holds about it. Prepared and co-signed by the machine that holds the work, signed by the person's approver key or passkey, and acted on there only; never stored as a receipt. Its subject is the work (`task`, and `gitCommit`, the branch's head) | `task`, `branch`, `head`, `unpushed` (commits on no remote branch and not landed), `uncommitted` (files never committed), `by`, `created` |
 | `https://use05.dev/org-layer/v0` | An organisation's policy floor, signed by its pinned key | `org`, `floor`, `created` |
 | `https://use05.dev/intent/v0` | An agent's declaration of what it will do, sealed by its hook | `task`, `title`, `author`, `card` (scope, acceptance checks, goal), `sealed`, `policy_sha256`, and when known `agent` (`kind`, `session`, `model`), `owner` (`name`, `key_id`: recorded, and confirmed only by that key's signed approval) and `sandbox` (what the agent's own process reported; its word, not a fact) |
 | `https://use05.dev/outcome/v0` | What the author said they did, for the tree they finished on. An assertion, never a fact | `task`, `outcome`, `finished` |
 | `https://use05.dev/log/v0` | A seal on an agent's action log: the log had `seq` lines and the last one had chain hash `head` | `task`, `seq`, `head`, `created` |
 
-Receipts never contain command output, file contents, diffs or prompts. Unknown fields are ignored when reading; the signature covers every byte, so nothing can be added after signing.
+Receipts never contain command output, file contents, diffs or prompts; a testing sign-off carries only the note its person wrote. Unknown fields are ignored when reading; the signature covers every byte, so nothing can be added after signing.
 
 ### Keys
 
-A receipt counts only if a key the verifier trusts signed it. Keys have roles: `local` (this machine; advisory, since any process running as you can use it), `runner` (a CI secret; authoritative evidence) and `approver` (a person's passphrase-protected key). Approvals and bypasses count only when an approver key signed them; a machine key cannot approve.
+A receipt counts only if a key the verifier trusts signed it. Keys have roles: `local` (this machine; advisory, since any process running as you can use it), `runner` (a CI secret; authoritative evidence) and `approver` (a person's passphrase-protected key, or a passkey). Approvals and bypasses count only when an approver key signed them, and bypasses only an Ed25519 one; a machine key cannot approve.
 
 ## The action log and its seals
 
@@ -49,7 +66,7 @@ A copy of the log travels on the receipts branch at `logs/<task>.jsonl`, written
 
 ## Verifying
 
-`use05 verify RECEIPT --key PUBLIC_KEY [--tree REV]` checks the signature, reads the statement, and, with `--tree`, that the receipt is for that exact tree. It exits 0 for a valid receipt (for evidence, of a passing check), 2 for a valid receipt of a failing check or an invalid signature, 5 for a good signature on a different tree, and 6 for a malformed receipt. Verification needs no network and no repository. The brief (`use05 brief`, and `use05 gate --ci` in CI) also checks a task's action log against its seals and says how strongly it is sealed.
+`use05 verify RECEIPT --key PUBLIC_KEY [--tree REV]` checks the signature (the key file may hold an Ed25519 or a passkey public key), reads the statement, and, with `--tree`, that the receipt is for that exact tree. It exits 0 for a valid receipt (for evidence, of a passing check), 2 for a valid receipt of a failing check or an invalid signature, 5 for a good signature on a different tree, and 6 for a malformed receipt. Verification needs no network and no repository. The brief (`use05 brief`, and `use05 gate --ci` in CI) also checks a task's action log against its seals and says how strongly it is sealed.
 
 ## Where receipts live
 

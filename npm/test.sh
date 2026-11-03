@@ -8,6 +8,8 @@ set -euo pipefail
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 BIN="${1:-$ROOT/target/release/use05}"
 [ -x "$BIN" ] || cargo build --release -q -p use05 --manifest-path "$ROOT/Cargo.toml"
+CLOUD="$(dirname "$BIN")/use05-cloud"
+[ -x "$CLOUD" ] || cargo build --release -q -p use05-cloud --manifest-path "$ROOT/Cargo.toml"
 V=$(sed -n 's/^version = "\(.*\)"/\1/p' "$ROOT/Cargo.toml" | head -n 1)
 case "$(uname -s)-$(uname -m)" in
   Darwin-arm64) target=aarch64-apple-darwin ;;
@@ -24,6 +26,7 @@ PKG_V="0.0.0-ci"
 D="use05-$PKG_V-$target"
 mkdir -p "$tmp/dist/$D" "$tmp/packs"
 cp "$BIN" "$tmp/dist/$D/use05"
+cp "$CLOUD" "$tmp/dist/$D/use05-cloud"
 (cd "$tmp/dist" && tar czf "$D.tar.gz" "$D" && rm -r "$D" && { command -v sha256sum >/dev/null && sha256sum "$D.tar.gz" || shasum -a 256 "$D.tar.gz"; } > "$D.tar.gz.sha256")
 "$ROOT/npm/build.sh" "$PKG_V" "$tmp/dist" "$tmp/out" >/dev/null
 (cd "$tmp/packs" && for d in "$tmp"/out/*; do npm pack -q "$d" >/dev/null; done)
@@ -32,6 +35,8 @@ got=$("$tmp/prefix/bin/use05" --version)
 [ "$got" = "use05 $V" ] || { echo "npm test: expected \"use05 $V\", got \"$got\"" >&2; exit 1; }
 set +e; "$tmp/prefix/bin/use05" no-such-command 2>/dev/null; code=$?; set -e
 [ "$code" = 6 ] || { echo "npm test: the exit code was not passed through (got $code, want 6)" >&2; exit 1; }
+# The helper comes with it, on PATH next to use05, run by its own launcher.
+"$tmp/prefix/bin/use05-cloud" 2>/dev/null | grep -q "connect this machine to your own 05 console" || { echo "npm test: use05-cloud did not run through npm" >&2; exit 1; }
 # The publish step the workflow runs, as a dry run: nothing is sent.
 "$ROOT/npm/publish.sh" "$tmp/out" --dry-run --tag ci >/dev/null 2>&1 || { echo "npm test: npm/publish.sh --dry-run failed" >&2; exit 1; }
-echo "npm test: installed from packed packages, ran $got, exit codes pass through, publish dry run ok"
+echo "npm test: installed from packed packages, ran $got and use05-cloud, exit codes pass through, publish dry run ok"

@@ -74,7 +74,7 @@ fn forge(payload_type: &str, body: &[u8], k: &SigningKey) -> Vec<u8> {
     let envelope = Envelope {
         payload: STANDARD.encode(body),
         payload_type: payload_type.to_string(),
-        signatures: vec![EnvelopeSignature { keyid: None, sig: STANDARD.encode(sig.to_bytes()) }],
+        signatures: vec![EnvelopeSignature { keyid: None, sig: STANDARD.encode(sig.to_bytes()), webauthn: None }],
     };
     to_bytes(&envelope)
 }

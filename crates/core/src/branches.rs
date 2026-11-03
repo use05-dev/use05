@@ -34,7 +34,13 @@ pub fn is_work(policy: &Policy, name: &str) -> bool {
 /// Where a task's work lands: the declaration's target, else the policy's, else the remote's
 /// default branch, else `main`.
 pub fn target_for(policy: &Policy, card: Option<&IntentCard>, top: &Path) -> String {
-    if let Some(t) = card.and_then(|c| c.target.clone()).or_else(|| policy.branches.target.clone()) {
+    card.and_then(|c| c.target.clone()).unwrap_or_else(|| landing_for(policy, None, top))
+}
+
+/// Where the policy's work lands, whatever an agent declared: the policy's target, else the host's
+/// default branch (when CI knows it), else the remote's, else `main`.
+pub fn landing_for(policy: &Policy, host_default: Option<&str>, top: &Path) -> String {
+    if let Some(t) = policy.branches.target.clone().or_else(|| host_default.filter(|b| !b.is_empty()).map(str::to_string)) {
         return t;
     }
     git::text(top, &["symbolic-ref", "--quiet", "--short", "refs/remotes/origin/HEAD"])
@@ -82,6 +88,11 @@ fn has_ignored_files(dir: &Path) -> bool {
 }
 
 /// Where a branch is checked out, if anywhere.
+/// The repository's main checkout (not a linked worktree).
+pub fn main_worktree(top: &Path) -> Option<PathBuf> {
+    worktrees(top).into_iter().next().map(|(p, _)| p)
+}
+
 pub fn checked_out_at(top: &Path, branch: &str) -> Option<PathBuf> {
     worktrees(top).into_iter().find(|(_, b)| b.as_deref() == Some(branch)).map(|(p, _)| p)
 }

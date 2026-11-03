@@ -7,17 +7,19 @@
 
 mod dsse;
 mod keys;
+mod passkey;
 mod statement;
 
-pub use dsse::{Envelope, EnvelopeSignature, Fault, PAYLOAD_TYPE, pae};
+pub use dsse::{Envelope, EnvelopeSignature, Fault, PAYLOAD_TYPE, WebAuthnSig, cosignature, pae};
 pub use keys::{
-    KeyError, key_id, parse_public_key, parse_secret_key, public_key_text, secret_key_text,
+    KeyError, PublicKey, key_id, parse_any_public_key, parse_public_key, parse_secret_key, public_key_text, secret_key_text,
 };
+pub use passkey::{PasskeyKey, passkey_challenge, passkey_public_text};
 pub use statement::{
     APPROVAL_TYPE, AgentRef, AnyStatement, Approval, ApprovalScope, BYPASS_TYPE, Bypass, Command, Completion,
-    Decision, Declaration, Environment, Evidence, INTENT_TYPE, LOG_TYPE, LogSeal, ORG_TYPE,
+    DISCARD_TYPE, Decision, Declaration, Discard, Environment, Evidence, INTENT_TYPE, LOG_TYPE, LogSeal, ORG_TYPE,
     OUTCOME_TYPE, OrgLayer, Outcome, OwnerRef, PREDICATE_TYPE, Predicate, Runner,
-    STATEMENT_TYPE, Statement, Status, Stream, Subject, intent_subject, log_subject, tree_subject,
+    STATEMENT_TYPE, Statement, Status, Stream, Subject, TESTING_TYPE, Tested, Testing, intent_subject, log_subject, tree_subject, work_subject,
 };
 
 pub use ed25519_dalek::{SigningKey, VerifyingKey};
@@ -62,6 +64,28 @@ pub fn verify_any(envelope_json: &[u8], key: &VerifyingKey) -> Result<Verified<A
     Ok(finish(statement, opened.hint, key))
 }
 
+/// Like [`verify_any`], with either kind of key. A passkey verifies only its own (WebAuthn)
+/// signatures; what it may sign is decided by the caller (05 counts them for approvals only).
+pub fn verify_any_with(envelope_json: &[u8], key: &PublicKey) -> Result<Verified<AnyStatement>, Fault> {
+    match key {
+        PublicKey::Ed25519(k) => verify_any(envelope_json, k),
+        PublicKey::Passkey(p) => {
+            let opened = passkey::verify(envelope_json, p)?;
+            let statement = statement::parse_any(&opened.payload)?;
+            Ok(finish_id(statement, opened.hint, key.id()))
+        }
+    }
+}
+
+/// Verify an envelope's signature with either kind of key and return the exact bytes it signed,
+/// whatever they are: the counterpart of [`seal_bytes`], for tools with their own record types.
+pub fn verify_bytes_with(envelope_json: &[u8], key: &PublicKey) -> Result<Vec<u8>, Fault> {
+    match key {
+        PublicKey::Ed25519(k) => dsse::verify(envelope_json, k).map(|o| o.payload),
+        PublicKey::Passkey(p) => passkey::verify(envelope_json, p).map(|o| o.payload),
+    }
+}
+
 /// Like [`verify`], for a statement with a specific predicate type.
 pub fn verify_as<P: Predicate>(envelope_json: &[u8], key: &VerifyingKey) -> Result<Verified<Statement<P>>, Fault> {
     let opened = dsse::verify(envelope_json, key)?;
@@ -70,7 +94,10 @@ pub fn verify_as<P: Predicate>(envelope_json: &[u8], key: &VerifyingKey) -> Resu
 }
 
 fn finish<S>(statement: S, hint: Option<String>, key: &VerifyingKey) -> Verified<S> {
-    let id = key_id(key);
+    finish_id(statement, hint, key_id(key))
+}
+
+fn finish_id<S>(statement: S, hint: Option<String>, id: String) -> Verified<S> {
     let hint_mismatch = hint.as_deref().is_some_and(|hint| hint != id);
     Verified { statement, key_id: id, hint_mismatch }
 }

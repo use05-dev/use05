@@ -5,7 +5,8 @@
 #
 # DIST holds the release's use05-VERSION-<target>.tar.gz files and their .sha256 files. OUT gets
 # one directory per package, ready for `npm publish`: a platform package @use05/cli-<os>-<cpu>
-# holding the binary, and @use05/cli, which runs whichever one npm installed (its command is use05). A tarball
+# holding the binaries (use05, and use05-cloud when the release has it), and @use05/cli, which runs
+# whichever one npm installed (its commands are use05 and use05-cloud). A tarball
 # whose checksum does not match stops the build. Targets missing from DIST are skipped and named.
 set -euo pipefail
 VERSION="${1:?usage: build.sh VERSION DIST OUT}"
@@ -34,18 +35,24 @@ for pair in $PLATFORMS; do
   dir="$OUT/cli-$platform"
   rm -rf "$dir" && mkdir -p "$dir/bin"
   tar -xzf "$tarball" -C "$dir" "$name/use05"
+  files='"bin/use05"'
+  if tar -tzf "$tarball" "$name/use05-cloud" >/dev/null 2>&1; then
+    tar -xzf "$tarball" -C "$dir" "$name/use05-cloud"
+    mv "$dir/$name/use05-cloud" "$dir/bin/use05-cloud" && chmod 755 "$dir/bin/use05-cloud"
+    files='"bin/use05", "bin/use05-cloud"'
+  fi
   mv "$dir/$name/use05" "$dir/bin/use05" && rmdir "$dir/$name"
   chmod 755 "$dir/bin/use05"
   cat > "$dir/package.json" <<JSON
 {
   "name": "@use05/cli-$platform",
   "version": "$VERSION",
-  "description": "The use05 binary for $os on $cpu. Install @use05/cli instead.",
+  "description": "The use05 binaries for $os on $cpu. Install @use05/cli instead.",
   "license": "Apache-2.0",
   "repository": { "type": "git", "url": "git+https://github.com/use05-dev/use05.git" },
   "os": ["$os"],
   "cpu": ["$cpu"],
-  "files": ["bin/use05"],
+  "files": [$files],
   "preferUnplugged": true
 }
 JSON

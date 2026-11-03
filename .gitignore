@@ -1,2 +1,5 @@
 target/
 *.key
+console-web/node_modules/
+console-web/dist/
+console-web/src/wasm/

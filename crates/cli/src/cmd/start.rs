@@ -57,7 +57,7 @@ pub fn publish_completion(ctx: &Ctx, task: &use05_core::task::Task) {
     let predicate = use05_receipt::Completion { task: task.id.clone(), outcome: task.outcome.clone().unwrap_or_default(), finished: task.finished.clone().unwrap_or_else(use05_core::time::now_rfc3339) };
     let statement = use05_receipt::Statement::new(vec![use05_receipt::tree_subject(&target.oid, &target.digest)], predicate);
     sign_and_store(ctx, task, &target.oid, &statement);
-    crate::extend::emit("finished", ctx.top(), json!({ "task": task.id, "agent": agent_kind(task), "tree": target.oid }));
+    crate::extend::announce_finished(ctx, task, agent_kind(task), &target.oid);
 }
 
 /// Seal the task's action log where it stands (D70): keep a copy on the receipts branch and sign

@@ -727,6 +727,7 @@ fn run_inner(agent: &str, event: &str) -> Result<Option<Value>, String> {
             }
             note(json!({ "event": "stop" }));
             let failed = prove_at_stop(&ctx, &task);
+            crate::extend::announce_approval_needed(&ctx, &task);
             // Claude Code can be asked to keep going; its own flag stops this from looping.
             let looping = payload.get("stop_hook_active").and_then(Value::as_bool).unwrap_or(false);
             // Asked once per session. A stop that follows a failed check is a looping one, so the

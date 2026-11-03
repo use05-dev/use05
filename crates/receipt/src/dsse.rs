@@ -30,6 +30,19 @@ pub struct EnvelopeSignature {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub keyid: Option<String>,
     pub sig: String,
+    /// Present when a passkey made this signature: then `sig` is a DER ECDSA P-256 signature over
+    /// the authenticator data and the SHA-256 of the client data (see the passkey module).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub webauthn: Option<WebAuthnSig>,
+}
+
+/// The parts of a WebAuthn assertion a verifier needs besides the signature, both base64.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct WebAuthnSig {
+    #[serde(rename = "authenticatorData")]
+    pub authenticator_data: String,
+    #[serde(rename = "clientDataJSON")]
+    pub client_data_json: String,
 }
 
 impl Envelope {
@@ -110,19 +123,18 @@ pub fn pae(payload_type: &str, body: &[u8]) -> Vec<u8> {
 }
 
 pub(crate) fn sign(payload_type: &str, body: &[u8], key: &SigningKey) -> Envelope {
+    Envelope { payload: STANDARD.encode(body), payload_type: payload_type.to_string(), signatures: vec![cosignature(payload_type, body, key)] }
+}
+
+/// One Ed25519 signature over a statement, as an envelope entry. Several keys can sign the same
+/// statement: a machine co-signs what it prepared, and a person's passkey signs it too.
+pub fn cosignature(payload_type: &str, body: &[u8], key: &SigningKey) -> EnvelopeSignature {
     let signature = key.sign(&pae(payload_type, body));
-    Envelope {
-        payload: STANDARD.encode(body),
-        payload_type: payload_type.to_string(),
-        signatures: vec![EnvelopeSignature {
-            keyid: Some(key_id(&key.verifying_key())),
-            sig: STANDARD.encode(signature.to_bytes()),
-        }],
-    }
+    EnvelopeSignature { keyid: Some(key_id(&key.verifying_key())), sig: STANDARD.encode(signature.to_bytes()), webauthn: None }
 }
 
 /// DSSE verifiers must accept standard or URL-safe base64.
-fn decode_b64(text: &str) -> Option<Vec<u8>> {
+pub(crate) fn decode_b64(text: &str) -> Option<Vec<u8>> {
     [STANDARD, STANDARD_NO_PAD, URL_SAFE, URL_SAFE_NO_PAD]
         .iter()
         .find_map(|engine| engine.decode(text).ok())
@@ -136,8 +148,8 @@ pub(crate) struct Opened {
     pub hint: Option<String>,
 }
 
-/// Verify the signature and the payload type.
-pub(crate) fn verify(envelope_json: &[u8], key: &VerifyingKey) -> Result<Opened, Fault> {
+/// Read an envelope and its payload bytes, before any signature is checked.
+pub(crate) fn open(envelope_json: &[u8]) -> Result<(Envelope, Vec<u8>), Fault> {
     let envelope: Envelope = serde_json::from_slice(envelope_json).map_err(|e| {
         use serde_json::error::Category;
         match e.classify() {
@@ -157,9 +169,16 @@ pub(crate) fn verify(envelope_json: &[u8], key: &VerifyingKey) -> Result<Opened,
         return Err(Fault::malformed("RECEIPT_NO_SIGNATURES", "the envelope carries no signature"));
     }
 
+    Ok((envelope, body))
+}
+
+/// Verify the signature and the payload type.
+pub(crate) fn verify(envelope_json: &[u8], key: &VerifyingKey) -> Result<Opened, Fault> {
+    let (envelope, body) = open(envelope_json)?;
     let signed_input = pae(&envelope.payload_type, &body);
     let mut verified_hint: Option<Option<String>> = None;
-    for entry in &envelope.signatures {
+    // A passkey's signature is not an Ed25519 one; it is checked by the passkey path, not here.
+    for entry in envelope.signatures.iter().filter(|e| e.webauthn.is_none()) {
         let raw = decode_b64(&entry.sig)
             .ok_or_else(|| Fault::malformed("RECEIPT_BAD_BASE64", "a signature is not valid base64"))?;
         let signature = Signature::from_slice(&raw).map_err(|_| {
@@ -176,14 +195,19 @@ pub(crate) fn verify(envelope_json: &[u8], key: &VerifyingKey) -> Result<Opened,
         ));
     };
 
-    // Only trust the type after the signature covering it has been checked.
+    check_type(&envelope)?;
+    Ok(Opened { payload: body, hint })
+}
+
+/// Only trust the type after the signature covering it has been checked.
+pub(crate) fn check_type(envelope: &Envelope) -> Result<(), Fault> {
     if envelope.payload_type != PAYLOAD_TYPE {
         return Err(Fault::invalid(
             "PAYLOAD_TYPE_UNSUPPORTED",
             format!("signed payload type {:?} is not supported", envelope.payload_type),
         ));
     }
-    Ok(Opened { payload: body, hint })
+    Ok(())
 }
 
 #[cfg(test)]

@@ -42,21 +42,27 @@ fn ssh_command(top: &Path, from_env: Option<&str>) -> Option<String> {
 /// Fetch one branch from a remote, never asking for a password, and give up after `timeout`.
 /// The branch is fetched into `refs/remotes/<remote>/<branch>` even in a single-branch clone.
 pub fn fetch(top: &Path, remote: &str, branch: &str, timeout: Duration) -> Result<(), String> {
-    use std::os::unix::process::CommandExt;
     let refspec = format!("+refs/heads/{branch}:refs/remotes/{remote}/{branch}");
+    quiet_git(top, &["fetch", "--quiet", "--no-tags", "--no-recurse-submodules", remote, &refspec], timeout).map_err(|e| if e.starts_with("git ") { e.replacen("git ", &format!("git fetch {remote} {branch} "), 1) } else { e.replace("the remote", remote) })
+}
+
+/// Run git against a remote (a fetch, a push): never asking for a password or passphrase, and
+/// giving up after `timeout`, leaving nothing running.
+pub fn quiet_git(top: &Path, args: &[&str], timeout: Duration) -> Result<(), String> {
     let mut cmd = Command::new("git");
     cmd.arg("-C")
         .arg(top)
-        .args(["fetch", "--quiet", "--no-tags", "--no-recurse-submodules", remote, &refspec])
+        .args(args)
         .env("GIT_TERMINAL_PROMPT", "0")
         .env("SSH_ASKPASS_REQUIRE", "never")
         .env("LC_ALL", "C")
-        // Its own process group, so a helper git starts (ssh) goes when git is given up on.
-        .process_group(0)
         // No pipes: nothing here waits on what a helper keeps open.
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null());
+    // Its own process group, so a helper git starts (ssh) goes when git is given up on.
+    #[cfg(unix)]
+    std::os::unix::process::CommandExt::process_group(&mut cmd, 0);
     if git::text(top, &["config", "--get", "core.sshCommand"]).is_err() && std::env::var_os("GIT_SSH").is_none() {
         if let Some(ssh) = ssh_command(top, std::env::var("GIT_SSH_COMMAND").ok().as_deref()) {
             cmd.env("GIT_SSH_COMMAND", ssh);
@@ -67,16 +73,16 @@ pub fn fetch(top: &Path, remote: &str, branch: &str, timeout: Duration) -> Resul
     loop {
         match child.try_wait() {
             Ok(Some(status)) if status.success() => return Ok(()),
-            Ok(Some(status)) => return Err(format!("git fetch {remote} {branch} failed{}", status.code().map(|c| format!(" (exit {c})")).unwrap_or_default())),
+            Ok(Some(status)) => return Err(format!("git failed{}", status.code().map(|c| format!(" (exit {c})")).unwrap_or_default())),
             Ok(None) if started.elapsed() >= timeout => {
                 // The whole group: git and anything it started.
                 kill_group(child.id());
                 let _ = child.kill();
                 let _ = child.wait();
-                return Err(format!("{remote} did not answer within {} s", timeout.as_secs()));
+                return Err(format!("the remote did not answer within {} s", timeout.as_secs()));
             }
             Ok(None) => std::thread::sleep(Duration::from_millis(25)),
-            Err(e) => return Err(format!("waiting for git fetch failed ({e})")),
+            Err(e) => return Err(format!("waiting for git failed ({e})")),
         }
     }
 }
@@ -84,10 +90,13 @@ pub fn fetch(top: &Path, remote: &str, branch: &str, timeout: Duration) -> Resul
 /// Kill a process group started with `process_group(0)`: its id is the leader's pid.
 #[allow(unsafe_code)]
 fn kill_group(leader: u32) {
+    #[cfg(unix)]
     if let Ok(pid) = i32::try_from(leader) {
         // SAFETY: kill(2) with a negative pid signals that process group; no memory is touched.
         unsafe { libc::kill(-pid, libc::SIGKILL) };
     }
+    #[cfg(not(unix))]
+    let _ = leader;
 }
 
 fn count(top: &Path, range: &str) -> u32 {

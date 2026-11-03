@@ -7,10 +7,10 @@ use std::process::{Command, Stdio};
 use std::time::Duration;
 
 use tempfile::TempDir;
-use use05_core::evidence::{Trust, TrustedKey};
+use use05_core::evidence::{Holder, Trust, TrustedKey};
 use use05_core::gate::{Decision, Effect, GateInput, GateResult, StaleBase, evaluate};
 use use05_core::intent::{IntentCard, Scope};
-use use05_core::policy::{CheckDef, IntentMode, Policy, Require, Role, Severity};
+use use05_core::policy::{CheckDef, IntentMode, LocalTesting, Policy, Require, Role, Severity, TestingPolicy};
 use use05_core::task::Task;
 use use05_core::time::{now_rfc3339, now_secs, rfc3339};
 use use05_core::{git, store};
@@ -63,7 +63,7 @@ fn key(seed: u8) -> SigningKey {
 }
 
 fn trusted(name: &str, role: Role, k: &SigningKey) -> TrustedKey {
-    TrustedKey { name: name.into(), role, key: k.verifying_key(), id: key_id(&k.verifying_key()) }
+    TrustedKey { name: name.into(), role, key: PublicKey::Ed25519(k.verifying_key()), id: key_id(&k.verifying_key()), holder: Holder::Unnamed }
 }
 
 fn policy_with(checks: &[(&str, &[&str])]) -> Policy {
@@ -103,6 +103,19 @@ impl Ctx<'_> {
         self.gate_at(&base, &tree, &digest)
     }
     fn gate_at(&self, base: &str, tree: &str, digest: &str) -> GateResult {
+        self.gate_pushing(base, tree, digest, None)
+    }
+    /// As a push to `branch` would be gated.
+    fn gate_to(&self, branch: &str) -> GateResult {
+        let (base, tree, digest) = self.repo.stage();
+        self.gate_pushing(&base, &tree, &digest, Some(branch))
+    }
+    fn gate_pushing(&self, base: &str, tree: &str, digest: &str, pushing_to: Option<&str>) -> GateResult {
+        self.gate_ci(base, tree, digest, pushing_to, None)
+    }
+    /// As CI gates it: `pushing_to` as CI read it (empty when CI could not tell), and the host's
+    /// default branch when the host says.
+    fn gate_ci(&self, base: &str, tree: &str, digest: &str, pushing_to: Option<&str>, default_branch: Option<&str>) -> GateResult {
         evaluate(&GateInput {
             top: self.repo.path(),
             policy: &self.policy,
@@ -116,6 +129,8 @@ impl Ctx<'_> {
             overlaps: &[],
             log: None,
             stale_base: self.stale.as_ref(),
+            pushing_to,
+            default_branch,
         })
         .unwrap()
     }
@@ -145,7 +160,7 @@ fn file_outcome_approval(repo: &Repo, tree: &str, digest: &str, a: Approval, sig
 }
 
 fn ctx<'a>(repo: &'a Repo, policy: Policy, trust: Vec<TrustedKey>) -> Ctx<'a> {
-    Ctx { repo, policy, trust: Trust { keys: trust }, task: None, late: Vec::new(), stale: None }
+    Ctx { repo, policy, trust: Trust { keys: trust, ..Default::default() }, task: None, late: Vec::new(), stale: None }
 }
 
 fn task_with(card: Option<IntentCard>, outcome: Option<&str>) -> Task {
@@ -302,6 +317,36 @@ fn a_protected_path_needs_a_person_and_only_the_right_kind_of_approval_counts() 
     let ok = c.gate();
     assert_eq!(ok.decision, Decision::Allow, "{:?}", codes(&ok));
     assert!(ok.findings.iter().any(|f| f.code == "PROTECTED_PATH" && f.message.ends_with("(approved)")));
+}
+
+#[test]
+fn an_approval_lasts_no_longer_than_the_policy_allows_and_is_not_dated_ahead() {
+    let repo = Repo::new();
+    let person = key(10);
+    repo.write("migrations/001.sql", "create table t();\n");
+    let policy = protected_policy();
+    let c = ctx(&repo, policy.clone(), vec![trusted("alice", Role::Approver, &person)]);
+    let (_, tree, digest) = repo.stage();
+    let days = policy.approvals.expire_days as i64;
+
+    // Whoever prepared it asked for a far longer life than approvals.expire_days.
+    let forever = approval(ApprovalScope::Outcome, Vote::Approve, &policy, "alice", 3650 * 86_400);
+    file_outcome_approval(&repo, &tree, &digest, forever, &person);
+    let r = c.gate();
+    assert_eq!(r.decision, Decision::ApprovalRequired, "{:?}", codes(&r));
+    assert!(r.approvals.iter().any(|a| a.void == Some("it lasts longer than the policy allows")), "{:?}", r.approvals);
+
+    // Made "tomorrow", so it would outlive its window.
+    let mut ahead = approval(ApprovalScope::Outcome, Vote::Approve, &policy, "alice", 3600);
+    ahead.created = rfc3339(now_secs() + 86_400);
+    file_outcome_approval(&repo, &tree, &digest, ahead, &person);
+    let r = c.gate();
+    assert_eq!(r.decision, Decision::ApprovalRequired);
+    assert!(r.approvals.iter().any(|a| a.void == Some("it is dated in the future")), "{:?}", r.approvals);
+
+    // Exactly the policy's window counts.
+    file_outcome_approval(&repo, &tree, &digest, approval(ApprovalScope::Outcome, Vote::Approve, &policy, "alice", days * 86_400), &person);
+    assert_eq!(c.gate().decision, Decision::Allow);
 }
 
 #[test]
@@ -523,7 +568,7 @@ fn it_works_on_a_repository_whose_base_is_empty() {
     let id = identify(dir.path(), "index").unwrap();
     let trust = Trust::default();
     let policy = Policy::default();
-    let r = evaluate(&GateInput { top: dir.path(), policy: &policy, trust: &trust, task: None, base_tree: None, target_tree: &id.oid, target_digest: &id.sha256, now: now_secs(), late: &[], overlaps: &[], log: None, stale_base: None }).unwrap();
+    let r = evaluate(&GateInput { top: dir.path(), policy: &policy, trust: &trust, task: None, base_tree: None, target_tree: &id.oid, target_digest: &id.sha256, now: now_secs(), late: &[], overlaps: &[], log: None, stale_base: None, pushing_to: None, default_branch: None }).unwrap();
     assert_eq!(r.decision, Decision::Allow);
     assert_eq!(r.changed.len(), 1);
     let _ = git::EMPTY_TREE;
@@ -799,4 +844,439 @@ fn work_that_started_behind_origin_is_held_at_fresh_base() {
     let mut off = ctx(&repo, Policy::default(), vec![]);
     off.stale = Some(stale);
     assert!(!codes(&off.gate()).contains(&"BASE_STALE"));
+}
+
+// ---------------------------------------------------------------------------- passkeys
+
+/// A browser's WebAuthn assertion over `body`, for a passkey made for localhost.
+fn passkey_seal(body: &[u8], sk: &p256::ecdsa::SigningKey) -> Vec<u8> {
+    use base64::Engine;
+    use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD};
+    use p256::ecdsa::signature::Signer;
+    use sha2::{Digest, Sha256};
+    let mut auth = Sha256::digest(b"localhost").to_vec();
+    auth.extend_from_slice(&[0x05, 0, 0, 0, 1]);
+    let challenge = URL_SAFE_NO_PAD.encode(passkey_challenge(PAYLOAD_TYPE, body));
+    let client = format!(r#"{{"type":"webauthn.get","challenge":"{challenge}","origin":"http://localhost:8080"}}"#);
+    let mut message = auth.clone();
+    message.extend_from_slice(&Sha256::digest(client.as_bytes()));
+    let sig: p256::ecdsa::Signature = sk.sign(&message);
+    Envelope {
+        payload: STANDARD.encode(body),
+        payload_type: PAYLOAD_TYPE.into(),
+        signatures: vec![EnvelopeSignature { keyid: None, sig: STANDARD.encode(sig.to_der().as_bytes()), webauthn: Some(WebAuthnSig { authenticator_data: STANDARD.encode(&auth), client_data_json: STANDARD.encode(client.as_bytes()) }) }],
+    }
+    .to_json_bytes()
+}
+
+fn passkey(seed: u8) -> (p256::ecdsa::SigningKey, PublicKey) {
+    let sk = p256::ecdsa::SigningKey::from_slice(&[seed; 32]).unwrap();
+    let key = PasskeyKey::from_sec1("localhost", sk.verifying_key().to_encoded_point(false).as_bytes()).unwrap();
+    (sk, PublicKey::Passkey(key))
+}
+
+fn trusted_passkey(name: &str, key: &PublicKey) -> TrustedKey {
+    TrustedKey { name: name.into(), role: Role::Approver, key: key.clone(), id: key.id(), holder: Holder::Unnamed }
+}
+
+/// A passkey-signed envelope that the machine which prepared it also signed, in either order.
+fn cosigned(body: &[u8], sk: &p256::ecdsa::SigningKey, machine: &SigningKey, machine_first: bool) -> Vec<u8> {
+    let mut envelope: Envelope = serde_json::from_slice(&passkey_seal(body, sk)).unwrap();
+    let entry = cosignature(PAYLOAD_TYPE, body, machine);
+    if machine_first { envelope.signatures.insert(0, entry) } else { envelope.signatures.push(entry) }
+    envelope.to_json_bytes()
+}
+
+#[test]
+fn a_policy_passkey_names_its_person() {
+    let (_, key) = passkey(26);
+    let PublicKey::Passkey(p) = &key else { unreachable!() };
+    let mut policy = Policy::default();
+    policy.trust.key.push(use05_core::policy::TrustKey { name: "phone".into(), role: Role::Approver, public: passkey_public_text(p), expires: None, person: Some(" Alice ".into()) });
+    assert_eq!(Trust::new(&policy, false).keys[0].holder, Holder::Person("Alice".into()));
+    let parsed = Policy::parse(&format!("[[trust.key]]\nname = \"phone\"\nrole = \"approver\"\npublic = \"{}\"\nperson = \"Alice\"\n", passkey_public_text(p).trim())).unwrap();
+    assert_eq!(parsed.trust.key[0].person.as_deref(), Some("Alice"));
+}
+
+#[test]
+fn classify_records_who_cosigned_an_approval() {
+    let repo = Repo::new();
+    let (sk, pk) = passkey(27);
+    let machine = key(30);
+    let trust = Trust { keys: vec![trusted_passkey("phone", &pk), trusted("this machine", Role::Local, &machine)], ..Default::default() };
+    let (_, tree, digest) = repo.stage();
+    let policy = protected_policy();
+    let body = serde_json::to_vec(&Statement::new(vec![tree_subject(&tree, &digest)], approval(ApprovalScope::Outcome, Vote::Approve, &policy, "owner", 3600))).unwrap();
+    for machine_first in [false, true] {
+        let raw = store::Raw { source: "test".into(), path: format!("r{machine_first}"), bytes: cosigned(&body, &sk, &machine, machine_first) };
+        let found = use05_core::evidence::classify(&trust, &[raw]);
+        assert_eq!(found.approvals.len(), 1, "machine first: {machine_first}");
+        assert_eq!(found.approvals[0].signer.key_id, pk.id());
+        assert_eq!(found.approvals[0].cosigners.iter().map(|s| s.key_id.clone()).collect::<Vec<_>>(), vec![key_id(&machine.verifying_key())]);
+    }
+}
+
+#[test]
+fn an_uncosigned_approval_has_no_cosigners() {
+    let repo = Repo::new();
+    let (sk, pk) = passkey(28);
+    let machine = key(31);
+    let trust = Trust { keys: vec![trusted_passkey("phone", &pk), trusted("this machine", Role::Local, &machine)], ..Default::default() };
+    let (_, tree, digest) = repo.stage();
+    let policy = protected_policy();
+    let body = serde_json::to_vec(&Statement::new(vec![tree_subject(&tree, &digest)], approval(ApprovalScope::Outcome, Vote::Approve, &policy, "owner", 3600))).unwrap();
+    let found = use05_core::evidence::classify(&trust, &[store::Raw { source: "test".into(), path: "r".into(), bytes: passkey_seal(&body, &sk) }]);
+    assert_eq!(found.approvals.len(), 1);
+    assert!(found.approvals[0].cosigners.is_empty());
+}
+
+/// A protected change owned by `owner`, a passkey held as `holder`, and this machine's key.
+fn passkey_case(seed: u8, holder: Holder, owner: Option<(&str, &str)>, this_person: Option<&str>) -> (Repo, Policy, p256::ecdsa::SigningKey, PublicKey, SigningKey, Trust, Option<Task>) {
+    let repo = Repo::new();
+    repo.write("migrations/001.sql", "create table t();\n");
+    let policy = protected_policy();
+    let (sk, pk) = passkey(seed);
+    let machine = key(seed.wrapping_add(100));
+    let mut phone = trusted_passkey("phone", &pk);
+    phone.holder = holder;
+    let trust = Trust { keys: vec![phone, trusted("this machine", Role::Local, &machine)], this_person: this_person.map(str::to_string) };
+    let task = owner.map(|(name, key_id)| {
+        let mut t = task_with(None, None);
+        t.owner = Some(use05_core::task::Owner { name: name.into(), key_id: key_id.into() });
+        t
+    });
+    (repo, policy, sk, pk, machine, trust, task)
+}
+
+fn voids(r: &GateResult) -> Vec<&'static str> {
+    r.approvals.iter().filter_map(|a| a.void).collect()
+}
+
+#[test]
+fn a_passkey_approval_counts_only_when_its_preparer_cosigned() {
+    let (repo, policy, sk, pk, machine, trust, task) = passkey_case(40, Holder::Person("Alice".into()), Some(("Alice", "k")), None);
+    let c = Ctx { repo: &repo, policy: policy.clone(), trust, task, late: Vec::new(), stale: None };
+    let (_, tree, digest) = repo.stage();
+    let body = serde_json::to_vec(&Statement::new(vec![tree_subject(&tree, &digest)], approval(ApprovalScope::Outcome, Vote::Approve, &policy, "Alice", 3600))).unwrap();
+
+    store::put(repo.path(), &tree, &passkey_seal(&body, &sk), &pk.id()).unwrap();
+    let r = c.gate();
+    assert_eq!(r.decision, Decision::ApprovalRequired, "{:?}", codes(&r));
+    assert!(voids(&r).contains(&"no machine that prepared it co-signed it"), "{:?}", r.approvals);
+
+    // Co-signed by a key nobody trusts: still not prepared by a machine 05 knows.
+    store::put(repo.path(), &tree, &cosigned(&body, &sk, &key(199), false), &pk.id()).unwrap();
+    assert_eq!(c.gate().decision, Decision::ApprovalRequired);
+
+    store::put(repo.path(), &tree, &cosigned(&body, &sk, &machine, false), &pk.id()).unwrap();
+    let ok = c.gate();
+    assert_eq!(ok.decision, Decision::Allow, "{:?} {:?}", codes(&ok), ok.approvals);
+}
+
+#[test]
+fn a_passkey_approval_counts_only_for_the_person_driving_the_work() {
+    let other = "it was signed by someone other than the person driving the work";
+    for (holder, owner, counts) in [
+        (Holder::Person("Bob".into()), Some("Alex Rivera"), false),
+        (Holder::Person("alex rivera ".into()), Some("Alex Rivera"), true),
+        (Holder::Person("Alex".into()), Some("Alex Rivera"), false),
+        (Holder::Person("Bob".into()), None, true),
+    ] {
+        let (repo, policy, sk, pk, machine, trust, task) = passkey_case(41, holder.clone(), owner.map(|o| (o, "k")), None);
+        let c = Ctx { repo: &repo, policy: policy.clone(), trust, task, late: Vec::new(), stale: None };
+        let (_, tree, digest) = repo.stage();
+        let body = serde_json::to_vec(&Statement::new(vec![tree_subject(&tree, &digest)], approval(ApprovalScope::Outcome, Vote::Approve, &policy, owner.unwrap_or("Bob"), 3600))).unwrap();
+        store::put(repo.path(), &tree, &cosigned(&body, &sk, &machine, true), &pk.id()).unwrap();
+        let r = c.gate();
+        assert_eq!(r.decision == Decision::Allow, counts, "{holder:?} for {owner:?}: {:?}", r.approvals);
+        if !counts {
+            assert!(voids(&r).contains(&other), "{:?}", r.approvals);
+        }
+    }
+}
+
+#[test]
+fn a_passkey_approval_names_its_person_even_without_a_recorded_driver() {
+    // Nobody is recorded as driving the work (its records were never pushed): the person the
+    // preparing machine named in the statement still has to be the passkey's.
+    for (approver, counts) in [("Bob", false), ("alice ", true)] {
+        let (repo, policy, sk, pk, machine, trust, task) = passkey_case(43, Holder::Person("Alice".into()), None, None);
+        let c = Ctx { repo: &repo, policy: policy.clone(), trust, task, late: Vec::new(), stale: None };
+        let (_, tree, digest) = repo.stage();
+        let body = serde_json::to_vec(&Statement::new(vec![tree_subject(&tree, &digest)], approval(ApprovalScope::Outcome, Vote::Approve, &policy, approver, 3600))).unwrap();
+        store::put(repo.path(), &tree, &cosigned(&body, &sk, &machine, false), &pk.id()).unwrap();
+        let r = c.gate();
+        assert_eq!(r.decision == Decision::Allow, counts, "approver {approver}: {:?}", r.approvals);
+        if !counts {
+            assert!(voids(&r).contains(&"it was signed by someone other than the person driving the work"), "{:?}", r.approvals);
+        }
+    }
+}
+
+#[test]
+fn a_trust_entry_without_a_person_says_so_and_a_pin_here_still_counts() {
+    let (repo, policy, sk, pk, machine, mut trust, task) = passkey_case(44, Holder::Unnamed, Some(("Alex", "k")), Some("k"));
+    let body = |tree: &str, digest: &str| serde_json::to_vec(&Statement::new(vec![tree_subject(tree, digest)], approval(ApprovalScope::Outcome, Vote::Approve, &policy, "Alex", 3600))).unwrap();
+    let (_, tree, digest) = repo.stage();
+    store::put(repo.path(), &tree, &cosigned(&body(&tree, &digest), &sk, &machine, false), &pk.id()).unwrap();
+    let c = Ctx { repo: &repo, policy: policy.clone(), trust: trust.clone(), task: task.clone(), late: Vec::new(), stale: None };
+    let r = c.gate();
+    assert_eq!(r.decision, Decision::ApprovalRequired);
+    assert!(voids(&r).contains(&"its trust entry names no person"), "{:?}", r.approvals);
+    // The same passkey also pinned on this machine, whose person drives the work: it counts.
+    let mut pinned = trusted_passkey("passkey iPhone", &pk);
+    pinned.holder = Holder::ThisMachine;
+    trust.keys.push(pinned);
+    let c = Ctx { repo: &repo, policy: policy.clone(), trust, task, late: Vec::new(), stale: None };
+    assert_eq!(c.gate().decision, Decision::Allow);
+}
+
+#[test]
+fn a_machine_named_for_one_person_cannot_prepare_for_another() {
+    let (repo, policy, sk, pk, machine, mut trust, task) = passkey_case(45, Holder::Person("Alice".into()), Some(("Alice", "k")), None);
+    // Bob's machine, listed in the policy as his, prepared and co-signed it.
+    trust.keys[1].holder = Holder::Person("Bob".into());
+    let c = Ctx { repo: &repo, policy: policy.clone(), trust, task, late: Vec::new(), stale: None };
+    let (_, tree, digest) = repo.stage();
+    let body = serde_json::to_vec(&Statement::new(vec![tree_subject(&tree, &digest)], approval(ApprovalScope::Outcome, Vote::Approve, &policy, "Alice", 3600))).unwrap();
+    store::put(repo.path(), &tree, &cosigned(&body, &sk, &machine, false), &pk.id()).unwrap();
+    let r = c.gate();
+    assert_eq!(r.decision, Decision::ApprovalRequired, "{:?}", r.approvals);
+    assert!(voids(&r).contains(&"it was prepared on someone else's machine"), "{:?}", r.approvals);
+}
+
+#[test]
+fn a_passkey_pinned_here_counts_for_this_machines_person() {
+    for (owner_key, counts) in [("k", true), ("other", false)] {
+        let (repo, policy, sk, pk, machine, trust, task) = passkey_case(42, Holder::ThisMachine, Some(("Alex", owner_key)), Some("k"));
+        let c = Ctx { repo: &repo, policy: policy.clone(), trust, task, late: Vec::new(), stale: None };
+        let (_, tree, digest) = repo.stage();
+        let body = serde_json::to_vec(&Statement::new(vec![tree_subject(&tree, &digest)], approval(ApprovalScope::Outcome, Vote::Approve, &policy, "Alex", 3600))).unwrap();
+        store::put(repo.path(), &tree, &cosigned(&body, &sk, &machine, false), &pk.id()).unwrap();
+        assert_eq!(c.gate().decision == Decision::Allow, counts, "owner key {owner_key}");
+    }
+}
+
+#[test]
+fn an_outcome_approval_signed_by_a_trusted_passkey_clears_approval_required() {
+    let repo = Repo::new();
+    repo.write("migrations/001.sql", "create table t();\n");
+    let policy = protected_policy();
+    let machine = key(121);
+    let (sk, key) = passkey(21);
+    let mut phone = trusted_passkey("phone", &key);
+    phone.holder = Holder::Person("owner".into());
+    let c = ctx(&repo, policy.clone(), vec![phone, trusted("this machine", Role::Local, &machine)]);
+    let (_, tree, digest) = repo.stage();
+    assert_eq!(c.gate().decision, Decision::ApprovalRequired);
+
+    let statement = Statement::new(vec![tree_subject(&tree, &digest)], approval(ApprovalScope::Outcome, Vote::Approve, &policy, "owner", 3600));
+    store::put(repo.path(), &tree, &cosigned(&serde_json::to_vec(&statement).unwrap(), &sk, &machine, false), &key.id()).unwrap();
+    let ok = c.gate();
+    assert_eq!(ok.decision, Decision::Allow, "{:?}", codes(&ok));
+}
+
+#[test]
+fn a_bypass_signed_by_a_passkey_does_not_count() {
+    let repo = Repo::new();
+    let (sk, key) = passkey(22);
+    let trust = Trust { keys: vec![trusted_passkey("phone", &key)], ..Default::default() };
+    let (_, tree, digest) = repo.stage();
+    let statement = Statement::new(
+        vec![tree_subject(&tree, &digest)],
+        Bypass { reason: "prod is down".into(), by: "owner".into(), findings: vec![], created: now_rfc3339(), expires: rfc3339(now_secs() + 3600) },
+    );
+    store::put(repo.path(), &tree, &passkey_seal(&serde_json::to_vec(&statement).unwrap(), &sk), &key.id()).unwrap();
+    let found = use05_core::evidence::classify(&trust, &store::find_all(repo.path()));
+    assert!(found.bypasses.is_empty(), "a passkey may approve, never bypass");
+    assert_eq!(found.unverified, 1);
+}
+
+#[test]
+fn a_passkey_listed_in_trust_key_is_trusted() {
+    let (_, key) = passkey(23);
+    let PublicKey::Passkey(p) = &key else { unreachable!() };
+    let mut policy = Policy::default();
+    policy.trust.key.push(use05_core::policy::TrustKey { name: "phone".into(), role: Role::Approver, public: passkey_public_text(p), expires: None, person: None });
+    let trust = Trust::new(&policy, false);
+    assert!(trust.by_id(&key.id()).is_some_and(|k| k.role == Role::Approver && k.key.is_passkey()));
+}
+
+#[test]
+fn a_passkey_signs_approvals_and_nothing_else_counts() {
+    let repo = Repo::new();
+    let (sk, key) = passkey(24);
+    let trust = Trust { keys: vec![trusted_passkey("phone", &key)], ..Default::default() };
+    let (_, tree, digest) = repo.stage();
+    let bodies = [
+        serde_json::to_vec(&Statement::new(
+            vec![intent_subject(&"ab".repeat(32))],
+            Declaration { task: "task1".into(), title: "t".into(), author: "agent:x".into(), card: serde_json::json!({}), sealed: now_rfc3339(), policy_sha256: "p".into(), agent: None, owner: None, sandbox: None },
+        ))
+        .unwrap(),
+        serde_json::to_vec(&Statement::new(vec![tree_subject(&tree, &digest)], Completion { task: "task1".into(), outcome: "o".into(), finished: now_rfc3339() })).unwrap(),
+        serde_json::to_vec(&Statement::new(vec![log_subject("task1", "ab")], LogSeal { task: "task1".into(), seq: 1, head: "ab".into(), created: now_rfc3339() })).unwrap(),
+    ];
+    let raws: Vec<store::Raw> = bodies.iter().enumerate().map(|(i, b)| store::Raw { source: "test".into(), path: format!("r{i}"), bytes: passkey_seal(b, &sk) }).collect();
+    let found = use05_core::evidence::classify(&trust, &raws);
+    assert!(found.declarations.is_empty() && found.completions.is_empty() && found.log_seals.is_empty(), "a passkey's declaration, outcome or log seal must not count");
+    assert_eq!(found.unverified, 3);
+}
+
+#[test]
+fn a_passkey_trusted_with_another_role_is_not_trusted() {
+    let (_, key) = passkey(25);
+    let PublicKey::Passkey(p) = &key else { unreachable!() };
+    for role in [Role::Runner, Role::Local] {
+        let mut policy = Policy::default();
+        policy.trust.key.push(use05_core::policy::TrustKey { name: "phone".into(), role, public: passkey_public_text(p), expires: None, person: None });
+        assert!(Trust::new(&policy, false).by_id(&key.id()).is_none(), "a passkey is only ever an approver ({role:?})");
+    }
+}
+
+#[test]
+fn a_policy_that_lists_a_passkey_but_not_the_machine_that_prepares_for_it_counts_nothing() {
+    // As CI reads it: the trust list made from the policy alone (no machine keys of its own).
+    let (repo, mut policy, sk, pk, machine, _, task) = passkey_case(44, Holder::Person("Alice".into()), Some(("Alice", "k")), None);
+    let PublicKey::Passkey(p) = &pk else { unreachable!() };
+    policy.trust.key.push(use05_core::policy::TrustKey { name: "phone".into(), role: Role::Approver, public: passkey_public_text(p), expires: None, person: Some("Alice".into()) });
+    let trust = Trust::new(&policy, false);
+    assert!(trust.keys.iter().any(|k| k.key.is_passkey()), "the passkey is trusted");
+    let c = Ctx { repo: &repo, policy: policy.clone(), trust, task, late: Vec::new(), stale: None };
+    let (_, tree, digest) = repo.stage();
+    let body = serde_json::to_vec(&Statement::new(vec![tree_subject(&tree, &digest)], approval(ApprovalScope::Outcome, Vote::Approve, &policy, "Alice", 3600))).unwrap();
+    store::put(repo.path(), &tree, &cosigned(&body, &sk, &machine, false), &pk.id()).unwrap();
+    let r = c.gate();
+    assert_eq!(r.decision, Decision::ApprovalRequired, "{:?}", r.approvals);
+    assert!(voids(&r).contains(&"no machine that prepared it co-signed it"), "{:?}", r.approvals);
+
+    // Listed too, as the machine that prepares for Alice: it counts.
+    policy.trust.key.push(use05_core::policy::TrustKey { name: "Alice's Mac".into(), role: Role::Local, public: use05_receipt::public_key_text(&machine.verifying_key()), expires: None, person: Some("Alice".into()) });
+    let c = Ctx { repo: &repo, policy: policy.clone(), trust: Trust::new(&policy, false), task: c.task.clone(), late: Vec::new(), stale: None };
+    let body = serde_json::to_vec(&Statement::new(vec![tree_subject(&tree, &digest)], approval(ApprovalScope::Outcome, Vote::Approve, &policy, "Alice", 3600))).unwrap();
+    store::put(repo.path(), &tree, &cosigned(&body, &sk, &machine, false), &pk.id()).unwrap();
+    assert_eq!(c.gate().decision, Decision::Allow, "{:?}", c.gate().approvals);
+}
+
+// ---------------------------------------------------------------------------- testing before a push (D87)
+
+fn file_testing(repo: &Repo, tree: &str, digest: &str, outcome: Tested, signer: &SigningKey) {
+    let t = Testing { outcome, task: "t".into(), note: "clicked through sign-up and paid an invoice".into(), tester: "alice".into(), created: now_rfc3339() };
+    let statement = Statement::new(vec![tree_subject(tree, digest)], t);
+    store::put(repo.path(), tree, &seal(&statement, signer).to_json_bytes(), &key_id(&signer.verifying_key())).unwrap();
+}
+
+fn testing_policy(local: LocalTesting, branches: &[&str]) -> Policy {
+    let mut p = Policy::default();
+    p.testing = TestingPolicy { local, branches: branches.iter().map(|b| b.to_string()).collect() };
+    p
+}
+
+#[test]
+fn a_push_to_a_chosen_branch_waits_for_a_persons_testing_sign_off() {
+    let repo = Repo::new();
+    repo.write("src/lib.rs", "pub fn f() { /* changed */ }\n");
+    let alice = key(70);
+    let c = ctx(&repo, testing_policy(LocalTesting::Required, &[]), vec![trusted("alice", Role::Approver, &alice)]);
+    // Off: nothing asked.
+    let off = ctx(&repo, Policy::default(), vec![]);
+    assert!(!codes(&off.gate_to("main")).contains(&"TESTING_REQUIRED"));
+    // The landing branch (main, here) needs it; an agent's working branch does not.
+    let r = c.gate_to("main");
+    assert_eq!(r.decision, Decision::ApprovalRequired, "{:?}", codes(&r));
+    let f = r.findings.iter().find(|f| f.code == "TESTING_REQUIRED").expect("asked for");
+    assert_eq!(f.next.as_deref(), Some("use05 approve --tested --note \"<what you tried>\""));
+    assert!(!codes(&c.gate_to("agent/fix")).contains(&"TESTING_REQUIRED"));
+    // Not a push: the brief says it will be needed, and holds nothing.
+    let brief = c.gate();
+    assert!(brief.findings.iter().any(|f| f.code == "TESTING_NOT_SIGNED" && f.effect == Effect::Info), "{:?}", codes(&brief));
+    // Signed off for this exact tree: it goes.
+    let (_, tree, digest) = repo.stage();
+    file_testing(&repo, &tree, &digest, Tested::Tested, &alice);
+    let ok = c.gate_to("main");
+    assert_eq!(ok.decision, Decision::Allow, "{:?}", codes(&ok));
+    assert_eq!(ok.testing.iter().map(|t| (t.outcome, t.note.as_str(), t.counts)).collect::<Vec<_>>(), vec![(Tested::Tested, "clicked through sign-up and paid an invoice", true)]);
+    // Change the code after: the sign-off was for other code.
+    repo.write("src/lib.rs", "pub fn f() { /* changed again */ }\n");
+    assert!(codes(&c.gate_to("main")).contains(&"TESTING_REQUIRED"));
+}
+
+#[test]
+fn a_skip_counts_only_where_the_policy_lets_testing_be_skipped() {
+    let repo = Repo::new();
+    repo.write("src/lib.rs", "pub fn f() { /* changed */ }\n");
+    let alice = key(71);
+    let (_, tree, digest) = repo.stage();
+    file_testing(&repo, &tree, &digest, Tested::Skipped, &alice);
+    let skippable = ctx(&repo, testing_policy(LocalTesting::Skippable, &[]), vec![trusted("alice", Role::Approver, &alice)]);
+    assert_eq!(skippable.gate_to("main").decision, Decision::Allow);
+    let required = ctx(&repo, testing_policy(LocalTesting::Required, &[]), vec![trusted("alice", Role::Approver, &alice)]);
+    let r = required.gate_to("main");
+    let f = r.findings.iter().find(|f| f.code == "TESTING_REQUIRED").expect("a skip does not count");
+    assert!(f.message.contains("skip"), "{}", f.message);
+}
+
+#[test]
+fn only_a_persons_sign_off_counts_and_an_approval_is_not_one() {
+    let repo = Repo::new();
+    repo.write("src/lib.rs", "pub fn f() { /* changed */ }\n");
+    let (alice, machine) = (key(72), key(73));
+    let policy = testing_policy(LocalTesting::Required, &["release/*"]);
+    let c = ctx(&repo, policy.clone(), vec![trusted("alice", Role::Approver, &alice), trusted("this machine", Role::Local, &machine)]);
+    let (_, tree, digest) = repo.stage();
+    // A machine key (an agent can use it) signing off: not a person.
+    file_testing(&repo, &tree, &digest, Tested::Tested, &machine);
+    // An approval of the outcome: accepting the change is not trying it.
+    file_outcome_approval(&repo, &tree, &digest, approval(ApprovalScope::Outcome, Vote::Approve, &policy, "alice", 3600), &alice);
+    assert!(codes(&c.gate_to("release/1.2")).contains(&"TESTING_REQUIRED"));
+    assert!(!codes(&c.gate_to("main")).contains(&"TESTING_REQUIRED"), "main is not one of the chosen branches here");
+}
+
+#[test]
+fn the_policy_says_where_testing_applies_not_the_agent() {
+    // The agent declares it lands on release/2, then pushes to main: main is still where the
+    // policy's work lands, so main needs the sign-off.
+    let repo = Repo::new();
+    repo.write("src/lib.rs", "pub fn f() { /* changed */ }\n");
+    let mut c = ctx(&repo, testing_policy(LocalTesting::Required, &[]), vec![]);
+    c.task = Some(task_with(Some(IntentCard { target: Some("release/2".into()), ..Default::default() }), None));
+    assert!(codes(&c.gate_to("main")).contains(&"TESTING_REQUIRED"), "{:?}", codes(&c.gate_to("main")));
+    assert!(!codes(&c.gate_to("release/2")).contains(&"TESTING_REQUIRED"));
+}
+
+#[test]
+fn in_ci_the_hosts_default_branch_is_the_landing_branch_and_an_unknown_one_is_held() {
+    let repo = Repo::new();
+    repo.write("src/lib.rs", "pub fn f() { /* changed */ }\n");
+    let c = ctx(&repo, testing_policy(LocalTesting::Required, &[]), vec![]);
+    let (base, tree, digest) = repo.stage();
+    // A repository whose default branch is master: CI has no origin/HEAD, the host says master.
+    assert!(codes(&c.gate_ci(&base, &tree, &digest, Some("master"), Some("master"))).contains(&"TESTING_REQUIRED"));
+    assert!(!codes(&c.gate_ci(&base, &tree, &digest, Some("main"), Some("master"))).contains(&"TESTING_REQUIRED"));
+    // CI could not tell where this goes (a merge queue it does not know, another CI): held, not let through.
+    let r = c.gate_ci(&base, &tree, &digest, Some(""), None);
+    assert_eq!(r.decision, Decision::ApprovalRequired, "{:?}", codes(&r));
+    assert!(codes(&r).contains(&"TESTING_REQUIRED"));
+    // The policy's own target still wins over the host's default.
+    let mut p = testing_policy(LocalTesting::Required, &[]);
+    p.branches.target = Some("develop".into());
+    let d = ctx(&repo, p, vec![]);
+    assert!(codes(&d.gate_ci(&base, &tree, &digest, Some("develop"), Some("master"))).contains(&"TESTING_REQUIRED"));
+    assert!(!codes(&d.gate_ci(&base, &tree, &digest, Some("master"), Some("master"))).contains(&"TESTING_REQUIRED"));
+}
+
+#[test]
+fn a_passkey_approval_prepared_and_co_signed_by_the_ci_runner_counts() {
+    // CI prepared the statement for the person who drives the work and co-signed it with the
+    // runner key; their passkey signed it on the console; CI filed it on its next run.
+    let (repo, policy, sk, pk, _machine, mut trust, task) = passkey_case(45, Holder::Person("Alice".into()), Some(("Alice", "k")), None);
+    let runner = key(145);
+    trust.keys.retain(|k| k.role != Role::Local);
+    trust.keys.push(trusted("ci", Role::Runner, &runner));
+    let c = Ctx { repo: &repo, policy: policy.clone(), trust, task, late: Vec::new(), stale: None };
+    let (_, tree, digest) = repo.stage();
+    let body = serde_json::to_vec(&Statement::new(vec![tree_subject(&tree, &digest)], approval(ApprovalScope::Outcome, Vote::Approve, &policy, "Alice", 3600))).unwrap();
+    store::put(repo.path(), &tree, &cosigned(&body, &sk, &runner, true), &pk.id()).unwrap();
+    let r = c.gate();
+    assert_eq!(r.decision, Decision::Allow, "{:?} {:?}", codes(&r), r.approvals);
 }

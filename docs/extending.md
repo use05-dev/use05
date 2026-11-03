@@ -64,7 +64,7 @@ Programs listed in your `extensions.toml` hear what happened. The file is in 05'
 
 ```toml
 [[on]]
-events = ["sealed", "finished", "gate", "landed"]
+events = ["sealed", "finished", "gate", "landed", "approval_needed"]
 run = ["/usr/local/bin/notify-team"]   # an absolute path
 timeout_secs = 5          # the default; then it is stopped
 ```
@@ -77,8 +77,11 @@ timeout_secs = 5          # the default; then it is stopped
 | `finished` | the author's statement of what was done was recorded | `task`, `agent`, `tree` |
 | `gate` | the pre-push or CI gate decided | `where` (`pre-push` or `ci`), `tree`, `task`, `decision`, `findings` (codes) |
 | `landed` | `use05 land` moved a change into its target | `task`, `branch`, `target`, `head` |
+| `approval_needed` | a task waits for a person's approval: after `use05 finish`, when the agent stops, at the gate, or when `use05 land` is held back | `task`, `scope` (`intent` or `outcome`), `tree`, `intent_sha256`, `findings` (the codes asking for it) |
+| `tested` | a person signed off that they tried a tree, or skipped it (D87) | `task`, `tree`, `outcome` (`tested` or `skipped`), `note` (their words), `by` |
+| `discarded` | a person threw a task's work away with `use05 discard` (D89) | `task` |
 
-Listeners hear identifiers and verdicts, never code, diffs, prompts, titles or outcomes. For more, a listener asks 05 itself: `use05 brief --task <id> --json`.
+Listeners hear identifiers and verdicts, never code, diffs, prompts, titles or outcomes; the one exception is the note a person writes when they sign off testing. For more, a listener asks 05 itself: `use05 brief --task <id> --json`. To have an approval signed elsewhere (a passkey), a listener asks for the exact statement with `use05 approve --task <id> --unsigned --json` and hands the signed result back with `use05 approve --signed <file>`; see the guide.
 
 Listeners cannot hold work up. 05 waits for each one at most `timeout_secs`, then stops it, and ignores what it says, how it exits and whether it starts at all. An `extensions.toml` that cannot be read runs nothing, and `use05 doctor` names the problem.
 

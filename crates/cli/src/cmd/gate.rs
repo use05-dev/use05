@@ -46,9 +46,12 @@ fn base_for_push(top: &Path, remote_sha: &str, local_sha: &str) -> Option<String
 }
 
 /// Tell event extensions what the gate decided: the verdict and its finding codes, nothing more.
-fn announce(listeners: &[crate::extend::Listener], top: &Path, place: &str, tree: &str, task: Option<&str>, r: &GateResult) {
+fn announce(listeners: &[crate::extend::Listener], top: &Path, place: &str, tree: &str, task: Option<&use05_core::task::Task>, r: &GateResult) {
     let codes: Vec<&str> = r.findings.iter().map(|f| f.code).collect();
-    crate::extend::emit_to(listeners, "gate", top, serde_json::json!({ "where": place, "tree": tree, "task": task, "decision": r.decision.word(), "findings": codes }));
+    let id = task.map(|t| t.id.as_str());
+    let mut events = vec![("gate", serde_json::json!({ "where": place, "tree": tree, "task": id, "decision": r.decision.word(), "findings": codes }))];
+    events.extend(crate::extend::approval_needed(id, tree, task.and_then(|t| t.intent_sha256.as_deref()), r).map(|f| ("approval_needed", f)));
+    crate::extend::emit_all(listeners, top, &events);
 }
 
 fn blocked_text(ui: &Ui, what: &str, results: &[(String, GateResult)]) -> String {
@@ -102,7 +105,8 @@ fn pre_push(args: &Args) -> ExitCode {
             let base = Some(base);
             let ctx = Ctx::open_with(&args.repo, None, base.as_deref())?;
             let target = ctx.target_from(local_sha, base.as_deref())?;
-            let mut gate = ctx.gate(&target)?;
+            let branch = remote_ref.trim_start_matches("refs/heads/");
+            let mut gate = ctx.gate_for(&target, Some(branch))?;
             // Prove what is missing for exactly what is pushed, with this machine's key (D65).
             let missing = gate.checks.iter().any(|c| matches!(c.state, use05_core::gate::CheckState::Missing | use05_core::gate::CheckState::Stale));
             if ctx.policy.evidence.prove_at_push && missing {
@@ -121,9 +125,9 @@ fn pre_push(args: &Args) -> ExitCode {
                     task: None,
                 });
                 eprintln!("05: proved what was missing for {} before checking the push. {}", &local_sha[..10.min(local_sha.len())], proved.headline);
-                gate = ctx.gate(&target)?;
+                gate = ctx.gate_for(&target, Some(branch))?;
             }
-            announce(&listeners, &top, "pre-push", &target.oid, ctx.task.as_ref().map(|t| t.id.as_str()), &gate);
+            announce(&listeners, &top, "pre-push", &target.oid, ctx.task.as_ref(), &gate);
             results.push((format!("{} → {}", &local_sha[..10.min(local_sha.len())], remote_ref.trim_start_matches("refs/heads/")), gate));
         }
         Ok(())
@@ -264,12 +268,13 @@ fn ci(args: &Args) -> ExitCode {
         }
     }
 
-    let gate = match ctx.gate(&target) {
+    let (branch, default_branch) = where_ci_pushes();
+    let gate = match ctx.gate_on_host(&target, Some(&branch), default_branch.as_deref()) {
         Ok(g) => g,
         Err(e) => return fail(Report::from_core("gate", e)),
     };
     let decision = gate.decision;
-    announce(&listeners, &top, "ci", &target.oid, ctx.task.as_ref().map(|t| t.id.as_str()), &gate);
+    announce(&listeners, &top, "ci", &target.oid, ctx.task.as_ref(), &gate);
     let mut brief = use05_core::brief::build(ctx.task.as_ref(), gate, &target.oid, &target.label, target.base_commit.as_deref(), target.head_commit.as_deref());
     brief.unknowns.extend(from_receipts);
     if args.json {
@@ -283,6 +288,19 @@ fn ci(args: &Args) -> ExitCode {
         }
     }
     ExitCode::from(decision.exit_code())
+}
+
+/// Where CI's change goes, and the host's default branch when it says: a pull request's base, a
+/// merge queue's base (its own branch is named for the queue), else the branch pushed. Empty when
+/// CI names none, so that a policy asking for something before a push holds it rather than lets
+/// it through.
+fn where_ci_pushes() -> (String, Option<String>) {
+    let var = |k: &str| std::env::var(k).ok().filter(|v| !v.is_empty());
+    let event: serde_json::Value = var("GITHUB_EVENT_PATH").and_then(|p| std::fs::read(p).ok()).and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default();
+    let default_branch = event["repository"]["default_branch"].as_str().filter(|b| !b.is_empty()).map(str::to_string);
+    let queued = event["merge_group"]["base_ref"].as_str().filter(|_| var("GITHUB_EVENT_NAME").as_deref() == Some("merge_group")).map(|r| r.strip_prefix("refs/heads/").unwrap_or(r).to_string());
+    let branch = var("GITHUB_BASE_REF").or(queued).or_else(|| var("GITHUB_REF_NAME").filter(|_| var("GITHUB_REF_TYPE").as_deref() == Some("branch"))).unwrap_or_default();
+    (branch, default_branch)
 }
 
 pub fn run(args: Args) -> ExitCode {

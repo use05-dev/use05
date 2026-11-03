@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 use serde_json::json;
 use use05_core::policy::Role;
 use use05_core::store;
-use use05_receipt::{AnyStatement, Fault, Status, VerifyingKey, key_id, parse_public_key, verify_any};
+use use05_receipt::{AnyStatement, Fault, PublicKey, Status, parse_any_public_key, verify_any_with};
 use use05_runner::identify;
 
 use crate::ctx::Ctx;
@@ -20,9 +20,9 @@ fn short(oid: &str) -> &str {
     &oid[..oid.len().min(12)]
 }
 
-fn load_public(path: &Path) -> Result<VerifyingKey, Report> {
+fn load_public(path: &Path) -> Result<PublicKey, Report> {
     let text = std::fs::read_to_string(path).map_err(|e| Report::error("verify", "KEY_UNUSABLE", format!("cannot read the key file {}: {e}", path.display()), None, 6))?;
-    parse_public_key(&text).map_err(|e| {
+    parse_any_public_key(&text).map_err(|e| {
         if text.trim_start().starts_with("use05-ed25519-secret") {
             Report::error("verify", "KEY_IS_SECRET", format!("{} is a secret key; verification needs the public key", path.display()), Some(format!("use {}.pub", path.display())), 6)
         } else {
@@ -49,13 +49,13 @@ fn fault_report(receipt: &str, fault: Fault) -> Report {
 pub fn run(args: Args) -> Report {
     // Keys to try: the one given, or every key the policy and this machine trust.
     let ctx = Ctx::open(&args.repo, None).ok();
-    let candidates: Vec<(String, Option<Role>, VerifyingKey)> = match &args.key {
+    let candidates: Vec<(String, Option<Role>, PublicKey)> = match &args.key {
         Some(path) => match load_public(path) {
             Ok(k) => vec![("the key you supplied".to_string(), None, k)],
             Err(r) => return r,
         },
         None => match &ctx {
-            Some(c) if !c.trust.keys.is_empty() => c.trust.keys.iter().map(|k| (k.name.clone(), Some(k.role), k.key)).collect(),
+            Some(c) if !c.trust.keys.is_empty() => c.trust.keys.iter().map(|k| (k.name.clone(), Some(k.role), k.key.clone())).collect(),
             _ => {
                 return Report::error(
                     "verify",
@@ -77,9 +77,9 @@ pub fn run(args: Args) -> Report {
     let mut last_fault = None;
     let mut verified = None;
     for (name, role, key) in &candidates {
-        match verify_any(&bytes, key) {
+        match verify_any_with(&bytes, key) {
             Ok(v) => {
-                verified = Some((name.clone(), *role, v));
+                verified = Some((name.clone(), *role, key.is_passkey(), v));
                 break;
             }
             Err(f) => {
@@ -90,7 +90,7 @@ pub fn run(args: Args) -> Report {
             }
         }
     }
-    let Some((signer_name, role, verified)) = verified else {
+    let Some((signer_name, role, by_passkey, verified)) = verified else {
         return fault_report(&args.receipt, last_fault.expect("at least one key was tried"));
     };
 
@@ -108,6 +108,21 @@ pub fn run(args: Args) -> Report {
         notes.push("The receipt names a different key id. The signature still verified against yours; the hint is never trusted.".to_string());
     }
 
+    // The signature is good, but 05 counts a passkey's signature on approvals only.
+    if by_passkey && !matches!(verified.statement, AnyStatement::Approval(_)) {
+        let mut report = Report::error(
+            "verify",
+            "PASSKEY_APPROVALS_ONLY",
+            "Signed by a passkey, which 05 counts for approvals only: this record does not count".to_string(),
+            Some("do not rely on this receipt; only a person's approval may be signed with a passkey".to_string()),
+            2,
+        );
+        report.outcome = "invalid";
+        report.rows = vec![("receipt".into(), args.receipt.clone()), ("signed".into(), signer)];
+        report.details = json!({ "receipt": args.receipt, "key_id": verified.key_id });
+        return report;
+    }
+
     let evidence = match &verified.statement {
         AnyStatement::Evidence(s) => s,
         AnyStatement::Approval(s) => {
@@ -123,6 +138,39 @@ pub fn run(args: Args) -> Report {
                 next: None,
                 excerpt: vec![],
                 details: json!({ "kind": "approval", "approver": p.approver, "scope": p.scope, "decision": p.decision, "expires": p.expires }),
+                exit: 0,
+            };
+        }
+        AnyStatement::Testing(s) => {
+            let p = &s.predicate;
+            let what = if p.outcome == use05_receipt::Tested::Tested { "tested by" } else { "testing skipped by" };
+            return Report {
+                command: "verify",
+                outcome: "valid",
+                code: "VALID",
+                tone: Tone::Good,
+                headline: format!("Valid: {what} {}", p.tester),
+                rows: vec![("signed".into(), signer), ("note".into(), p.note.clone()), ("created".into(), p.created.clone())],
+                notes,
+                next: None,
+                excerpt: vec![],
+                details: json!({ "kind": "testing", "outcome": p.outcome, "tester": p.tester, "note": p.note, "created": p.created }),
+                exit: 0,
+            };
+        }
+        AnyStatement::Discard(s) => {
+            let p = &s.predicate;
+            return Report {
+                command: "verify",
+                outcome: "valid",
+                code: "VALID",
+                tone: Tone::Warn,
+                headline: format!("Valid: {} discarded task {}", p.by, p.task),
+                rows: vec![("signed".into(), signer), ("branch".into(), p.branch.clone().unwrap_or_else(|| "(none)".into())), ("lost".into(), format!("{} commit(s), {} file(s)", p.unpushed, p.uncommitted)), ("created".into(), p.created.clone())],
+                notes,
+                next: None,
+                excerpt: vec![],
+                details: json!({ "kind": "discard", "task": p.task, "branch": p.branch, "head": p.head, "unpushed": p.unpushed, "uncommitted": p.uncommitted, "by": p.by, "created": p.created }),
                 exit: 0,
             };
         }
@@ -288,9 +336,4 @@ pub fn run(args: Args) -> Report {
         }),
         exit: if passed { 0 } else { 2 },
     }
-}
-
-#[allow(dead_code)]
-fn _id(k: &VerifyingKey) -> String {
-    key_id(k)
 }

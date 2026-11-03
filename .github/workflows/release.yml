@@ -29,26 +29,61 @@ jobs:
         run: rustup update stable && rustup target add ${{ matrix.target }}
       - name: Linux tooling
         if: runner.os == 'Linux'
-        run: sudo apt-get update -qq && sudo apt-get install -y -qq musl-tools gcc-aarch64-linux-gnu
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq musl-tools gcc-aarch64-linux-gnu qemu-user-static
       - name: Build
         env:
           CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER: aarch64-linux-gnu-gcc
-        run: cargo build --release -p use05 --target ${{ matrix.target }}
+          CC_aarch64_unknown_linux_musl: aarch64-linux-gnu-gcc
+        run: cargo build --release -p use05 -p use05-cloud --target ${{ matrix.target }}
       - name: Smoke test
-        if: matrix.target != 'aarch64-unknown-linux-musl' && matrix.target != 'x86_64-apple-darwin'
-        run: target/${{ matrix.target }}/release/use05 --version
+        if: matrix.target != 'x86_64-apple-darwin'
+        run: |
+          # The aarch64 Linux binaries are static: they run here under qemu.
+          RUN=""; [ "${{ matrix.target }}" = aarch64-unknown-linux-musl ] && RUN=qemu-aarch64-static
+          $RUN target/${{ matrix.target }}/release/use05 --version
+          $RUN target/${{ matrix.target }}/release/use05-cloud | grep -q "own 05 console"
       - name: Package
         run: |
           V=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n 1)
           if [ "$GITHUB_REF_TYPE" = tag ] && [ "${GITHUB_REF_NAME#v}" != "$V" ]; then echo "::error::tag $GITHUB_REF_NAME does not match version $V in Cargo.toml"; exit 1; fi
           D="use05-$V-${{ matrix.target }}"
-          mkdir "$D" && cp "target/${{ matrix.target }}/release/use05" LICENSE* README.md "$D/" 2>/dev/null || cp "target/${{ matrix.target }}/release/use05" "$D/"
+          mkdir "$D" && cp "target/${{ matrix.target }}/release/use05" "target/${{ matrix.target }}/release/use05-cloud" "$D/"
+          cp LICENSE* README.md "$D/" 2>/dev/null || true
           tar czf "$D.tar.gz" "$D"
           (command -v sha256sum >/dev/null && sha256sum "$D.tar.gz" || shasum -a 256 "$D.tar.gz") > "$D.tar.gz.sha256"
       - uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.target }}
           path: use05-*.tar.gz*
+
+  # The console, for anyone who hosts their own: one image, its data one SQLite file on a volume.
+  # Built on release-check too, so a broken image shows before a tag; pushed only for a tag, and
+  # tagged latest only once the release itself was made.
+  image:
+    name: console image
+    needs: [build, release]
+    if: always() && needs.build.result == 'success' && (github.ref_type == 'tag' || github.ref_name == 'release-check')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/login-action@v3
+        if: github.ref_type == 'tag'
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Build
+        run: docker build -f crates/console/Dockerfile -t use05-console .
+      - name: Push
+        if: github.ref_type == 'tag' && needs.release.result == 'success'
+        run: |
+          V="${GITHUB_REF_NAME#v}"
+          IMG="ghcr.io/${GITHUB_REPOSITORY_OWNER}/use05-console"
+          docker tag use05-console "$IMG:$V" && docker push "$IMG:$V"
+          docker tag use05-console "$IMG:latest" && docker push "$IMG:latest"
 
   release:
     needs: build

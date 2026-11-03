@@ -39,9 +39,16 @@ jobs:
           "$RUNNER_TEMP/venv/bin/pip" install -q "securesystemslib[crypto]"
           USE05_BIN="$PWD/target/release/use05" "$RUNNER_TEMP/venv/bin/python" tools/interop.py
 
+      - name: The console's web app builds and its crypto agrees with Rust's
+        if: runner.os == 'Linux'
+        run: |
+          rustup target add wasm32-unknown-unknown
+          cargo install wasm-bindgen-cli --version 0.2.130 --locked
+          cd console-web && npm ci --no-audit --no-fund && npm run wasm && npm test && npm run build
+
       - name: The installer works against a local release
         if: runner.os == 'Linux'
-        run: tools/test-install.sh "$PWD/target/release/use05"
+        run: cargo build --release -p use05-cloud && tools/test-install.sh "$PWD/target/release/use05"
 
       - name: The npm packages install and run
         run: npm/test.sh "$PWD/target/release/use05"
@@ -52,5 +59,6 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - run: rustup update stable && rustup target add x86_64-unknown-linux-musl && sudo apt-get install -y -qq musl-tools
-      - run: cargo build --release -p use05 --target x86_64-unknown-linux-musl
+      - run: cargo build --release -p use05 -p use05-cloud --target x86_64-unknown-linux-musl
       - run: file target/x86_64-unknown-linux-musl/release/use05 | grep -q "statically linked\|static-pie"
+      - run: file target/x86_64-unknown-linux-musl/release/use05-cloud | grep -q "statically linked\|static-pie"

@@ -1,0 +1,15 @@
+[package]
+name = "use05-policy-edit"
+description = "What a policy edit from a browser may change, and how it is applied: shared by the console's web app (as WebAssembly), its helper and its server."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+use05-core = { path = "../core" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+toml_edit = "0.22"

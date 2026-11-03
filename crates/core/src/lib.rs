@@ -6,6 +6,7 @@
 pub mod branches;
 pub mod brief;
 pub mod claims;
+pub mod discard;
 pub mod error;
 pub mod evidence;
 pub mod fresh;

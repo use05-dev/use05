@@ -3,10 +3,12 @@
 
 use std::fs::OpenOptions;
 use std::io::{self, BufRead, BufReader, Write};
+#[cfg(unix)]
 use std::os::fd::AsRawFd;
 
 /// Read a line from the controlling terminal with echo off. Fails when there is no terminal,
 /// which is the case under an agent's shell tool: the secret has to come from a person.
+#[cfg(unix)]
 pub fn prompt_secret(prompt: &str) -> io::Result<String> {
     let mut tty = OpenOptions::new().read(true).write(true).open("/dev/tty")?;
     write!(tty, "{prompt}")?;
@@ -39,6 +41,28 @@ pub fn prompt_secret(prompt: &str) -> io::Result<String> {
     Ok(line.trim_end_matches(['\n', '\r']).to_string())
 }
 
+/// Without a Unix terminal there is no echo to turn off: read the line as it comes.
+#[cfg(not(unix))]
+pub fn prompt_secret(prompt: &str) -> io::Result<String> {
+    let mut tty = OpenOptions::new().read(true).write(true).open("/dev/tty")?;
+    write!(tty, "{prompt}")?;
+    tty.flush()?;
+    let mut line = String::new();
+    BufReader::new(&tty).read_line(&mut line)?;
+    Ok(line.trim_end_matches(['\n', '\r']).to_string())
+}
+
+/// Ask a question on the controlling terminal and read the answer, echoed. Fails when there is
+/// no terminal, as under an agent's shell tool: the answer has to come from a person.
+pub fn ask(question: &str) -> io::Result<String> {
+    let mut tty = OpenOptions::new().read(true).write(true).open("/dev/tty")?;
+    write!(tty, "{question}")?;
+    tty.flush()?;
+    let mut line = String::new();
+    BufReader::new(&tty).read_line(&mut line)?;
+    Ok(line.trim_end_matches(['\n', '\r']).to_string())
+}
+
 /// Is there a person at a terminal?
 pub fn has_tty() -> bool {
     OpenOptions::new().read(true).write(true).open("/dev/tty").is_ok()
@@ -47,10 +71,13 @@ pub fn has_tty() -> bool {
 /// Columns on the terminal attached to stdout, else `$COLUMNS`, else 80. Never below 40.
 pub fn width() -> usize {
     // SAFETY: TIOCGWINSZ writes a winsize struct we own into the buffer we pass.
+    #[cfg(unix)]
     let from_tty = unsafe {
         let mut size = std::mem::zeroed::<libc::winsize>();
         (libc::ioctl(libc::STDOUT_FILENO, libc::TIOCGWINSZ, &mut size) == 0 && size.ws_col > 0).then_some(size.ws_col as usize)
     };
+    #[cfg(not(unix))]
+    let from_tty: Option<usize> = None;
     let from_env = std::env::var("COLUMNS").ok().and_then(|c| c.parse().ok());
     from_tty.or(from_env).unwrap_or(80).clamp(40, 200)
 }

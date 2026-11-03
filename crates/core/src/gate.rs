@@ -9,7 +9,7 @@ use use05_receipt::{ApprovalScope, Decision as Vote, Status};
 
 use crate::claims::{self, Judged, Observed};
 use crate::error::Result;
-use crate::evidence::{Found, Signed, Signer, Trust, classify};
+use crate::evidence::{Found, Holder, Signed, Signer, Trust, classify};
 use crate::git::{self, Change};
 use crate::intent::{Risk, is_dependency_file, is_protected, risk_of_paths};
 use crate::policy::{IntentMode, Policy, Role, Severity};
@@ -121,6 +121,19 @@ pub struct ClaimStatus {
     pub judged: Judged,
 }
 
+/// A person's testing sign-off or skip for this tree (D87), and whether it counts.
+#[derive(Debug, Clone, Serialize)]
+pub struct TestingInfo {
+    pub outcome: use05_receipt::Tested,
+    pub by: Signer,
+    pub note: String,
+    pub created: String,
+    /// It counts toward a push to a branch the policy names.
+    pub counts: bool,
+    /// Why it does not count, if it does not.
+    pub void: Option<&'static str>,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct ApprovalInfo {
     pub scope: ApprovalScope,
@@ -163,6 +176,8 @@ pub struct GateResult {
     pub newer_receipts: usize,
     /// Other tools' records on the same branch, not read (D73).
     pub foreign_receipts: usize,
+    /// People's testing sign-offs and skips for this tree (D87).
+    pub testing: Vec<TestingInfo>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -192,6 +207,12 @@ pub struct GateInput<'a> {
     pub log: Option<&'a crate::logseal::LogIntegrity>,
     /// The work started behind origin's copy of its target and has not caught up since.
     pub stale_base: Option<&'a StaleBase>,
+    /// The branch this change is being pushed (or landed, or merged) to, when gated for that: a
+    /// policy can ask that a person tried it first (D87).
+    /// `Some("")` when it is being pushed but CI could not tell where: held as if to the landing branch.
+    pub pushing_to: Option<&'a str>,
+    /// The host's default branch, when CI knows it: where work lands unless the policy names a target.
+    pub default_branch: Option<&'a str>,
 }
 
 /// How far behind origin a task's work started, as the hook saw it when the session began.
@@ -240,6 +261,75 @@ pub fn task_from_receipts(found: &crate::evidence::Found, target_tree: &str) -> 
 
 fn expired(expires: &str, now: u64) -> bool {
     parse_rfc3339(expires).is_none_or(|t| t <= now)
+}
+
+/// Why a passkey's approval does not count, if it does not (D86). A page that holds a passkey can
+/// be made to sign anything, so it counts only when the machine (or runner) that prepared the
+/// statement co-signed it, and only for the person driving the work: the person the co-signed
+/// statement names as approver and, when one is recorded, the work's owner. A machine key listed
+/// with a `person` prepares only for that person. Keys that sign at a terminal are not passkeys and
+/// are not checked here.
+pub fn passkey_void(a: &Signed<use05_receipt::Statement<use05_receipt::Approval>>, trust: &Trust, driver: Option<&crate::task::Owner>) -> Option<&'static str> {
+    passkey_void_of(&a.signer, &a.cosigners, &a.statement.predicate.approver, trust, driver)
+}
+
+/// [`passkey_void`] for any person's statement (an approval, a testing sign-off): who signed it,
+/// who co-signed it, and the person it names.
+pub fn passkey_void_of(by: &Signer, cosigners: &[Signer], approver: &str, trust: &Trust, driver: Option<&crate::task::Owner>) -> Option<&'static str> {
+    let same = |x: &str, y: &str| x.trim().eq_ignore_ascii_case(y.trim());
+    // A key can be both listed in the policy and pinned here; any of its entries may vouch for it.
+    let holders = |id: &str| trust.keys.iter().filter(|k| k.id == id).collect::<Vec<_>>();
+    let signer = holders(&by.key_id);
+    if !signer.iter().any(|k| k.key.is_passkey()) {
+        return None;
+    }
+    if cosigners.is_empty() {
+        return Some("no machine that prepared it co-signed it");
+    }
+    let theirs = signer.iter().any(|k| match &k.holder {
+        Holder::Person(p) => same(p, approver) && driver.is_none_or(|d| same(p, &d.name)),
+        Holder::ThisMachine => driver.is_none_or(|d| trust.this_person.as_deref() == Some(d.key_id.as_str())),
+        Holder::Unnamed => false,
+    });
+    if !theirs {
+        return Some(if signer.iter().all(|k| k.holder == Holder::Unnamed) { "its trust entry names no person" } else { "it was signed by someone other than the person driving the work" });
+    }
+    // A preparing machine named for a person prepares only for that person.
+    let prepared_for_them = cosigners.iter().any(|c| {
+        holders(&c.key_id).iter().all(|k| match &k.holder {
+            Holder::Person(q) => same(q, approver),
+            _ => true,
+        })
+    });
+    if !prepared_for_them {
+        return Some("it was prepared on someone else's machine");
+    }
+    None
+}
+
+/// Clocks differ a little between the machine that prepared an approval and the one reading it.
+const CLOCK_SKEW_SECS: u64 = 300;
+
+/// Why an approval does not count, if it does not: given under other rules, expired, dated ahead,
+/// or made to last longer than `approvals.expire_days`. Whoever prepared the statement chose its
+/// dates, so the reader checks them against its own policy.
+pub fn approval_void(a: &use05_receipt::Approval, policy: &Policy, now: u64) -> Option<&'static str> {
+    if a.policy_sha256 != policy.digest() {
+        return Some("the policy changed since");
+    }
+    if expired(&a.expires, now) {
+        return Some("expired");
+    }
+    let (Some(created), Some(expires)) = (parse_rfc3339(&a.created), parse_rfc3339(&a.expires)) else {
+        return Some("it is not dated");
+    };
+    if created > now + CLOCK_SKEW_SECS {
+        return Some("it is dated in the future");
+    }
+    if expires.saturating_sub(created) > policy.approvals.expire_days as u64 * 86_400 + CLOCK_SKEW_SECS {
+        return Some("it lasts longer than the policy allows");
+    }
+    None
 }
 
 fn effect_for(severity: Severity) -> Option<Effect> {
@@ -571,13 +661,7 @@ pub fn evaluate(input: &GateInput<'_>) -> Result<GateResult> {
         if !subject_ok || !task_ok {
             continue;
         }
-        let void = if p.policy_sha256 != policy_sha256 {
-            Some("the policy changed since")
-        } else if expired(&p.expires, input.now) {
-            Some("expired")
-        } else {
-            None
-        };
+        let void = approval_void(p, policy, input.now).or_else(|| passkey_void(a, input.trust, input.task.and_then(|t| t.owner.as_ref())));
         approval_info.push(ApprovalInfo { scope: p.scope, vote: p.decision, by: a.signer.clone(), rationale: p.rationale.clone(), created: p.created.clone(), expires: p.expires.clone(), void });
         if void.is_none() {
             match (p.decision, p.scope) {
@@ -623,6 +707,45 @@ pub fn evaluate(input: &GateInput<'_>) -> Result<GateResult> {
         for f in findings.iter_mut().filter(|f| f.approvable && f.effect == Effect::Approval) {
             f.effect = Effect::Info;
             f.message.push_str(" (approved)");
+        }
+    }
+
+    // ------------------------------------------------------------- testing before a push (D87)
+    let mut testing = Vec::new();
+    if policy.testing.local != crate::policy::LocalTesting::Off {
+        let skippable = policy.testing.local == crate::policy::LocalTesting::Skippable;
+        let driver = input.task.and_then(|t| t.owner.as_ref());
+        let mut seen = Vec::new();
+        for t in at_tree.testing.iter().chain(everything.testing.iter()) {
+            if seen.contains(&t.path) || !t.statement.tree_subject().is_some_and(|(oid, d)| oid == input.target_tree && d == input.target_digest) {
+                continue;
+            }
+            seen.push(t.path.clone());
+            let p = &t.statement.predicate;
+            let mut void = passkey_void_of(&t.signer, &t.cosigners, &p.tester, input.trust, driver);
+            if void.is_none() && p.outcome == use05_receipt::Tested::Skipped && !skippable {
+                void = Some("the policy requires testing, so a skip does not count");
+            }
+            testing.push(TestingInfo { outcome: p.outcome, by: t.signer.clone(), note: p.note.clone(), created: p.created.clone(), counts: void.is_none(), void });
+        }
+        let signed = testing.iter().any(|t| t.counts);
+        // The policy says where, never the agent's declaration; a push CI could not place is held.
+        let landing = crate::branches::landing_for(policy, input.default_branch, input.top);
+        let applies = |branch: &str| branch.is_empty() || if policy.testing.branches.is_empty() { branch == landing } else { policy.testing.branches.iter().any(|p| crate::glob::matches(p, branch)) };
+        let next = "use05 approve --tested --note \"<what you tried>\"";
+        let or_skip = if skippable { ", or skip it with a reason (use05 approve --skip-testing)" } else { "" };
+        match input.pushing_to {
+            Some(branch) if applies(branch) && !signed => {
+                let skipped = testing.iter().any(|t| t.outcome == use05_receipt::Tested::Skipped);
+                let why = if skipped && !skippable { "; a skip does not count here: the policy requires testing" } else { "" };
+                let to = if branch.is_empty() { String::new() } else { format!(" to {branch}") };
+                findings.push(Finding::new("TESTING_REQUIRED", Effect::Approval, format!("before this is pushed{to}, a person must try it in their own environment and sign off{or_skip}{why}")).next(next));
+            }
+            None if !signed => {
+                let to = if policy.testing.branches.is_empty() { landing.clone() } else { policy.testing.branches.join(", ") };
+                findings.push(Finding::new("TESTING_NOT_SIGNED", Effect::Info, format!("before it is pushed to {to}, a person must try it in their own environment and sign off{or_skip}")).next(next));
+            }
+            _ => {}
         }
     }
 
@@ -680,5 +803,6 @@ pub fn evaluate(input: &GateInput<'_>) -> Result<GateResult> {
         unverified_receipts: at_tree.unverified,
         newer_receipts: at_tree.newer,
         foreign_receipts: at_tree.foreign,
+        testing,
     })
 }

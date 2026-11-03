@@ -52,3 +52,33 @@ pub fn parse_public_key(text: &str) -> Result<VerifyingKey, KeyError> {
     let bytes = decode32(text, PUBLIC_PREFIX, "public")?;
     VerifyingKey::from_bytes(&bytes).map_err(|_| KeyError::BadEncoding)
 }
+
+/// A public key 05 can verify with: an Ed25519 key, or a passkey (approvals only).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PublicKey {
+    Ed25519(VerifyingKey),
+    Passkey(crate::passkey::PasskeyKey),
+}
+
+impl PublicKey {
+    /// Short, stable identifier, hexadecimal like [`key_id`].
+    pub fn id(&self) -> String {
+        match self {
+            PublicKey::Ed25519(k) => key_id(k),
+            PublicKey::Passkey(p) => hex::encode(&Sha256::digest(p.sec1())[..8]),
+        }
+    }
+
+    pub fn is_passkey(&self) -> bool {
+        matches!(self, PublicKey::Passkey(_))
+    }
+}
+
+/// Read either kind of public key text.
+pub fn parse_any_public_key(text: &str) -> Result<PublicKey, KeyError> {
+    if text.trim_start().starts_with(crate::passkey::PUBLIC_PREFIX) {
+        crate::passkey::parse_text(text).map(PublicKey::Passkey)
+    } else {
+        parse_public_key(text).map(PublicKey::Ed25519)
+    }
+}

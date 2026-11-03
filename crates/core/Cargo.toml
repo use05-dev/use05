@@ -9,16 +9,19 @@ publish.workspace = true
 
 [dependencies]
 use05-receipt = { path = "../receipt" }
-use05-runner = { path = "../runner" }
 base64 = "0.22"
 chacha20poly1305 = "0.10"
 hex = "0.4"
-libc = "0.2"
 scrypt = { version = "0.11", default-features = false, features = ["std"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"
 toml = "0.8"
 
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
 [dev-dependencies]
+use05-runner = { path = "../runner" }
 tempfile = "3"
+p256 = { version = "0.13", features = ["ecdsa"] }

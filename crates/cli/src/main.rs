@@ -61,6 +61,8 @@ enum Cmd {
     Gate(GateCli),
     /// Move a task's work into its target branch when the gate allows it, then clean up
     Land(LandCli),
+    /// Throw a task's abandoned work away: its worktree and branch, here and on origin
+    Discard(DiscardCli),
     #[command(hide = true)]
     Finish(FinishCli),
     #[command(hide = true)]
@@ -93,6 +95,10 @@ struct InitCli {
     /// Do not install agent hooks or the git pre-push hook
     #[arg(long)]
     no_hooks: bool,
+    /// Write Claude Code's hooks to .claude/settings.json, which you commit, so every checkout and
+    /// every cloud agent session runs under 05 (default: .claude/settings.local.json, this checkout only)
+    #[arg(long, conflicts_with = "no_hooks")]
+    shared_hooks: bool,
     /// Do not touch AGENTS.md
     #[arg(long)]
     no_agents_md: bool,
@@ -214,6 +220,25 @@ struct ApproveCli {
     /// Read the passphrase from the first line of stdin instead of the terminal
     #[arg(long)]
     passphrase_stdin: bool,
+    /// Print the statement to be signed elsewhere (a passkey); sign and store nothing
+    #[arg(long, conflicts_with = "passphrase_stdin")]
+    unsigned: bool,
+    /// File an approval signed elsewhere, if a trusted approver key signed it
+    #[arg(long, value_name = "FILE", conflicts_with_all = ["intent", "outcome", "reject", "reason", "task", "tree", "passphrase_stdin", "unsigned", "tested", "skip_testing", "note"])]
+    signed: Option<PathBuf>,
+    /// Sign off that you tried this change in your own environment (with --note)
+    #[arg(long, conflicts_with_all = ["intent", "outcome", "reject", "skip_testing"])]
+    tested: bool,
+    /// Skip testing, where the policy allows it (with --reason)
+    #[arg(long, conflicts_with_all = ["intent", "outcome", "reject", "tested"])]
+    skip_testing: bool,
+    /// What you tried, for --tested
+    #[arg(long, value_name = "TEXT", requires = "tested")]
+    note: Option<String>,
+    /// With --unsigned: the person the statement is for (default: git's user.name here). For CI,
+    /// which prepares a statement for someone else to sign.
+    #[arg(long, value_name = "NAME", requires = "unsigned")]
+    approver: Option<String>,
     /// Push the receipts branch to origin afterwards
     #[arg(long)]
     push: bool,
@@ -260,6 +285,29 @@ struct PolicyCli {
 
 #[derive(Subcommand)]
 enum PolicyCmd {
+    /// Set one setting: use05 policy set testing.local required
+    Set {
+        /// The setting, as `section.key` (see `use05 policy`)
+        setting: String,
+        /// The new value, as TOML: required, 2, true, ["a/**", "b/**"]
+        value: String,
+        #[command(flatten)]
+        common: Common,
+    },
+    /// Add to a list: a path to protect.paths, or a whole rule to require as { when = [...], also = [...] }
+    Add {
+        setting: String,
+        value: String,
+        #[command(flatten)]
+        common: Common,
+    },
+    /// Remove from a list: a value, or a rule by its number (from 1) or name
+    Remove {
+        setting: String,
+        value: String,
+        #[command(flatten)]
+        common: Common,
+    },
     /// Sign an organisation floor (what the cloud app will do for you)
     #[command(hide = true)]
     OrgSign {
@@ -376,6 +424,20 @@ struct LandCli {
 }
 
 #[derive(Args)]
+struct DiscardCli {
+    /// The task's id, or the start of it
+    task: Option<String>,
+    /// Print the statement for a passkey to sign elsewhere, co-signed here; discard nothing
+    #[arg(long, conflicts_with = "signed")]
+    unsigned: bool,
+    /// Discard as a signed statement this machine prepared says
+    #[arg(long, value_name = "FILE")]
+    signed: Option<PathBuf>,
+    #[command(flatten)]
+    common: Common,
+}
+
+#[derive(Args)]
 struct UninstallCli {
     #[command(flatten)]
     common: Common,
@@ -403,7 +465,7 @@ fn main() -> ExitCode {
                 Err(e) => return emit(&report::Report::error("init", "USAGE", e, None, 6), a.common.json),
             };
             let interactive = a.guided || (!a.defaults && terminal());
-            emit(&cmd::init::run(cmd::init::Args { ci: a.ci, no_hooks: a.no_hooks, no_agents_md: a.no_agents_md, repo: a.common.repo, interactive, flags }), a.common.json)
+            emit(&cmd::init::run(cmd::init::Args { ci: a.ci, no_hooks: a.no_hooks, shared_hooks: a.shared_hooks, no_agents_md: a.no_agents_md, repo: a.common.repo, interactive, flags }), a.common.json)
         }
         Cmd::Start(a) => emit(
             &cmd::start::run(cmd::start::Args {
@@ -438,12 +500,15 @@ fn main() -> ExitCode {
         ),
         Cmd::Brief(a) => cmd::brief::run(&a.common.repo, a.task.as_deref(), a.tree.as_deref(), a.fetch, a.common.json),
         Cmd::Approve(a) => emit(
-            &cmd::approve::run_approve(cmd::approve::ApproveArgs { intent: a.intent, reject: a.reject, reason: a.reason, task: a.task, tree: a.tree, passphrase_stdin: a.passphrase_stdin, push: a.push, repo: a.common.repo }),
+            &cmd::approve::run_approve(cmd::approve::ApproveArgs { intent: a.intent, reject: a.reject, reason: a.reason, task: a.task, tree: a.tree, passphrase_stdin: a.passphrase_stdin, push: a.push, unsigned: a.unsigned, signed: a.signed, tested: a.tested, skip_testing: a.skip_testing, note: a.note, approver: a.approver, repo: a.common.repo }),
             a.common.json,
         ),
         Cmd::Verify(a) => emit(&cmd::verify::run(cmd::verify::Args { receipt: a.receipt, key: a.key, tree: a.tree, repo: a.common.repo }), a.common.json),
         Cmd::Policy(a) => match a.action {
             Some(PolicyCmd::OrgSign { floor, org, key, out }) => emit(&cmd::policy::org_sign(&floor, &org, &key, &out), a.common.json),
+            Some(PolicyCmd::Set { setting, value, common }) => emit(&cmd::policy::one_rule(&common.repo, use05_policy_edit::edit::Op::Set, &setting, &value), common.json),
+            Some(PolicyCmd::Add { setting, value, common }) => emit(&cmd::policy::one_rule(&common.repo, use05_policy_edit::edit::Op::Add, &setting, &value), common.json),
+            Some(PolicyCmd::Remove { setting, value, common }) => emit(&cmd::policy::one_rule(&common.repo, use05_policy_edit::edit::Op::Remove, &setting, &value), common.json),
             None if a.edit => {
                 let flags = match setup_flags(a.team.as_deref(), a.target, &a.envs) {
                     Ok(f) => f,
@@ -461,6 +526,7 @@ fn main() -> ExitCode {
         Cmd::Hook(a) => cmd::hook::run(&a.agent, &a.event),
         Cmd::Gate(a) => cmd::gate::run(cmd::gate::Args { git_hook: a.git_hook, ci: a.ci, tree: a.tree, push: a.push, repo: a.common.repo, json: a.common.json }),
         Cmd::Land(a) => emit(&cmd::land::run(&a.common.repo, a.task.as_deref()), a.common.json),
+        Cmd::Discard(a) => emit(&cmd::discard::run(&a.common.repo, a.task.as_deref(), a.unsigned, a.signed.as_deref()), a.common.json),
         Cmd::Finish(a) => emit(&cmd::start::finish(&a.common.repo, a.task.as_deref(), a.outcome.as_deref()), a.common.json),
         Cmd::Key { action } => match action {
             KeyCmd::New { path, approver, passphrase_stdin, json } => emit(&cmd::approve::key_new(path, approver, passphrase_stdin), json),

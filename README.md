@@ -36,7 +36,7 @@
 
 **You own the request and the acceptance. Agents own the plan and the work. 05 holds them to the plan.**
 
-05 is an acceptance layer for AI-written code that takes the place of pull-request review. The agent declares what it will do before it starts, and 05 seals that plan where the agent cannot change it. When it finishes, 05 proves what was checked on the exact files and compares the result to the plan. When everything matched, you approve, the change lands as a commit and you push it: no pull request to review. When something did not match, you read one page instead of the diff. With several agents in one repository, 05 keeps them out of each other's way. Everything runs on your machine: no account, no telemetry, nothing uploaded.
+05 is an acceptance layer for AI-written code that takes the place of pull-request review. The agent declares what it will do before it starts, and 05 seals that plan where the agent cannot change it. When it finishes, 05 proves what was checked on the exact files and compares the result to the plan. When everything matched, you approve, the change lands as a commit and you push it: no pull request to review. When something did not match, you read one page instead of the diff. With several agents in one repository, 05 keeps them out of each other's way. Everything runs on your machine: no account, no telemetry, nothing uploaded. If you want to approve from your phone, you can host your own console, encrypted end to end.
 
 ## Five principles, hence the name
 
@@ -101,9 +101,15 @@ Run as many agents as you like on one repository. 05 keeps them orchestrated so 
 4. **Each agent works apart**, on its own branch and git worktree.
 5. **Shared files are flagged.** The brief reports `OVERLAP` while another task's change to the same file is not in this change's base.
 6. **Changes land one at a time.** `use05 land` only fast-forwards exactly what was checked; if the target moved, it refuses and says to rebase.
-7. **Nothing is left behind.** A landed change's branch and worktree are removed; kept branches, unmerged work and anything uncommitted never are.
+7. **Nothing is left behind.** A landed change's branch and worktree are removed; kept branches, unmerged work and anything uncommitted never are. Work an agent abandoned goes with `use05 discard <task>`, after 05 shows what would be lost that exists nowhere else.
 
 `overlap = "warn"` (the default), `"approval"` or `"deny"` under `[drift]` in `.05/policy.toml` sets how strict this is, and `reservation_idle_hours` (default 2) frees an idle session's area. Only file paths are compared, never contents. Live warnings cover every agent and worktree on one machine; across machines, git still refuses a push that is not a fast-forward.
+
+## Approve from your phone
+
+Run your own console and you do not need a terminal to keep up: see what every agent on your machines is doing, approve the work that waits for you with a passkey (Face ID, a fingerprint, a security key), sign off that you tested a change, throw away abandoned work, tighten a policy, and get an email when something needs you. Pages update as things happen.
+
+It is one container image, its data one SQLite file, that you host for yourself (or your team, by invitation); there is no hosted version. Claim it from your terminal with `use05 cloud login <url>`, which also pairs the machine and reports the repository. It is encrypted end to end: machines seal what they report to your console's key, which only your passkey or a recovery code unlocks, so the console relays your work without being able to read it. Machines connect out to it and run nothing it sends; a phone approval counts only for a statement the machine prepared and co-signed itself. The web page's code comes from the console, so host it where only you can change it. See [Your own console](docs/guide.md#your-own-console).
 
 ## How it works
 
@@ -114,7 +120,9 @@ Run as many agents as you like on one repository. 05 keeps them orchestrated so 
 - **Folder and file rules.** Under `[protect]`, paths can be `locked` (never changed; no approval clears it), `append_only` (new files only, such as migrations), `no_delete`, or `no_read` (agents may not open them). Agent hooks refuse these before they happen, and the gate and CI gate deny them. A person can bypass a rule for one exact change, with a reason the brief shows, unless the path is `absolute` or `bypass = false`. Unlocking is its own approved change to the policy. `no_read` is advisory: it holds only where the agent's hooks report the read.
 - **Starting fresh, and files that change together.** With `fresh_base`, the hook fetches origin when an agent's session starts and tells the agent whether it has the latest code; work that started behind and never caught up is flagged in the brief, or held for a person, or refused. A `[[require]]` rule says some files change together, such as docs with the code they describe: the agent is told at the start, asked to make the update before it finishes, and the brief reports a change that skipped it. 05 checks that the docs changed, not what they say.
 - **The gate is deterministic.** No model judges anything. It compares intent, files changed, evidence on the exact tree, approvals and protected paths, and answers allow, wait, approval required or deny.
-- **Approvals** are signed with a passphrase-protected key, bound to the exact content and the policy, and expire.
+- **Approvals** are signed with a passphrase-protected key or a passkey, bound to the exact content and the policy, and expire. A passkey approval counts only for a statement a trusted machine prepared and co-signed, and only for the person who owns the work.
+- **Testing before a push.** A policy can ask that the developer tried the change in their own environment before it is pushed to chosen branches. They sign off with a short note (`use05 approve --tested --note "…"`), or skip it with a reason where the policy allows. The pre-push hook and the CI gate hold the push until they do, and the note is on the receipt and in the brief.
+- **One rule at a time.** `use05 policy set`, `add` and `remove` change a single rule and keep the rest of the file, comments included; the console saves one rule on its own too.
 - **Agents.** Hooks for Claude Code and Codex seal each agent's declaration, guard risky commands and protected paths, keep parallel agents out of each other's declared scope, run the checks when the agent stops, and write an `AGENTS.md` block so agents know the rules. Subagents are held to the same rules, and each is told them when it starts. Each declaration names the agent and an accountable owner.
 - **Built for long sessions and large changes.** The brief stays one page however big the change: lines added and removed per area, files outside the plan grouped by area, and a Session section that digests hours of agent work into how long it ran, what 05 refused and why, which checks ran along the way, and which subagents took part.
 - **A record you can prove later.** What the agent did (tools, paths and decisions; never contents or prompts) is a hash-chained log, sealed by signed receipts as the work happens and countersigned by CI. It travels with the receipts, so anyone with the repository and the public keys can check it.
@@ -129,6 +137,7 @@ It is not an agent, an agent runner, a code reviewer powered by a model, a sessi
 ## Documentation
 
 - [Using 05](docs/guide.md): install, set up, work with agents, read the brief, approve, configure every setting, all commands
+- [Your own console](docs/guide.md#your-own-console): approvals from your phone, for you or your team, self-hosted
 - [Turn on the CI gate](docs/turn-on-the-ci-gate.md) (the strong control)
 - [Receipt format](docs/receipts.md)
 - [Extending 05](docs/extending.md): commands, any agent's hooks, events, your own record types
