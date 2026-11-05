@@ -5819,17 +5819,28 @@ fn an_lfs_server_that_never_answers_stops_the_proof_at_the_time_limit() {
         eprintln!("skipped: git-lfs is not installed here");
         return;
     }
+    let real = Command::new("sh").args(["-c", "command -v git-lfs"]).output().unwrap();
+    let real = String::from_utf8_lossy(&real.stdout).trim().to_string();
+    if real.is_empty() {
+        eprintln!("skipped: git-lfs is not on PATH");
+        return;
+    }
     let s = with_lfs_pointers(true);
-    // A git-lfs that hangs, ahead of the real one on PATH; `git lfs version` still answers.
+    // A server that never answers stalls only the download (smudge); everything git-lfs does on
+    // this machine, such as the clean filter `git status` runs, still works. So the stub ahead of
+    // the real git-lfs hangs on smudge and hands every other command to the real one.
     let stub = tempfile::tempdir().unwrap();
     let script = stub.path().join("git-lfs");
-    fs::write(&script, "#!/bin/sh\n[ \"$1\" = version ] && { echo git-lfs/3.0.0; exit 0; }\nsleep 60\n").unwrap();
+    fs::write(&script, format!("#!/bin/sh\n[ \"$1\" = smudge ] && sleep 60\nexec '{real}' \"$@\"\n")).unwrap();
     fs::set_permissions(&script, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
     let path = format!("{}:{}", stub.path().display(), std::env::var("PATH").unwrap());
+    // As on most machines with Git LFS (and on CI runners): its filter is set up for every repository.
+    let system = stub.path().join("gitconfig");
+    fs::write(&system, "[filter \"lfs\"]\n\tclean = git-lfs clean -- %f\n\tsmudge = git-lfs smudge -- %f\n\tprocess = git-lfs filter-process\n\trequired = true\n").unwrap();
     s.key("me.key");
     let started = std::time::Instant::now();
-    let out = s.run_env(&["prove", "--key", "me.key", "--json", "--", "./test.sh"], &[("PATH", &path), ("USE05_LFS_TIMEOUT_SECS", "1")]);
-    assert!(started.elapsed() < std::time::Duration::from_secs(30), "gave up near the limit, not after the sleep");
+    let out = s.run_env(&["prove", "--key", "me.key", "--json", "--", "./test.sh"], &[("PATH", &path), ("USE05_LFS_TIMEOUT_SECS", "1"), ("GIT_CONFIG_SYSTEM", system.to_str().unwrap())]);
+    assert!(started.elapsed() < std::time::Duration::from_secs(30), "gave up near the limit, not after the sleep: {:?} {}", started.elapsed(), text(&out));
     assert_eq!(code(&out), 6, "{}", text(&out));
     let report = json(&out);
     assert_eq!(report["code"], "LFS_FAILED", "{report}");
