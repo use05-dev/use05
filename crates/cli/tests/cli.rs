@@ -31,7 +31,11 @@ fn bin_dir() -> &'static str {
 
 impl Sandbox {
     fn new() -> Sandbox {
-        let sandbox = Sandbox { dir: tempfile::tempdir().unwrap(), home: tempfile::tempdir().unwrap() };
+        Sandbox::in_dir(tempfile::tempdir().unwrap())
+    }
+
+    fn in_dir(dir: TempDir) -> Sandbox {
+        let sandbox = Sandbox { dir, home: tempfile::tempdir().unwrap() };
         sandbox.git(&["init", "-q", "-b", "main"]);
         sandbox.git(&["config", "core.autocrlf", "false"]);
         sandbox.write("main.rs", "fn main() {}\n");
@@ -244,11 +248,14 @@ fn mask(token: &str) -> String {
 }
 
 fn snapshot(name: &str, sandbox: &Sandbox, out: &Output) {
-    let actual = normalise(sandbox, &text(out));
+    snapshot_text(name, &normalise(sandbox, &text(out)));
+}
+
+fn snapshot_text(name: &str, actual: &str) {
     let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/snapshots").join(format!("{name}.txt"));
     if std::env::var_os("UPDATE_SNAPSHOTS").is_some() {
         fs::create_dir_all(path.parent().unwrap()).unwrap();
-        fs::write(&path, &actual).unwrap();
+        fs::write(&path, actual).unwrap();
         return;
     }
     let expected = fs::read_to_string(&path).unwrap_or_else(|_| panic!("missing snapshot {name}; run with UPDATE_SNAPSHOTS=1"));
@@ -1035,6 +1042,27 @@ fn doctor_reports_problems_with_a_nonzero_exit_and_never_changes_anything() {
 }
 
 #[test]
+fn doctor_reports_receipt_count_and_size() {
+    let s = Sandbox::new();
+    s.key("me.key");
+    let none = text(&s.run(&["doctor"]));
+    assert!(none.contains("receipts 0 on 0 branches, 0 B"), "{none}");
+
+    assert_eq!(code(&s.run(&["prove", "--key", "me.key", "--", "./test.sh"])), 0);
+    let stored = s.stored_receipts();
+    assert_eq!(stored.len(), 1);
+    let bytes = s.git(&["cat-file", "-s", &format!("{}:{}", stored[0].0, stored[0].1)]);
+    let doctor = s.run(&["doctor"]);
+    let line = text(&doctor).lines().find(|l| l.contains("receipts") && l.contains("branch")).unwrap_or_default().to_string();
+    assert!(line.contains("receipts 1 on 1 branch,"), "a count and the branches: {line}");
+    assert!(line.contains(" B") || line.contains("KB"), "a size: {line}");
+    assert!(line.contains("Never pruned"), "it says receipts are kept for good: {line}");
+
+    let report = json(&s.run(&["doctor", "--json"]));
+    assert_eq!(report["details"]["receipts"], serde_json::json!({ "count": 1, "branches": 1, "bytes": bytes.trim().parse::<u64>().unwrap() }), "{report}");
+}
+
+#[test]
 fn a_repository_needing_a_newer_use05_asks_for_an_upgrade_instead_of_a_parse_error() {
     let s = Sandbox::initialised();
     let policy = fs::read_to_string(s.path(".05/policy.toml")).unwrap();
@@ -1348,6 +1376,11 @@ fn a_protected_file_is_still_protected_when_the_agent_reports_its_path_through_a
 /// Run `use05` on a pseudo-terminal (stdin, stdout, stderr and /dev/tty are all the terminal),
 /// feed it `lines` one at a time when it is waiting, and return its exit code and screen text.
 fn on_a_terminal(s: &Sandbox, args: &[&str], lines: &[&str]) -> (i32, String) {
+    on_a_terminal_with(s, args, lines, &[])
+}
+
+/// Like `on_a_terminal`, with extra environment variables (an agent's session id, say).
+fn on_a_terminal_with(s: &Sandbox, args: &[&str], lines: &[&str], envs: &[(&str, &str)]) -> (i32, String) {
     use std::io::{Read, Write};
     use std::os::fd::{FromRawFd, OwnedFd};
     use std::os::unix::process::CommandExt;
@@ -1356,6 +1389,7 @@ fn on_a_terminal(s: &Sandbox, args: &[&str], lines: &[&str]) -> (i32, String) {
     assert_eq!(unsafe { libc::openpty(&mut master, &mut slave, std::ptr::null_mut(), std::ptr::null_mut(), std::ptr::null_mut()) }, 0);
     let (master, slave) = unsafe { (OwnedFd::from_raw_fd(master), OwnedFd::from_raw_fd(slave)) };
     let mut cmd = s.command(args);
+    cmd.envs(envs.iter().copied());
     cmd.stdin(slave.try_clone().unwrap()).stdout(slave.try_clone().unwrap()).stderr(slave.try_clone().unwrap());
     // SAFETY: only async-signal-safe calls between fork and exec: a new session whose controlling terminal is the pty.
     unsafe {
@@ -1698,7 +1732,7 @@ fn the_first_prompt_of_a_session_is_kept_locally_and_shown_in_the_brief() {
     assert_eq!(task_json(&s, "s1")["request"], "Cap retries at 3");
     let id = find_task(&s, "s1");
     let brief = text(&s.run(&["brief", "--task", &id]));
-    assert!(brief.contains("asked: Cap retries at 3"), "{brief}");
+    assert!(brief.contains("asked: \"Cap retries at 3\""), "{brief}");
 }
 
 #[test]
@@ -2461,7 +2495,7 @@ fn ci_never_countersigns_a_log_copy_nobody_trusted_wrote() {
 fn the_ci_workflow_keeps_the_write_token_out_of_reach_of_the_code_it_checks() {
     let s = Sandbox::initialised();
     assert_eq!(code(&s.run(&["init", "--ci", "github"])), 0);
-    let wf = fs::read_to_string(s.path(".github/workflows/05.yml")).unwrap();
+    let wf = fs::read_to_string(s.path(".github/workflows/05-gate.yml")).unwrap();
     assert!(wf.contains("persist-credentials: false"), "{wf}");
     assert!(wf.contains("USE05_PUSH_TOKEN: ${{ github.token }}") && wf.contains("use05 gate --ci --push"), "{wf}");
 }
@@ -2974,6 +3008,49 @@ fn policy_edit_changes_an_existing_setup_and_says_how_the_change_takes_effect() 
     assert!(text(&out).contains("use05 approve --outcome"), "a policy change is approved like any protected change: {}", text(&out));
 }
 
+/// Run with an answer typed and then silence: the input stays open, as with a person who left.
+fn run_then_silence(s: &Sandbox, args: &[&str], typed: &str, envs: &[(&str, &str)]) -> (Output, std::time::Duration) {
+    use std::io::Write;
+    let mut cmd = s.command(args);
+    for (k, v) in envs {
+        cmd.env(k, v);
+    }
+    let started = std::time::Instant::now();
+    let mut child = cmd.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    stdin.write_all(typed.as_bytes()).unwrap();
+    // The input is still open while we wait: it is dropped only after the command is done.
+    let child_out = child.wait_with_output().unwrap();
+    drop(stdin);
+    (child_out, started.elapsed())
+}
+
+#[test]
+fn guided_init_gives_up_after_the_prompt_timeout() {
+    let s = with_environment_branches();
+    let (out, took) = run_then_silence(&s, &["init", "--guided"], "2\n", &[("USE05_PROMPT_TIMEOUT_SECS", "1")]);
+    assert_eq!(code(&out), 1, "{}", text(&out));
+    assert!(took < std::time::Duration::from_secs(30), "it gave up, it did not wait: {took:?}");
+    let shown = text(&out);
+    assert!(shown.contains("No answer in 1 second; nothing was written.") && shown.contains("use05 init --defaults"), "{shown}");
+    assert!(!s.path(".05/policy.toml").exists() && !s.path(".claude/settings.local.json").exists(), "nothing was written");
+    let (out, _) = run_then_silence(&s, &["init", "--guided", "--json"], "2\n", &[("USE05_PROMPT_TIMEOUT_SECS", "1")]);
+    assert_eq!((code(&out), json(&out)["code"].clone()), (1, serde_json::json!("INIT_NO_ANSWER")), "{}", text(&out));
+    // The wait is for a person only: no questions with --defaults.
+    assert_eq!(code(&s.run_env(&["init", "--defaults"], &[("USE05_PROMPT_TIMEOUT_SECS", "1")])), 0);
+}
+
+#[test]
+fn policy_edit_gives_up_after_the_prompt_timeout_and_leaves_the_policy_alone() {
+    let s = with_environment_branches();
+    assert_eq!(code(&s.run(&["init", "--defaults"])), 0);
+    let before = fs::read_to_string(s.path(".05/policy.toml")).unwrap();
+    let (out, _) = run_then_silence(&s, &["policy", "--edit", "--guided"], "\n", &[("USE05_PROMPT_TIMEOUT_SECS", "1")]);
+    assert_eq!(code(&out), 1, "{}", text(&out));
+    assert!(text(&out).contains("No answer in 1 second; nothing was written."), "{}", text(&out));
+    assert_eq!(fs::read_to_string(s.path(".05/policy.toml")).unwrap(), before);
+}
+
 #[test]
 fn stopping_part_way_through_changes_nothing() {
     let s = with_environment_branches();
@@ -2992,6 +3069,25 @@ fn init_takes_the_answers_as_flags_without_asking() {
     let p = policy_of(&s);
     assert_eq!(p.environment.iter().map(|e| e.name.as_str()).collect::<Vec<_>>(), ["dev", "prod"]);
     assert_eq!((p.approvals.min, p.drift.tests), (2, use05_core::policy::Severity::Deny));
+}
+
+#[test]
+fn init_presets_set_who_may_promote_into_the_last_rung() {
+    let envs = ["--target", "main", "--env", "dev=main", "--env", "uat=uat", "--env", "prod=production"];
+    let prod = |team: &str| {
+        let s = with_environment_branches();
+        let out = s.run(&[&["init", "--team", team][..], &envs].concat());
+        assert_eq!(code(&out), 0, "{}", text(&out));
+        let p = policy_of(&s);
+        let prod = p.environment_named("prod").unwrap().clone();
+        (prod.agent, prod.rules.sign_off, p.environment_named("uat").unwrap().agent)
+    };
+    use use05_core::policy::Severity;
+    // Just you: agents promote everywhere. A small team: prod for people (the default, unset).
+    // Larger or regulated: prod for people, with a person's sign-off.
+    assert_eq!(prod("solo"), (Some(true), Severity::Allow, None));
+    assert_eq!(prod("small"), (None, Severity::Allow, None));
+    assert_eq!(prod("regulated"), (None, Severity::Approval, None));
 }
 
 #[test]
@@ -3661,7 +3757,7 @@ fn verify_refuses_a_passkey_signed_bypass() {
     let tree = s.git(&["rev-parse", "HEAD^{tree}"]);
     let bypass = use05_receipt::Statement::new(
         vec![use05_receipt::tree_subject(&tree, &"ab".repeat(32))],
-        use05_receipt::Bypass { reason: "r".into(), by: "b".into(), findings: vec![], created: "2026-11-01T00:00:00Z".into(), expires: "2099-01-01T00:00:00Z".into() },
+        use05_receipt::Bypass { env: None, from: None, rule: None, policy_sha256: None, reason: "r".into(), by: "b".into(), findings: vec![], created: "2026-11-01T00:00:00Z".into(), expires: "2099-01-01T00:00:00Z".into() },
     );
     s.write("bypass.json", &sign_with_passkey_only(&to_sign(&serde_json::to_vec(&bypass).unwrap()), &sk));
     s.write("phone.pub", &use05_receipt::passkey_public_text(&key));
@@ -3949,6 +4045,341 @@ fn the_ci_gate_reads_where_a_push_goes_from_the_host_and_holds_one_it_cannot_pla
     assert!(ci(&[]));
 }
 
+// ---------------------------------------------------------------- the runner key out of a branch's reach (D94)
+
+/// A stand-in for GitHub's statuses API: answers each request with 201 and hands back what each
+/// asked, for up to `n` requests or 60 seconds.
+fn statuses_api(n: usize) -> (String, std::thread::JoinHandle<Vec<(String, Value)>>) {
+    use std::io::{Read, Write};
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    let handle = std::thread::spawn(move || {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        let mut seen = Vec::new();
+        while seen.len() < n && std::time::Instant::now() < deadline {
+            let Ok((mut stream, _)) = listener.accept() else {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+                continue;
+            };
+            stream.set_nonblocking(false).unwrap();
+            stream.set_read_timeout(Some(std::time::Duration::from_secs(10))).unwrap();
+            let mut got = Vec::new();
+            let mut chunk = [0u8; 4096];
+            let (head, body) = loop {
+                let read = stream.read(&mut chunk).unwrap_or(0);
+                got.extend_from_slice(&chunk[..read]);
+                let text = String::from_utf8_lossy(&got).to_string();
+                if let Some((head, body)) = text.split_once("\r\n\r\n") {
+                    let length = head.lines().find_map(|l| l.to_ascii_lowercase().strip_prefix("content-length:").map(|v| v.trim().parse::<usize>().unwrap())).unwrap_or(0);
+                    if body.len() >= length || read == 0 {
+                        break (head.to_string(), body.to_string());
+                    }
+                }
+                assert!(read > 0, "the request ended early: {text}");
+            };
+            stream.write_all(b"HTTP/1.1 201 Created\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").unwrap();
+            seen.push((head.lines().next().unwrap_or_default().to_string(), serde_json::from_str(&body).unwrap_or(Value::Null)));
+        }
+        seen
+    });
+    (url, handle)
+}
+
+/// `gate --ci --json` as the 05 gate workflow runs it: started by the 05 workflow's run, with
+/// this run's own GITHUB_SHA and ref those of the default branch.
+fn gate_workflow_run(s: &Sandbox, secret: Option<&str>, event: &Value, api: &str, summary: &Path) -> Output {
+    gate_workflow_run_with(s, secret, event, api, summary, &[])
+}
+
+fn gate_workflow_run_with(s: &Sandbox, secret: Option<&str>, event: &Value, api: &str, summary: &Path, extra: &[(&str, &str)]) -> Output {
+    let ci_home = tempfile::tempdir().unwrap();
+    let path = ci_home.path().join("event.json");
+    fs::write(&path, event.to_string()).unwrap();
+    let mut cmd = s.command(&["gate", "--ci", "--json"]);
+    cmd.env("USE05_HOME", ci_home.path()).env("HOME", ci_home.path()).stdin(Stdio::null());
+    for (k, v) in [
+        ("GITHUB_EVENT_NAME", "workflow_run"),
+        ("GITHUB_EVENT_PATH", path.to_str().unwrap()),
+        ("GITHUB_SHA", &s.git(&["rev-parse", "main"])),
+        ("GITHUB_REF_NAME", "main"),
+        ("GITHUB_REF_TYPE", "branch"),
+        ("GITHUB_REPOSITORY", "acme/app"),
+        ("GITHUB_API_URL", api),
+        ("GITHUB_STEP_SUMMARY", summary.to_str().unwrap()),
+        ("USE05_PUSH_TOKEN", "t0ken"),
+    ] {
+        cmd.env(k, v);
+    }
+    for (k, v) in extra {
+        cmd.env(k, v);
+    }
+    if let Some(secret) = secret {
+        cmd.env("USE05_RUNNER_KEY", secret);
+    }
+    cmd.output().unwrap()
+}
+
+fn run_event(head: &str, head_repo: &str, base: Option<&str>) -> Value {
+    serde_json::json!({
+        "workflow_run": {
+            "event": "pull_request", "head_sha": head, "head_branch": "feature", "head_repository": { "full_name": head_repo },
+            "pull_requests": base.map(|b| vec![serde_json::json!({ "base": { "ref": b } })]).unwrap_or_default(),
+        },
+        "repository": { "full_name": "acme/app", "default_branch": "main" },
+    })
+}
+
+#[test]
+fn workflow_run_event_gates_the_head_not_the_default_branch() {
+    let (s, secret, _remote) = ci_fixture_with("\n[testing]\nlocal = \"required\"\n");
+    s.write("main.rs", "fn main() { /* the change */ }\n");
+    s.commit_all("change");
+    let head = s.git(&["rev-parse", "HEAD"]);
+    let tree = s.git(&["rev-parse", "HEAD^{tree}"]);
+    // The gate's checkout is wherever its workflow put it: here, the default branch.
+    s.git(&["checkout", "-q", "main"]);
+    assert_ne!(s.git(&["rev-parse", "HEAD^{tree}"]), tree);
+    let summary = s.home.path().join("summary.md");
+    let posted = |server: std::thread::JoinHandle<Vec<(String, Value)>>| {
+        let seen = server.join().unwrap();
+        for (line, _) in &seen {
+            assert_eq!(line, &format!("POST /repos/acme/app/statuses/{head} HTTP/1.1"), "the status goes on the change's head");
+        }
+        seen.into_iter().map(|(_, body)| (body["state"].as_str().unwrap_or_default().to_string(), body["description"].as_str().unwrap_or_default().to_string())).collect::<Vec<_>>()
+    };
+
+    // Into another branch than the one testing is asked for: allowed, on the head's tree.
+    let (api, server) = statuses_api(2);
+    let out = gate_workflow_run(&s, Some(&secret), &run_event(&head, "acme/app", Some("release")), &api, &summary);
+    assert_eq!(code(&out), 0, "{}", text(&out));
+    assert_eq!(json(&out)["brief"]["tree"], tree.as_str(), "it gated the head the event names, not what is checked out");
+    assert!(!finding_codes(&out).iter().any(|c| c == "TESTING_REQUIRED" || c == "CI_KEY_EXPOSED"), "{:?}", finding_codes(&out));
+    assert_eq!(posted(server), [("pending".into(), "checking".into()), ("success".into(), "allowed".into())]);
+
+    // Into main: held for a person's testing, and the status says so.
+    let (api, server) = statuses_api(2);
+    let out = gate_workflow_run(&s, Some(&secret), &run_event(&head, "acme/app", Some("main")), &api, &summary);
+    assert_eq!(code(&out), 3, "{}", text(&out));
+    assert!(finding_codes(&out).contains(&"TESTING_REQUIRED".to_string()), "{:?}", finding_codes(&out));
+    assert_eq!(posted(server)[1], ("failure".into(), "needs a person's approval".into()));
+
+    // Without the key nothing is gated, and the status says that too rather than staying pending.
+    let (api, server) = statuses_api(2);
+    let out = gate_workflow_run(&s, None, &run_event(&head, "acme/app", Some("release")), &api, &summary);
+    assert_eq!(code(&out), 6, "{}", text(&out));
+    assert_eq!(posted(server)[1], ("failure".into(), "05 could not gate this change (NO_RUNNER_KEY)".into()));
+}
+
+#[test]
+fn a_status_that_cannot_be_posted_fails_the_run_and_says_so() {
+    let (s, secret, _remote) = ci_fixture();
+    s.write("main.rs", "fn main() { /* fine */ }\n");
+    s.commit_all("change");
+    let head = s.git(&["rev-parse", "HEAD"]);
+    let summary = s.home.path().join("summary.md");
+    // Nothing listens there.
+    let closed = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let api = format!("http://{}", closed.local_addr().unwrap());
+    drop(closed);
+    let out = gate_workflow_run(&s, Some(&secret), &run_event(&head, "acme/app", Some("main")), &api, &summary);
+    assert_eq!(code(&out), 4, "an allowed change whose status is missing fails the run:\n{}", text(&out));
+    assert_eq!(json(&out)["decision"], "allow");
+    let md = fs::read_to_string(&summary).unwrap();
+    assert!(md.contains("could not post its `05` status") && md.contains("does not see this verdict"), "{md}");
+    assert!(!md.contains("t0ken") && !text(&out).contains("t0ken"), "the token is never quoted");
+}
+
+#[test]
+fn a_change_from_a_fork_is_gated_and_the_summary_says_where_it_came_from() {
+    let (s, secret, _remote) = ci_fixture();
+    s.write("main.rs", "fn main() { /* from a fork */ }\n");
+    s.commit_all("change");
+    let head = s.git(&["rev-parse", "HEAD"]);
+    let summary = s.home.path().join("summary.md");
+    let (api, server) = statuses_api(2);
+    let out = gate_workflow_run(&s, Some(&secret), &run_event(&head, "someone/app", None), &api, &summary);
+    assert_eq!(code(&out), 0, "{}", text(&out));
+    assert_eq!(server.join().unwrap().len(), 2, "its verdict is posted like any other");
+    let md = fs::read_to_string(&summary).unwrap();
+    assert!(md.contains("This change came from the fork someone/app") && md.contains("its checks ran as the same user as 05, so they could have read the runner key"), "without a check user it says what that means: {md}");
+    assert!(!md.contains("Nothing was pushed"), "without --push it does not claim what it did not do: {md}");
+}
+
+#[test]
+fn the_summary_says_who_posted_the_status() {
+    let (s, secret, _remote) = ci_fixture();
+    s.write("main.rs", "fn main() { /* who posts */ }\n");
+    s.commit_all("change");
+    let head = s.git(&["rev-parse", "HEAD"]);
+    let summary = s.home.path().join("workflow-token.md");
+    let (api, server) = statuses_api(2);
+    gate_workflow_run(&s, Some(&secret), &run_event(&head, "acme/app", Some("main")), &api, &summary);
+    server.join().unwrap();
+    let md = fs::read_to_string(&summary).unwrap();
+    assert!(md.contains("posted with the workflow token: a branch can forge this status"), "{md}");
+
+    let summary = s.home.path().join("app.md");
+    let (api, server) = statuses_api(2);
+    gate_workflow_run_with(&s, Some(&secret), &run_event(&head, "acme/app", Some("main")), &api, &summary, &[("USE05_STATUS_TOKEN", "ghs_app")]);
+    assert!(server.join().unwrap().len() == 2);
+    let md = fs::read_to_string(&summary).unwrap();
+    assert!(md.contains("posted by your 05 app") && !md.contains("can forge"), "{md}");
+}
+
+#[test]
+fn a_change_with_no_base_is_held_to_the_default_branchs_rules_never_its_own() {
+    let (s, secret, _remote) = ci_fixture();
+    // A commit with no history in common with main, whose own rules (the same runner key, an
+    // easy check) would let it through.
+    let easy = s.git(&["show", "main:.05/policy.toml"]).replace("run = [\"./test.sh\"]", "run = [\"true\"]");
+    s.git(&["checkout", "-q", "--orphan", "lonely"]);
+    s.write(".05/policy.toml", &easy);
+    s.write("test.sh", "#!/bin/sh\nexit 1\n");
+    s.commit_all("no base");
+    let head = s.git(&["rev-parse", "HEAD"]);
+    // The gate's checkout is the change itself, as 05-gate.yml leaves it.
+    let (api, server) = statuses_api(2);
+    let out = gate_workflow_run(&s, Some(&secret), &run_event(&head, "acme/app", Some("main")), &api, &s.home.path().join("summary.md"));
+    server.join().unwrap();
+    assert_eq!(code(&out), 2, "main's ./test.sh is what runs, and it fails here:\n{}", text(&out));
+    assert!(finding_codes(&out).contains(&"CHECK_FAILED".to_string()), "{:?}", finding_codes(&out));
+}
+
+#[test]
+fn a_runner_key_on_a_push_event_is_reported_exposed() {
+    let (s, secret, _remote) = ci_fixture();
+    s.write("main.rs", "fn main() { /* exposed */ }\n");
+    s.commit_all("change");
+    let out = s
+        .command(&["gate", "--ci", "--json"])
+        .env("USE05_HOME", s.home.path().join("ci"))
+        .env("USE05_RUNNER_KEY", &secret)
+        .env("GITHUB_EVENT_NAME", "push")
+        .env("GITHUB_REF_NAME", "feature")
+        .env("GITHUB_REF_TYPE", "branch")
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    assert_eq!(code(&out), 0, "it warns, and still gates:\n{}", text(&out));
+    let v = json(&out);
+    let finding = v["brief"]["gate"]["findings"].as_array().unwrap().iter().find(|f| f["code"] == "CI_KEY_EXPOSED").cloned().unwrap_or_else(|| panic!("{v}"));
+    assert_eq!(finding["effect"], "warn");
+    assert!(finding["message"].as_str().unwrap().contains("branch's own workflow"), "{finding}");
+    assert!(finding["next"].as_str().unwrap().starts_with("use05 init --ci github"), "{finding}");
+
+    // From the gate a branch cannot change, it is not.
+    let head = s.git(&["rev-parse", "HEAD"]);
+    let (api, server) = statuses_api(2);
+    let out = gate_workflow_run(&s, Some(&secret), &run_event(&head, "acme/app", Some("main")), &api, &s.home.path().join("summary.md"));
+    server.join().unwrap();
+    assert!(!finding_codes(&out).contains(&"CI_KEY_EXPOSED".to_string()), "{}", text(&out));
+}
+
+/// The workflow files as JSON, when Ruby is there to read YAML (GitHub's runners and macOS have it).
+fn yaml(path: &Path) -> Option<Value> {
+    let out = Command::new("ruby").args(["-ryaml", "-rjson", "-e", "puts JSON.generate(YAML.safe_load(File.read(ARGV[0])))"]).arg(path).output().ok()?;
+    assert!(out.status.success(), "{} is not YAML: {}", path.display(), String::from_utf8_lossy(&out.stderr));
+    Some(serde_json::from_slice(&out.stdout).unwrap())
+}
+
+#[test]
+fn init_ci_writes_two_workflows_and_only_the_gate_has_the_key() {
+    let s = Sandbox::initialised();
+    let out = s.run(&["init", "--ci", "github"]);
+    assert_eq!(code(&out), 0, "{}", text(&out));
+    let (gate_path, start_path) = (s.path(".github/workflows/05-gate.yml"), s.path(".github/workflows/05.yml"));
+    let (gate, start) = (fs::read_to_string(&gate_path).unwrap(), fs::read_to_string(&start_path).unwrap());
+    assert!(!start.contains("secrets.") && start.contains("permissions:\n  contents: read\n"), "{start}");
+    assert!(gate.contains("workflow_run:\n    workflows: [\"05\"]\n    types: [completed]\n") && gate.contains("USE05_RUNNER_KEY: ${{ secrets.USE05_RUNNER_KEY }}"), "{gate}");
+    match (yaml(&start_path), yaml(&gate_path)) {
+        (Some(start), Some(gate)) => {
+            // YAML 1.1 reads the key `on` as true.
+            let on = |v: &Value| v.get("on").or_else(|| v.get("true")).cloned().unwrap();
+            assert_eq!(start["name"], "05", "the gate starts on the run of the workflow named 05");
+            assert_eq!(start["permissions"], serde_json::json!({ "contents": "read" }));
+            assert_eq!(start["jobs"].as_object().unwrap().len(), 1);
+            let triggers: Vec<String> = on(&start).as_object().unwrap().keys().cloned().collect();
+            assert_eq!(triggers, ["merge_group", "pull_request", "push"]);
+            assert_eq!(on(&gate), serde_json::json!({ "workflow_run": { "workflows": ["05"], "types": ["completed"] } }));
+            assert_eq!(gate["permissions"], serde_json::json!({ "contents": "write", "statuses": "write" }));
+            let job = &gate["jobs"]["gate"];
+            assert_eq!(job["environment"], "use05", "the key is an environment secret only the default branch can use");
+            let steps = job["steps"].as_array().unwrap();
+            let checkout = steps.iter().position(|st| st["uses"].as_str().is_some_and(|u| u.starts_with("actions/checkout@"))).unwrap();
+            assert_eq!(steps[checkout]["with"], serde_json::json!({ "ref": "${{ github.event.workflow_run.head_sha }}", "fetch-depth": 0, "persist-credentials": false }));
+            // Nothing runs as the key holder once the change is on disk, but the app token and the gate.
+            let after: Vec<String> = steps[checkout + 1..].iter().map(|st| st["name"].as_str().unwrap_or_default().to_string()).collect();
+            assert_eq!(after, ["Status token from your 05 app", "Prove and gate"]);
+            assert!(steps.iter().any(|st| st["run"].as_str().is_some_and(|r| r.contains("useradd --create-home --shell /bin/bash use05-check"))));
+            let gating = steps.iter().find(|st| st["run"] == "use05 gate --ci --push").unwrap();
+            assert_eq!(gating["env"]["USE05_CHECK_USER"], "use05-check");
+            assert_eq!(gating["env"]["USE05_RUNNER_KEY"], "${{ secrets.USE05_RUNNER_KEY }}");
+        }
+        _ => eprintln!("no ruby here, so the workflows were not read as YAML"),
+    }
+    snapshot_text("ci_gate_workflow", &gate);
+    snapshot_text("ci_start_workflow", &start);
+
+    // Nothing in the repository gives the key away; how GitHub keeps it is said, not checked.
+    let doctor = text(&s.run(&["doctor"]));
+    assert!(!doctor.contains("an agent's push can read it"), "{doctor}");
+    assert!(doctor.contains("cannot read these settings from here"), "{doctor}");
+}
+
+#[test]
+fn init_ci_locks_workflows_in_a_new_policy() {
+    let s = Sandbox::new();
+    s.commit_all("first");
+    let out = s.run(&["init", "--ci", "github"]);
+    assert_eq!(code(&out), 0, "{}", text(&out));
+    let policy = use05_core::policy::Policy::parse(&fs::read_to_string(s.path(".05/policy.toml")).unwrap()).unwrap();
+    assert_eq!(policy.protect.locked, [".github/workflows/**"]);
+    s.commit_all("set up 05");
+    s.write(".github/workflows/05.yml", "name: 05\non: push\njobs: {}\n");
+    s.git(&["add", "-A"]);
+    let brief = s.run(&["brief", "--json"]);
+    assert!(finding_codes(&brief).contains(&"LOCKED_PATH".to_string()), "a branch cannot change the gate: {:?}", finding_codes(&brief));
+
+    // An existing policy is left as it is, and init says how to lock them.
+    let t = Sandbox::initialised();
+    let before = fs::read_to_string(t.path(".05/policy.toml")).unwrap();
+    let out = t.run(&["init", "--ci", "github"]);
+    assert!(text(&out).contains("use05 policy add protect.locked \".github/workflows/**\""), "{}", text(&out));
+    assert_eq!(fs::read_to_string(t.path(".05/policy.toml")).unwrap(), before);
+}
+
+/// The workflow 0.0.13 and earlier wrote: one file, run from each branch's own copy, with the key.
+const OLD_WORKFLOW: &str = "name: 05\non:\n  pull_request:\n  push:\n    branches-ignore: [\"05-receipts/**\"]\npermissions:\n  contents: write\njobs:\n  acceptance:\n    runs-on: ubuntu-latest\n    steps:\n      - uses: actions/checkout@v4\n      - name: Prove and gate\n        env:\n          USE05_RUNNER_KEY: ${{ secrets.USE05_RUNNER_KEY }}\n          USE05_PUSH_TOKEN: ${{ github.token }}\n        run: use05 gate --ci --push\n";
+
+#[test]
+fn doctor_says_how_to_move_an_old_workflow_that_gives_the_key_to_every_branch() {
+    let s = Sandbox::initialised();
+    fs::create_dir_all(s.path(".github/workflows")).unwrap();
+    s.write(".github/workflows/05.yml", OLD_WORKFLOW);
+    let doctor = s.run(&["doctor"]);
+    assert_eq!(code(&doctor), 0, "a warning, not a failure:\n{}", text(&doctor));
+    let said = text(&doctor).replace("\n             ", " ");
+    assert!(said.contains("! CI key .github/workflows/05.yml gives the runner key to a run the branch defines, so an agent's push can read it. Move to the gate a branch cannot change: use05 init --ci github, then rotate the key"), "{said}");
+
+    // As an earlier use05 wrote it and nobody changed it, init brings it up to date.
+    let manifest_path = s.path(".git/05/install.json");
+    let mut manifest: Value = serde_json::from_str(&fs::read_to_string(&manifest_path).unwrap()).unwrap();
+    use sha2::Digest;
+    let digest = hex::encode(sha2::Sha256::digest(OLD_WORKFLOW.as_bytes()));
+    manifest["items"].as_array_mut().unwrap().push(serde_json::json!({ "kind": "file", "path": ".github/workflows/05.yml", "sha256": digest }));
+    fs::write(&manifest_path, manifest.to_string()).unwrap();
+    let init = s.run(&["init", "--ci", "github"]);
+    assert!(text(&init).contains("replaced .github/workflows/05.yml"), "{}", text(&init));
+    assert!(!fs::read_to_string(s.path(".github/workflows/05.yml")).unwrap().contains("secrets."));
+    assert!(!text(&s.run(&["doctor"])).contains("an agent's push can read it"));
+
+    // One a person changed is theirs: left alone, and named.
+    s.write(".github/workflows/05.yml", &format!("{OLD_WORKFLOW}# ours\n"));
+    let init = text(&s.run(&["init", "--ci", "github"])).replace("\n             ", " ");
+    assert!(init.contains(".github/workflows/05.yml already exists; left as it is") && init.contains("still gives the runner key"), "{init}");
+}
+
 // ---------------------------------------------------------------- one rule at a time (D88)
 
 #[test]
@@ -4038,7 +4469,7 @@ fn discard_shows_what_is_lost_and_needs_a_person_at_the_terminal() {
     let (wt, id) = abandoned(&s, &holder);
     // An agent's shell has no terminal: it cannot throw work away.
     let out = s.run(&["discard", &id, "--json"]);
-    assert_eq!(code(&out), 6, "{}", text(&out));
+    assert_eq!(code(&out), 3, "a person is needed, as for approve: {}", text(&out));
     assert_eq!(json(&out)["code"], "NEEDS_A_PERSON");
     assert!(wt.exists());
     // At a terminal, after seeing what would be lost; "no" keeps it.
@@ -4460,10 +4891,387 @@ fn when_the_agent_stops_the_person_reads_where_the_work_stands_once() {
     assert!(generic.stdout.is_empty() || json(&generic)["message"].is_string(), "{}", text(&generic));
 }
 
+// ---------------------------------------------------------------- assurance beside the verdict (D101)
+
+impl Sandbox {
+    /// Through `init` with no test script to find, so the policy requires no checks.
+    fn without_checks(agent_hooks: bool) -> Sandbox {
+        let s = Sandbox::new();
+        if agent_hooks {
+            fs::create_dir_all(s.path(".claude")).unwrap();
+        }
+        s.commit_all("first");
+        let init = s.run(&["init"]);
+        assert_eq!(code(&init), 0, "{}", text(&init));
+        assert!(!fs::read_to_string(s.path(".05/policy.toml")).unwrap().contains("\n[[check]]"), "no check was detected");
+        s.commit_all("add 05");
+        s
+    }
+}
+
+#[test]
+fn an_agent_told_05_is_too_old_is_asked_to_stop_not_to_install_it() {
+    // Seen with Codex: given an install command, an agent runs it on the person's machine.
+    let s = Sandbox::initialised();
+    s.write(".05/policy.toml", "[use05]\nmin_version = \"99.0.0\"\n");
+    s.commit_all("needs a newer 05");
+    let person = json(&s.run(&["policy", "--json"]));
+    assert!(person["next"].as_str().unwrap().starts_with("upgrade: npm i -g @use05/cli"), "{person:#}");
+    let out = s.command(&["policy", "--json"]).env("CLAUDE_CODE_SESSION_ID", "s1").stdin(Stdio::null()).output().unwrap();
+    let agent = json(&out);
+    assert_eq!(agent["code"], "POLICY_NEEDS_NEWER", "{agent:#}");
+    assert!(agent["next"].as_str().unwrap().starts_with("stop and ask the user to upgrade 05") && !agent["next"].as_str().unwrap().contains("curl"), "{agent:#}");
+    // And AGENTS.md says it before anything is tried.
+    assert!(fs::read_to_string(s.path("AGENTS.md")).unwrap().contains("If `use05` is missing or says it is too old, stop and ask the user to install or upgrade it. Do not install it yourself."));
+}
+
+#[test]
+fn doctor_says_when_nothing_is_ever_run_and_how_to_add_a_check_that_works() {
+    let s = Sandbox::without_checks(false);
+    let out = text(&s.run(&["doctor"]));
+    assert!(out.contains("no required checks, so 05 never runs anything here to see whether a change works"), "{out}");
+    // Not yet committed, as just after `use05 init`, it is said of the file as written.
+    s.git(&["rm", "-q", "--cached", ".05/policy.toml"]);
+    s.git(&["commit", "-q", "-m", "not yet"]);
+    let out = text(&s.run(&["doctor"]));
+    assert!(out.contains("is valid but not committed") && out.contains("no required checks"), "{out}");
+    s.git(&["add", ".05/policy.toml"]);
+    s.commit_all("add 05 again");
+    // A test command it can find is named exactly, and the command it prints works as printed.
+    s.write("package.json", "{\"scripts\":{\"test\":\"./test.sh\"}}\n");
+    let out = text(&s.run(&["doctor"]));
+    let add = out.split("Add the command that decides it: ").nth(1).map(|t| t.split_whitespace().collect::<Vec<_>>().join(" ")).unwrap_or_default();
+    let quoted = add.split('\'').nth(1).unwrap_or_default().to_string();
+    assert!(add.starts_with("use05 policy add check '{ name = \"test\""), "{out}");
+    let added = s.run(&["policy", "add", "check", &quoted]);
+    assert_eq!(code(&added), 0, "{}", text(&added));
+    assert_eq!(policy_of(&s).check.len(), 1, "the check is in the policy now");
+    assert!(!text(&s.run(&["doctor"])).contains("no required checks"), "the file as written has a check");
+    // Committed, it is the rules, and the note is still gone.
+    s.commit_all("add the test check");
+    assert!(!text(&s.run(&["doctor"])).contains("no required checks"));
+}
+
+/// The brief's fields as 0.0.13 printed them: every one is still there, with nothing renamed.
+const BRIEF_FIELDS_0_0_13: [&str; 25] = [
+    "label", "title", "task_id", "author", "request", "agent", "owner", "owner_confirmed", "sandbox", "goal", "card", "risk", "tree", "tree_label",
+    "areas", "area_summary", "added", "removed", "outside_scope", "outside_scope_areas", "gate", "unknowns", "undo", "session", "lands_on",
+];
+
+#[test]
+fn a_change_allowed_with_no_checks_says_so_beside_the_verdict() {
+    let s = Sandbox::without_checks(false);
+    s.write("main.rs", "fn main() { 1; }\n");
+    s.git(&["add", "-A"]);
+    let out = s.run(&["brief"]);
+    assert_eq!(code(&out), 0, "{}", text(&out));
+    let words = text(&out);
+    // D66's label stays; the line under it says what it rests on.
+    assert!(words.contains("✓ ALLOW  nothing to read\n  Checks: none required; behaviour not verified\n"), "{words}");
+    assert!(!words.contains("Behaviour beyond these checks"), "folded into the checks line when nothing ran: {words}");
+    for word in ["verified correct", "proven", "score"] {
+        assert!(!words.contains(word), "{word}: {words}");
+    }
+    snapshot("brief_no_checks", &s, &out);
+
+    // The bare page keeps the label and adds the qualifier.
+    let bare = text(&s.run(&[]));
+    assert!(bare.contains("✓ ALLOW nothing to read (no checks ran, behaviour not verified)"), "{bare}");
+}
+
+#[test]
+fn brief_json_keeps_every_existing_field_and_adds_assurance() {
+    let s = Sandbox::without_checks(false);
+    s.write("main.rs", "fn main() { 2; }\n");
+    s.git(&["add", "-A"]);
+    let v = json(&s.run(&["brief", "--json"]));
+    let top: Vec<&str> = v.as_object().unwrap().keys().map(String::as_str).collect();
+    assert_eq!(top, ["brief", "command", "decision", "label", "overlap", "v"], "the envelope is unchanged");
+    let brief = v["brief"].as_object().unwrap();
+    for field in BRIEF_FIELDS_0_0_13 {
+        assert!(brief.contains_key(field), "{field} is still printed: {v}");
+    }
+    let added: Vec<&str> = brief.keys().map(String::as_str).filter(|k| !BRIEF_FIELDS_0_0_13.contains(k)).collect();
+    assert_eq!(added, ["assurance", "story"], "two objects are added (D101, D102), nothing else");
+    let story: Vec<&str> = v["brief"]["story"].as_object().unwrap().keys().map(String::as_str).collect();
+    assert_eq!(story, ["agent_says", "asked", "checked", "claim_counts", "claims", "needs_you", "not_known", "observed"], "{v}");
+    let a = &v["brief"]["assurance"];
+    let keys: Vec<&str> = a.as_object().unwrap().keys().map(String::as_str).collect();
+    assert_eq!(keys, ["behaviour", "checks_required", "enforcement", "evidence", "failed", "limitations", "local_only", "missing", "not_accepted", "not_required", "passed", "stale", "summary", "test_origin", "tests_changed"], "{a}");
+    assert_eq!((a["checks_required"].as_u64(), a["evidence"].as_str(), a["behaviour"].as_str(), a["enforcement"].as_str()), (Some(0), Some("none"), Some("not_assessed"), Some("unknown")), "{a}");
+    assert_eq!(a["summary"], "none required; behaviour not verified");
+    // The unknowns are what they were.
+    assert!(v["brief"]["unknowns"].as_array().unwrap().iter().any(|u| u == "policy requires no checks, so nothing was verified by running anything"), "{v}");
+}
+
+#[test]
+fn the_assurance_changes_no_decision_label_or_exit_code() {
+    // Each fixture: what the gate decided before the assurance existed, and what the summary says.
+    let none = Sandbox::without_checks(false);
+    none.write("main.rs", "fn main() { 3; }\n");
+    none.git(&["add", "-A"]);
+
+    let local = Sandbox::initialised();
+    local.write("main.rs", "fn main() { 3; }\n");
+    local.git(&["add", "-A"]);
+    assert_eq!(code(&local.run(&["prove"])), 0);
+
+    let unproved = Sandbox::initialised();
+    unproved.write("main.rs", "fn main() { 3; }\n");
+    unproved.git(&["add", "-A"]);
+
+    let failing = Sandbox::initialised();
+    failing.write(".05/policy.toml", "[[check]]\nname = \"test\"\nrun = [\"false\"]\n");
+    failing.commit_all("failing check");
+    failing.write("main.rs", "fn main() { 3; }\n");
+    failing.git(&["add", "-A"]);
+    failing.run(&["prove"]);
+
+    let protected = Sandbox::initialised();
+    protected.write(".05/policy.toml", &(fs::read_to_string(protected.path(".05/policy.toml")).unwrap() + "\n# edited\n"));
+    protected.git(&["add", "-A"]);
+    assert_eq!(code(&protected.run(&["prove"])), 0);
+
+    let cases: [(&Sandbox, &str, &str, i32, &str); 5] = [
+        (&none, "allow", "allow", 0, "none required; behaviour not verified"),
+        (&local, "allow", "allow", 0, "1 passed on the machine that ran it (advisory: an agent can run as its user)"),
+        (&unproved, "wait", "wait", 5, "1 not run on this tree"),
+        (&failing, "deny", "deny", 2, "1 failed"),
+        (&protected, "approval_required", "approval_required", 3, "1 passed on the machine that ran it (advisory: an agent can run as its user)"),
+    ];
+    for (s, decision, label, exit, summary) in cases {
+        let out = s.run(&["brief", "--json"]);
+        let v = json(&out);
+        assert_eq!((v["decision"].as_str(), v["label"].as_str(), code(&out)), (Some(decision), Some(label), exit), "{v}");
+        assert_eq!(v["brief"]["gate"]["decision"], decision);
+        assert_eq!(v["brief"]["assurance"]["summary"], summary, "{v}");
+        // The words and the JSON agree, and the human brief exits the same way.
+        let words = s.run(&["brief"]);
+        assert_eq!(code(&words), exit);
+        assert!(text(&words).contains(&format!("  Checks: {summary}")), "{}", text(&words));
+    }
+}
+
+#[test]
+fn agent_claim_contradicted_by_failing_check_is_shown_as_claim() {
+    let s = Sandbox::initialised();
+    s.write(".05/policy.toml", "[[check]]\nname = \"test\"\nrun = [\"false\"]\n");
+    s.commit_all("failing check");
+    s.run(&["start", "Anything"]);
+    s.write("main.rs", "fn main() { /* x */ }\n");
+    s.git(&["add", "-A"]);
+    s.run(&["finish", "--outcome", "All tests pass."]);
+    s.run(&["prove"]);
+    let out = s.run(&["brief"]);
+    assert_eq!(code(&out), 2, "{}", text(&out));
+    let words = text(&out);
+    // The agent's words are its claim, shown as one; the checks line counts what the check did.
+    assert!(words.contains("Claims     ✗ \"All tests pass\" contradicted: test did not pass"), "{words}");
+    assert!(words.contains("did not pass\n\n  Checks: 1 failed\n  Behaviour beyond these checks: not assessed\n"), "apart from the numbered reasons: {words}");
+    let v = json(&s.run(&["brief", "--json"]));
+    assert_eq!((v["brief"]["assurance"]["passed"].as_u64(), v["brief"]["assurance"]["failed"].as_u64()), (Some(0), Some(1)), "{v}");
+}
+
+#[test]
+fn the_story_keeps_the_agents_words_apart_from_what_05_saw_and_checked() {
+    let s = Sandbox::initialised();
+    s.write(".05/policy.toml", "[[check]]\nname = \"test\"\nrun = [\"false\"]\n");
+    s.commit_all("failing check");
+    s.run(&["start", "Cap the retries"]);
+    s.write("main.rs", "fn main() { /* x */ }\n");
+    s.git(&["add", "-A"]);
+    s.run(&["finish", "--outcome", "Capped the retries at three. All tests pass."]);
+    s.run(&["prove"]);
+    let words = text(&s.run(&["brief"]));
+    // The agent's words are said to be its own, and its claim is shown against the check that
+    // contradicts it; what 05 saw and what the check found are said as 05's.
+    assert!(words.contains("Story      asked: not recorded"), "{words}");
+    assert!(words.contains("agent says: \"Capped the retries at three. All tests pass.\" (its own words)"), "{words}");
+    assert!(words.contains("agent's claims: 1 contradicted by a check"), "{words}");
+    assert!(words.contains("05 saw: 1 file changed in the top folder · +1 −1"), "{words}");
+    assert!(words.contains("checked: 1 failed"), "{words}");
+    assert!(words.contains("needs you:"), "a failed check holds it: {words}");
+    let v = json(&s.run(&["brief", "--json"]));
+    let st = &v["brief"]["story"];
+    assert_eq!(st["claims"][0]["status"], "contradicted", "{st}");
+    assert_eq!(st["claim_counts"]["contradicted"], 1);
+    // An agent's words are never among what 05 saw or what the checks found.
+    for line in st["observed"].as_array().unwrap().iter().chain([&st["checked"]]) {
+        assert!(!line.as_str().unwrap().contains("retries"), "{line}");
+    }
+    // The story decides nothing: the decision is the gate's, as before.
+    assert_eq!(v["decision"], "deny");
+}
+
+#[test]
+fn the_story_says_whether_the_tests_stand_apart_from_the_change() {
+    let origin = |s: &Sandbox| {
+        let v = json(&s.run(&["brief", "--json"]));
+        (v["brief"]["assurance"]["test_origin"].as_str().unwrap_or_default().to_string(), v["brief"]["story"].clone())
+    };
+    let s = Sandbox::initialised();
+    fs::create_dir_all(s.path("tests")).unwrap();
+    s.write("tests/parser_test.rs", "#[test]\nfn parses() {}\n");
+    s.commit_all("tests");
+    // Unchanged this time, but no rule keeps a change from rewriting them.
+    s.write("main.rs", "fn main() { 8; }\n");
+    s.git(&["add", "-A"]);
+    assert_eq!(code(&s.run(&["prove"])), 0);
+    let (o, st) = origin(&s);
+    assert_eq!(o, "not_protected", "{st}");
+    assert!(st["not_known"].as_array().unwrap().iter().any(|n| n.as_str().unwrap().starts_with("whether the tests stand apart from the change")), "{st}");
+    // The policy protects them: a change to one needs a person.
+    let policy = fs::read_to_string(s.path(".05/policy.toml")).unwrap().replace("[protect]\n", "[protect]\nappend_only = [\"tests/**\", \"test.sh\"]\n");
+    s.write(".05/policy.toml", &policy);
+    s.commit_all("protect the tests");
+    s.write("main.rs", "fn main() { 9; }\n");
+    s.git(&["add", "-A"]);
+    assert_eq!(code(&s.run(&["prove"])), 0);
+    let (o, st) = origin(&s);
+    assert_eq!(o, "protected", "{st}");
+    assert!(st["observed"].as_array().unwrap().iter().any(|n| n.as_str().unwrap().starts_with("the test files are under the policy's protect rules")), "{st}");
+    // The change edits a test itself: it partly grades itself, whatever the rules.
+    s.write("tests/new_test.rs", "#[test]\nfn always() {}\n");
+    s.git(&["add", "-A"]);
+    let (o, _) = origin(&s);
+    assert_eq!(o, "edited_by_change");
+}
+
+#[test]
+fn the_story_of_a_good_change_and_of_one_waiting_for_a_person() {
+    // A change in no risk area, its check passed: nothing needs anyone.
+    let s = Sandbox::initialised();
+    s.write("main.rs", "fn main() { 7; }\n");
+    s.git(&["add", "-A"]);
+    assert_eq!(code(&s.run(&["prove"])), 0);
+    let st = json(&s.run(&["brief", "--json"]))["brief"]["story"].clone();
+    assert_eq!(st["needs_you"].as_array().unwrap().len(), 0, "{st}");
+    assert_eq!(st["checked"], "1 passed on the machine that ran it (advisory: an agent can run as its user)");
+    assert_eq!(st["not_known"][0], "behaviour beyond these checks");
+    // A change to a protected path: what holds it is the first thing a person reads after the facts.
+    s.write(".05/policy.toml", &format!("{}\n# tightened\n", fs::read_to_string(s.path(".05/policy.toml")).unwrap()));
+    s.git(&["add", "-A"]);
+    assert_eq!(code(&s.run(&["prove"])), 0);
+    let st = json(&s.run(&["brief", "--json"]))["brief"]["story"].clone();
+    assert!(st["needs_you"][0].as_str().unwrap().contains("protected file(s) changed"), "{st}");
+}
+
+#[test]
+fn the_story_says_a_person_must_try_it_when_the_rules_ask_for_testing_before_a_push() {
+    // The brief is not a push, so it allows; but trying it is still a person's to do before one.
+    let s = Sandbox::initialised();
+    assert_eq!(code(&s.run(&["policy", "set", "testing.local", "required"])), 0);
+    s.commit_all("testing before a push");
+    s.write("main.rs", "fn main() { 9; }\n");
+    s.git(&["add", "-A"]);
+    assert_eq!(code(&s.run(&["prove"])), 0);
+    let st = json(&s.run(&["brief", "--json"]))["brief"]["story"].clone();
+    assert!(st["needs_you"].as_array().unwrap().iter().any(|n| n.as_str().unwrap().contains("a person must try it in their own environment")), "{st}");
+}
+
+#[test]
+fn a_change_that_edits_its_own_tests_says_so_under_the_checks_line() {
+    let s = Sandbox::initialised();
+    fs::create_dir_all(s.path("tests")).unwrap();
+    s.write("tests/parser_test.rs", "#[test]\nfn parses() { assert!(true); }\n");
+    s.write("main.rs", "fn main() { 4; }\n");
+    s.git(&["add", "-A"]);
+    assert_eq!(code(&s.run(&["prove"])), 0);
+    let words = text(&s.run(&["brief"]));
+    assert!(
+        words.contains("  Checks: 1 passed on the machine that ran it (advisory: an agent can run as its user)\n  Note: this change also edits 1 test file(s), so it partly grades itself\n  Behaviour beyond these checks: not assessed"),
+        "{words}"
+    );
+    // Narrow, plain and ASCII terminals still hold every line within the width.
+    for width in ["40", "60"] {
+        let out = s.command(&["brief"]).env("COLUMNS", width).stdin(Stdio::null()).output().unwrap();
+        let w: usize = width.parse().unwrap();
+        for line in text(&out).lines() {
+            assert!(line.chars().count() <= w, "width {w}: {line:?}\n{}", text(&out));
+        }
+        assert!(text(&out).contains("partly grades itself"), "{}", text(&out));
+    }
+    let ascii = s.command(&["brief"]).env("LANG", "C").stdin(Stdio::null()).output().unwrap();
+    assert!(String::from_utf8_lossy(&ascii.stdout).is_ascii() && text(&ascii).contains("Checks: 1 passed"), "{}", text(&ascii));
+}
+
+#[test]
+fn when_no_check_ran_the_agent_window_says_so_and_keeps_the_label() {
+    let s = Sandbox::without_checks(true);
+    hook(&s, "s1", "PostToolUse", "Edit", "main.rs");
+    s.write("main.rs", "fn main() { 5; }\n");
+    s.git(&["add", "-A"]);
+    let v = json(&stop(&s, "claude-code", "s1", false));
+    let line = v["systemMessage"].as_str().unwrap_or_else(|| panic!("{v}"));
+    assert_eq!(line, "05: allowed, nothing to read (1 file; no checks ran, behaviour not verified). Commit and push when you are ready.");
+}
+
+#[test]
+fn a_change_landed_with_no_checks_is_not_said_to_have_passed_them() {
+    let s = Sandbox::without_checks(true);
+    let policy = fs::read_to_string(s.path(".05/policy.toml")).unwrap();
+    s.write(".05/policy.toml", &policy.replace("land = \"manual\"", "land = \"auto\""));
+    s.commit_all("land automatically");
+    let holder = tempfile::tempdir().unwrap();
+    let wt = agent_worktree(&s, &holder, "claude/nochecks");
+    let payload = |event: &str| serde_json::json!({ "session_id": "s1", "cwd": wt, "hook_event_name": event, "tool_name": "Edit", "tool_input": { "file_path": wt.join("main.rs") } }).to_string();
+    s.run_with_stdin(&["hook", "claude-code", "PostToolUse"], &payload("PostToolUse"));
+    fs::write(wt.join("main.rs"), "fn main() { 6; }\n").unwrap();
+    git_at(&wt, &["commit", "-qam", "no checks"]);
+    let out = s.run_with_stdin(&["hook", "claude-code", "Stop"], &payload("Stop"));
+    assert_eq!(code(&out), 0, "{}", text(&out));
+    let line = json(&out)["systemMessage"].as_str().map(str::to_string).unwrap_or_else(|| panic!("{}", text(&out)));
+    assert!(line.contains("landed on main") && line.contains("no checks ran, behaviour not verified") && !line.contains("passed its checks"), "{line}");
+}
+
+#[test]
+fn a_change_landed_by_a_bypass_over_a_failed_check_is_not_said_to_have_passed_it() {
+    let s = Sandbox::initialised();
+    fs::create_dir_all(s.path(".claude")).unwrap();
+    s.write(".05/policy.toml", "[[check]]\nname = \"test\"\nrun = [\"sh\", \"-c\", \"! grep -q broken main.rs\"]\n\n[branches]\nland = \"auto\"\n");
+    s.commit_all("a check that fails on broken code, and landing on its own");
+    s.approver();
+    let holder = tempfile::tempdir().unwrap();
+    let wt = agent_worktree(&s, &holder, "claude/bypassed");
+    let payload = |event: &str| serde_json::json!({ "session_id": "s1", "cwd": wt, "hook_event_name": event, "tool_name": "Edit", "tool_input": { "file_path": wt.join("main.rs") } }).to_string();
+    s.run_with_stdin(&["hook", "claude-code", "PostToolUse"], &payload("PostToolUse"));
+    fs::write(wt.join("main.rs"), "fn main() { /* broken */ }\n").unwrap();
+    git_at(&wt, &["commit", "-qam", "broken"]);
+    let head = git_at(&wt, &["rev-parse", "HEAD"]);
+    let wt_repo = wt.to_str().unwrap();
+    assert_eq!(code(&s.run(&["prove", "--repo", wt_repo])), 2, "the check fails on this tree");
+    let bypass = s.run_with_stdin(&["bypass", "--reason", "production is down", "--tree", &head, "--repo", wt_repo, "--passphrase-stdin"], "correct horse\n");
+    assert_eq!(code(&bypass), 0, "{}", text(&bypass));
+    let out = s.run_with_stdin(&["hook", "claude-code", "Stop"], &payload("Stop"));
+    assert_eq!(code(&out), 0, "{}", text(&out));
+    assert_eq!(s.git(&["rev-parse", "main"]), head, "the bypass let it land: {}", text(&out));
+    let line = json(&out)["systemMessage"].as_str().map(str::to_string).unwrap_or_else(|| panic!("{}", text(&out)));
+    assert!(line.contains("landed on main (allowed by a bypass)") && !line.contains("passed its checks"), "{line}");
+}
+
+#[test]
+fn the_ci_gate_says_its_checks_were_signed_by_ci_but_not_that_merging_requires_them() {
+    let (s, secret, _remote) = ci_fixture();
+    s.write("main.rs", "fn main() { println!(\"ci\"); }\n");
+    s.commit_all("improve");
+    let out = gate_ci(&s, Some(&secret), &["--json"]);
+    assert_eq!(code(&out), 0, "{}", text(&out));
+    let a = &json(&out)["brief"]["assurance"];
+    assert_eq!((a["evidence"].as_str(), a["enforcement"].as_str(), a["local_only"].as_u64()), (Some("runner_signed"), Some("ci_gate"), Some(0)), "{a}");
+    assert_eq!(a["summary"], "1 passed, signed by CI (merge enforcement not confirmed from here)");
+    let words = gate_ci(&s, Some(&secret), &[]);
+    assert!(text(&words).contains("  Checks: 1 passed, signed by CI (merge enforcement not confirmed from here)"), "{}", text(&words));
+}
+
 #[test]
 fn a_push_that_needs_a_person_is_approved_right_there_at_the_terminal() {
     let s = Sandbox::initialised();
     s.approver();
+    // A task began earlier, and work since then is already on the remote: the person is shown
+    // what this push holds (one file), not everything since the task began.
+    s.run(&["start", "Earlier work", "--scope", "**"]);
+    s.write("earlier.rs", "fn earlier() {}\n");
+    s.commit_all("earlier, already pushed");
     let base = s.git(&["rev-parse", "HEAD"]);
     s.write(".05/policy.toml", &(fs::read_to_string(s.path(".05/policy.toml")).unwrap() + "\n# tightened\n"));
     s.commit_all("tighten");
@@ -4477,6 +5285,7 @@ fn a_push_that_needs_a_person_is_approved_right_there_at_the_terminal() {
     let (yes, screen) = on_a_terminal(&s, &["gate", "--git-hook", "pre-push"], &[&refs, "\x04", "correct horse"]);
     assert_eq!(yes, 0, "{}", plain(&screen));
     assert!(plain(&screen).contains("05: Approved"), "{}", plain(&screen));
+    assert!(plain(&screen).contains("1 file(s) changed"), "{}", plain(&screen));
     assert!(!screen.contains("correct horse"), "the passphrase is never echoed");
 }
 
@@ -4497,4 +5306,3042 @@ fn the_bare_page_offers_to_land_what_is_allowed_and_enter_does_it() {
     assert_eq!(done, 0, "{}", plain(&screen));
     assert!(plain(&screen).contains("1  Land \"Ready to land\""), "{}", plain(&screen));
     assert_eq!(s.git(&["rev-parse", "main"]), head, "Enter landed it");
+}
+
+// ---------------------------------------------------------------- Git LFS in the exact tree (D96)
+
+const LFS_ATTRIBUTES: &str = "*.bin filter=lfs diff=lfs merge=lfs -text\n";
+
+fn lfs_pointer(oid_byte: &str, size: u64) -> String {
+    format!("version https://git-lfs.github.com/spec/v1\noid sha256:{}\nsize {size}\n", oid_byte.repeat(32))
+}
+
+/// A sandbox whose staged tree holds two LFS pointers, with `[evidence] lfs = true` when asked.
+fn with_lfs_pointers(lfs: bool) -> Sandbox {
+    let s = Sandbox::initialised();
+    if lfs {
+        let policy = fs::read_to_string(s.path(".05/policy.toml")).unwrap();
+        assert!(policy.contains("[evidence]\n"), "{policy}");
+        s.write(".05/policy.toml", &policy.replacen("[evidence]\n", "[evidence]\nlfs = true\n", 1));
+        s.commit_all("ask for the real LFS files");
+    }
+    s.write(".gitattributes", LFS_ATTRIBUTES);
+    s.write("model.bin", &lfs_pointer("11", 10));
+    s.write("data.bin", &lfs_pointer("22", 20));
+    s.git(&["add", "-A"]);
+    s
+}
+
+#[test]
+fn lfs_pointers_are_listed_under_unknowns_when_lfs_is_off() {
+    let s = with_lfs_pointers(false);
+    let line = "2 LFS files were checked as pointers (set [evidence] lfs = true to check the real files)";
+    // The page wraps the line; its words are the same.
+    let page = text(&s.run(&["brief"])).split_whitespace().collect::<Vec<_>>().join(" ");
+    assert!(page.contains(line), "{page}");
+    let unknowns = json(&s.run(&["brief", "--json"]))["brief"]["unknowns"].clone();
+    assert!(unknowns.as_array().unwrap().iter().any(|u| u == line), "{unknowns}");
+
+    // One file reads as one file.
+    s.git(&["rm", "-q", "--cached", "data.bin"]);
+    let one = json(&s.run(&["brief", "--json"]))["brief"]["unknowns"].clone();
+    assert!(one.as_array().unwrap().iter().any(|u| u == "1 LFS file was checked as a pointer (set [evidence] lfs = true to check the real file)"), "{one}");
+
+    // Without a .gitattributes that uses LFS, a file that looks like a pointer is just a file.
+    s.git(&["rm", "-q", "--cached", ".gitattributes"]);
+    let none = json(&s.run(&["brief", "--json"]))["brief"]["unknowns"].clone();
+    assert!(!none.to_string().contains("LFS"), "{none}");
+}
+
+#[test]
+fn lfs_on_leaves_no_pointer_unknown_and_without_git_lfs_fails_loudly() {
+    let s = with_lfs_pointers(true);
+    let brief = text(&s.run(&["brief"]));
+    assert!(!brief.contains("LFS file"), "the checks ask for the real files, so nothing is unknown: {brief}");
+
+    // A PATH with git and sh but no git-lfs.
+    let bin = tempfile::tempdir().unwrap();
+    for tool in ["git", "sh"] {
+        let found = std::env::var("PATH").unwrap().split(':').map(|d| Path::new(d).join(tool)).find(|p| p.exists()).expect("the tool is on PATH");
+        std::os::unix::fs::symlink(found, bin.path().join(tool)).unwrap();
+    }
+    let path = bin.path().to_str().unwrap();
+    s.key("me.key");
+    let out = s.run_env(&["prove", "--key", "me.key", "--json", "--", "./test.sh"], &[("PATH", path)]);
+    assert_eq!(code(&out), 6, "{}", text(&out));
+    let report = json(&out);
+    assert_eq!(report["code"], "LFS_UNAVAILABLE", "{report}");
+    assert!(report["message"].as_str().unwrap().contains("Nothing ran"), "{report}");
+    assert!(report["next"].as_str().unwrap().contains("git-lfs.com"), "{report}");
+    assert!(s.stored_receipts().is_empty(), "no receipt was made for a check that did not run");
+}
+
+#[test]
+fn prove_with_lfs_on_checks_the_real_file_and_says_so() {
+    if !Command::new("git").args(["lfs", "version"]).stdin(Stdio::null()).output().is_ok_and(|o| o.status.success()) {
+        eprintln!("skipped: git-lfs is not installed here");
+        return;
+    }
+    let s = Sandbox::initialised();
+    let policy = fs::read_to_string(s.path(".05/policy.toml")).unwrap();
+    s.write(".05/policy.toml", &policy.replacen("[evidence]\n", "[evidence]\nlfs = true\n", 1));
+    s.commit_all("ask for the real LFS files");
+    // The filter only: 05's pre-push hook is already in place, and LFS's own would not replace it.
+    s.git(&["lfs", "install", "--local", "--skip-repo"]);
+    s.write(".gitattributes", LFS_ATTRIBUTES);
+    s.write("model.bin", "the real bytes\n");
+    s.git(&["add", "-A"]);
+    assert!(s.git(&["cat-file", "-p", ":model.bin"]).starts_with("version https://git-lfs.github.com/spec/v1"));
+
+    s.key("me.key");
+    let out = s.run(&["prove", "--key", "me.key", "--json", "--", "grep", "-q", "the real bytes", "model.bin"]);
+    assert_eq!(code(&out), 0, "the check read the real file, not the pointer: {}", text(&out));
+    let lfs = json(&out)["details"]["checks"][0]["lfs"].clone();
+    assert_eq!((lfs[0]["path"].as_str(), lfs[0]["size"].as_u64()), (Some("model.bin"), Some(15)), "{lfs}");
+
+    let human = s.run(&["prove", "--key", "me.key", "--", "grep", "-q", "the real bytes", "model.bin"]);
+    assert!(text(&human).contains("1 LFS file was fetched, so the check ran on the real file; the receipt lists it."), "{}", text(&human));
+}
+
+/// A folder with stand-ins for `git-lfs` and `use05` that record their arguments and standard
+/// input, for running the pre-push hook as git would. `lfs_exit` is what the `git-lfs` one returns;
+/// `None` leaves git-lfs out altogether.
+fn recording_stubs(lfs_exit: Option<i32>, with_use05: bool) -> TempDir {
+    let dir = tempfile::tempdir().unwrap();
+    let stub = |name: &str, exit: i32| {
+        let path = dir.path().join(name);
+        let log = dir.path().join(name);
+        let body = format!("#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{0}.args'\ncat >> '{0}.in'\nexit {exit}\n", log.display());
+        fs::write(&path, body).unwrap();
+        fs::set_permissions(&path, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+    };
+    if let Some(exit) = lfs_exit {
+        stub("git-lfs", exit);
+    }
+    if with_use05 {
+        stub("use05", 0);
+    }
+    dir
+}
+
+/// Run the repository's pre-push hook the way git does: in the work tree, with the refs on stdin.
+/// PATH holds the stubs and links to only the programs the hook runs besides its shell builtins,
+/// so a real git-lfs on the machine (Linux images ship one in /usr/bin) cannot be found. The
+/// hook's temporary file must be gone when it ends, however it ends.
+fn run_pre_push(s: &Sandbox, stubs: &TempDir, refs: &str) -> Output {
+    use std::io::Write;
+    let hook = fs::read_to_string(s.path(".git/hooks/pre-push")).unwrap();
+    let tools = tempfile::tempdir().unwrap();
+    let search: Vec<String> = std::env::var("PATH").unwrap().split(':').map(str::to_string).chain(["/usr/bin".to_string(), "/bin".to_string()]).collect();
+    // Everything the script calls as a program (its builtins are command, trap, export, echo, exit).
+    for tool in ["git", "cat", "mktemp", "rm"] {
+        assert!(hook.contains(tool), "the hook no longer runs {tool}: update this list");
+        let found = search.iter().map(|d| Path::new(d).join(tool)).find(|p| p.exists()).unwrap_or_else(|| panic!("{tool} is not on PATH"));
+        std::os::unix::fs::symlink(found, tools.path().join(tool)).unwrap();
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let mut child = Command::new("/bin/sh")
+        .arg(s.path(".git/hooks/pre-push"))
+        .args(["origin", "file:///elsewhere"])
+        .current_dir(s.dir.path())
+        .env_clear()
+        .env("PATH", format!("{}:{}", stubs.path().display(), tools.path().display()))
+        .env("HOME", s.home.path())
+        .env("TMPDIR", tmp.path())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child.stdin.take().unwrap().write_all(refs.as_bytes()).unwrap();
+    let out = child.wait_with_output().unwrap();
+    let left: Vec<_> = fs::read_dir(tmp.path()).unwrap().flatten().map(|e| e.file_name()).collect();
+    assert!(left.is_empty(), "the hook left its temporary file behind: {left:?}");
+    out
+}
+
+fn recorded(stubs: &TempDir, file: &str) -> String {
+    fs::read_to_string(stubs.path().join(file)).unwrap_or_default()
+}
+
+#[test]
+fn the_pre_push_hook_uploads_lfs_files_first_when_the_repository_uses_lfs() {
+    let s = Sandbox::initialised();
+    let hook = fs::read_to_string(s.path(".git/hooks/pre-push")).unwrap();
+    assert!(hook.contains("git lfs pre-push \"$@\""), "{hook}");
+    assert!(hook.contains("use05 gate --git-hook pre-push"), "{hook}");
+    let refs = format!("refs/heads/main {} refs/heads/main {}\n", "a".repeat(40), "0".repeat(40));
+
+    // Not an LFS repository: git-lfs is never called, and 05's check gets the refs.
+    let plain = recording_stubs(Some(0), true);
+    let out = run_pre_push(&s, &plain, &refs);
+    assert_eq!(code(&out), 0, "{}", text(&out));
+    assert_eq!(recorded(&plain, "git-lfs.args"), "");
+    assert_eq!(recorded(&plain, "use05.args"), "gate --git-hook pre-push origin file:///elsewhere\n");
+    assert_eq!(recorded(&plain, "use05.in"), refs);
+
+    // An LFS repository: git-lfs gets the same arguments and the same refs, then 05 does too.
+    s.write(".gitattributes", LFS_ATTRIBUTES);
+    s.commit_all("track big files");
+    let lfs = recording_stubs(Some(0), true);
+    let out = run_pre_push(&s, &lfs, &refs);
+    assert_eq!(code(&out), 0, "{}", text(&out));
+    assert_eq!(recorded(&lfs, "git-lfs.args"), "pre-push origin file:///elsewhere\n");
+    assert_eq!(recorded(&lfs, "git-lfs.in"), refs);
+    assert_eq!(recorded(&lfs, "use05.args"), "gate --git-hook pre-push origin file:///elsewhere\n");
+    assert_eq!(recorded(&lfs, "use05.in"), refs, "05 reads the refs too, from the same input");
+
+    // The same, found through git's lfs settings alone.
+    let by_config = Sandbox::initialised();
+    by_config.git(&["config", "lfs.url", "https://lfs.example.invalid/x"]);
+    let configured = recording_stubs(Some(0), true);
+    run_pre_push(&by_config, &configured, &refs);
+    assert_eq!(recorded(&configured, "git-lfs.in"), refs);
+
+    // A failed upload fails the push, and 05's check does not run after it.
+    let failing = recording_stubs(Some(1), true);
+    let out = run_pre_push(&s, &failing, &refs);
+    assert_eq!(code(&out), 1, "{}", text(&out));
+    assert_eq!(recorded(&failing, "use05.args"), "", "05 did not run");
+}
+
+#[test]
+fn the_pre_push_hook_stops_the_push_when_an_lfs_repository_has_no_git_lfs() {
+    let s = Sandbox::initialised();
+    s.write(".gitattributes", LFS_ATTRIBUTES);
+    s.commit_all("track big files");
+    let refs = format!("refs/heads/main {} refs/heads/main {}\n", "a".repeat(40), "0".repeat(40));
+
+    // As Git LFS's own hook does: say what is missing, and stop (exit 2). 05's check does not run.
+    let without = recording_stubs(None, true);
+    let out = run_pre_push(&s, &without, &refs);
+    assert_eq!(code(&out), 2, "{}", text(&out));
+    let said = String::from_utf8_lossy(&out.stderr);
+    assert!(said.contains("uses Git LFS, but git-lfs was not found on PATH, so this push was stopped") && said.contains("git-lfs.com"), "{said}");
+    assert_eq!(recorded(&without, "use05.args"), "");
+
+    // A repository that does not use LFS is not held up by it.
+    let plain = Sandbox::initialised();
+    let out = run_pre_push(&plain, &recording_stubs(None, true), &refs);
+    assert_eq!(code(&out), 0, "{}", text(&out));
+
+    // A commented-out filter line is not use, and neither is LFS configured for the whole machine.
+    let commented = Sandbox::initialised();
+    commented.write(".gitattributes", "# *.bin filter=lfs diff=lfs merge=lfs -text\n   # also off: *.psd filter=lfs\n*.txt text\n");
+    commented.commit_all("lfs is off for now");
+    fs::write(commented.home.path().join(".gitconfig"), "[lfs]\n\turl = https://lfs.example.invalid/x\n").unwrap();
+    let out = run_pre_push(&commented, &recording_stubs(None, true), &refs);
+    assert_eq!(code(&out), 0, "{}", text(&out));
+    assert!(!use05_cli_uses_lfs(&commented), "init and doctor read it the same way");
+
+    // Git LFS writes `lfs.repositoryformatversion` into any repository it runs a command in: that
+    // alone is not use, and must not stop a push on a machine without git-lfs.
+    let touched = Sandbox::initialised();
+    touched.git(&["config", "lfs.repositoryformatversion", "0"]);
+    let out = run_pre_push(&touched, &recording_stubs(None, true), &refs);
+    assert_eq!(code(&out), 0, "{}", text(&out));
+    assert!(!use05_cli_uses_lfs(&touched), "init and doctor read it the same way");
+}
+
+/// Whether `init` and `doctor` see the repository as using LFS: they warn about its hook only then.
+fn use05_cli_uses_lfs(s: &Sandbox) -> bool {
+    fs::write(s.path(".git/hooks/pre-push"), "#!/bin/sh\necho theirs\n").unwrap();
+    squash_words(&text(&s.run(&["doctor"]))).contains("this repository uses Git LFS")
+}
+
+fn squash_words(text: &str) -> String {
+    text.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+#[test]
+fn the_pre_push_hook_works_from_a_path_with_a_space_in_it() {
+    let s = Sandbox::in_dir(tempfile::Builder::new().prefix("a repo with spaces ").tempdir().unwrap());
+    s.write("package.json", "{\"scripts\":{\"test\":\"./test.sh\"}}\n");
+    s.write(".gitattributes", LFS_ATTRIBUTES);
+    s.commit_all("first");
+    assert_eq!(code(&s.run(&["init"])), 0);
+    let refs = format!("refs/heads/main {} refs/heads/main {}\n", "a".repeat(40), "0".repeat(40));
+    let stubs = recording_stubs(Some(0), true);
+    let out = run_pre_push(&s, &stubs, &refs);
+    assert_eq!(code(&out), 0, "{}", text(&out));
+    assert_eq!(recorded(&stubs, "git-lfs.in"), refs);
+    assert_eq!(recorded(&stubs, "use05.in"), refs);
+}
+
+#[test]
+fn init_replaces_git_lfss_own_pre_push_hook_and_leaves_other_hooks_alone() {
+    let s = Sandbox::new();
+    s.write(".gitattributes", LFS_ATTRIBUTES);
+    s.commit_all("first");
+    fs::create_dir_all(s.path(".git/hooks")).unwrap();
+    let standard = "#!/bin/sh\ncommand -v git-lfs >/dev/null 2>&1 || { echo >&2 \"\\nThis repository is configured for Git LFS but 'git-lfs' was not found on your path.\\n\"; exit 2; }\ngit lfs pre-push \"$@\"\n";
+    s.write(".git/hooks/pre-push", standard);
+    let out = s.run(&["init"]);
+    assert_eq!(code(&out), 0, "{}", text(&out));
+    let hook = fs::read_to_string(s.path(".git/hooks/pre-push")).unwrap();
+    assert!(hook.contains("# 05 pre-push hook") && hook.contains("git lfs pre-push"), "{hook}");
+    assert!(text(&out).contains("replaced Git LFS's own pre-push hook"), "{}", text(&out));
+    let doctor = text(&s.run(&["doctor"]));
+    assert!(!doctor.contains("does not run"), "the hook chains it, so nothing to warn about: {doctor}");
+
+    // Uninstalling takes 05's hook away and says how to get Git LFS's back.
+    let gone = s.run(&["uninstall"]);
+    assert!(!s.path(".git/hooks/pre-push").exists());
+    assert!(text(&gone).contains("git lfs update"), "{}", text(&gone));
+
+    // The hook Git LFS itself writes is recognised too, whatever this version's wording.
+    if Command::new("git").args(["lfs", "version"]).stdin(Stdio::null()).output().is_ok_and(|o| o.status.success()) {
+        let real = Sandbox::new();
+        real.write(".gitattributes", LFS_ATTRIBUTES);
+        real.commit_all("first");
+        real.git(&["lfs", "install", "--local"]);
+        assert!(fs::read_to_string(real.path(".git/hooks/pre-push")).unwrap().contains("git lfs pre-push"));
+        let out = real.run(&["init"]);
+        assert!(text(&out).contains("replaced Git LFS's own pre-push hook"), "{}", text(&out));
+    }
+    // Spacing does not matter.
+    let spaced = "#!/bin/sh\n\n  command   -v git-lfs >/dev/null 2>&1 ||  { echo >&2 \"\\nThis repository is configured for Git LFS but 'git-lfs' was not found.\\n\"; exit 2; }\n\tgit lfs pre-push   \"$@\"  \n";
+    s.write(".git/hooks/pre-push", spaced);
+    let out = s.run(&["init"]);
+    assert!(text(&out).contains("replaced Git LFS's own pre-push hook"), "{}", text(&out));
+    s.run(&["uninstall"]);
+
+    // A hook that does something else as well is another tool's: left alone.
+    let theirs = format!("{standard}echo and then our own checks\n");
+    s.write(".git/hooks/pre-push", &theirs);
+    let out = s.run(&["init"]);
+    assert_eq!(fs::read_to_string(s.path(".git/hooks/pre-push")).unwrap(), theirs);
+    assert!(text(&out).contains("left alone"), "{}", text(&out));
+}
+
+#[test]
+fn doctor_warns_when_an_lfs_repository_pushes_through_a_hook_that_skips_lfs() {
+    let s = Sandbox::initialised();
+    s.write(".gitattributes", LFS_ATTRIBUTES);
+    s.commit_all("track big files");
+    let fine = text(&s.run(&["doctor"]));
+    assert!(!fine.contains("does not run"), "{fine}");
+
+    // Another tool's hook that never calls Git LFS.
+    fs::write(s.path(".git/hooks/pre-push"), "#!/bin/sh\necho theirs\n").unwrap();
+    // The page wraps its lines; the words are the same.
+    let squash = |out: &Output| text(out).split_whitespace().collect::<Vec<_>>().join(" ");
+    // A note, not a problem: it may reach Git LFS through a hook manager or a wrapper.
+    let foreign_run = s.run(&["doctor"]);
+    let foreign = squash(&foreign_run);
+    assert!(foreign.contains("this repository uses Git LFS, but the installed hook does not run `git lfs pre-push` itself"), "{foreign}");
+    assert!(!foreign.contains("problem to fix") && code(&foreign_run) == 0, "{foreign}");
+
+    // 05's own earlier hook, which did not chain it, is named as such, and init brings it up to date.
+    let old = "#!/bin/sh\n# 05 pre-push hook (installed by `use05 init`; remove with `use05 uninstall`)\nexec use05 gate --git-hook pre-push \"$@\"\n";
+    fs::write(s.path(".git/hooks/pre-push"), old).unwrap();
+    let manifest_path = s.path(".git/05/install.json");
+    let mut manifest: Value = serde_json::from_slice(&fs::read(&manifest_path).unwrap()).unwrap();
+    for item in manifest["items"].as_array_mut().unwrap() {
+        if item["path"].as_str().is_some_and(|p| p.ends_with("hooks/pre-push")) {
+            item["sha256"] = Value::String(hex::encode(<sha2::Sha256 as sha2::Digest>::digest(old.as_bytes())));
+        }
+    }
+    fs::write(&manifest_path, serde_json::to_vec(&manifest).unwrap()).unwrap();
+    let ours_run = s.run(&["doctor"]);
+    let ours = squash(&ours_run);
+    assert!(ours.contains("the installed hook does not run Git LFS's upload step") && ours.contains("problem to fix"), "05's own hook should have the chain: {ours}");
+    assert_eq!(code(&ours_run), 4, "{ours}");
+    let init = s.run(&["init"]);
+    assert!(text(&init).contains("updated the git pre-push hook"), "{}", text(&init));
+    assert!(fs::read_to_string(s.path(".git/hooks/pre-push")).unwrap().contains("git lfs pre-push"));
+    assert!(!text(&s.run(&["doctor"])).contains("does not run"));
+}
+
+/// The doctor's lines, with each line's wrapping undone.
+fn doctor_words(s: &Sandbox) -> String {
+    text(&s.run(&["doctor"])).split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// Nineteen gaps of a minute and then three of 41 minutes in one task (22 gaps, p90 is 41 minutes),
+/// then a long silence before another task: that one is no agent going quiet.
+fn seed_quiet_gaps(s: &Sandbox) {
+    let state = s.path(".git/05");
+    let edit = |task: &str, at: u64| use05_core::log::append_at(&state, task, serde_json::json!({ "event": "tool_done", "tool": "Edit", "paths": ["a.rs"] }), at).unwrap();
+    let mut at = use05_core::time::now_secs() - 10 * 86_400;
+    edit("t1", at);
+    for gap in std::iter::repeat_n(60, 19).chain(std::iter::repeat_n(2460, 3)) {
+        at += gap;
+        edit("t1", at);
+    }
+    edit("t2", at + 20 * 3600);
+}
+
+#[test]
+fn doctor_suggests_reservation_idle_from_quiet_gaps() {
+    let s = Sandbox::initialised();
+    let now = use05_core::time::now_secs();
+    let before = json(&s.run(&["doctor", "--json"]));
+    seed_quiet_gaps(&s);
+    let said = doctor_words(&s);
+    assert!(said.contains("Tip: agents here go quiet up to 41 min between edits (p90, 30 days); reservations lapse after 2 h."), "{said}");
+    assert!(said.contains("Less strict, so set it at a terminal, not from the console: use05 policy set drift.reservation_idle_hours 1"), "{said}");
+    // A tip is not something that is not set up: it has its own level and its own count.
+    assert!(said.contains("1 tip shown above"), "{said}");
+    let after = json(&s.run(&["doctor", "--json"]));
+    let tip = after["details"]["record"].as_array().unwrap().iter().find(|l| l["text"].as_str().unwrap().contains("go quiet")).unwrap();
+    assert_eq!(tip["level"], "tip", "{after}");
+    let notes = |r: &Value| r["message"].as_str().unwrap().split(", ").nth(1).unwrap().to_string();
+    assert_eq!(notes(&before), notes(&after), "the notes are the same with the tip");
+    assert!(after["message"].as_str().unwrap().ends_with("1 tip(s)"), "{after}");
+    // The command it prints is one `policy set` accepts.
+    let set = s.run(&["policy", "set", "drift.reservation_idle_hours", "1"]);
+    assert_eq!(code(&set), 0, "{}", text(&set));
+
+    // No policy file, or one not committed yet: `policy set` would have nothing to change, so no tip.
+    let none = Sandbox::new();
+    none.commit_all("first");
+    seed_quiet_gaps(&none);
+    assert!(!doctor_words(&none).contains("go quiet"), "{}", doctor_words(&none));
+    let draft = Sandbox::new();
+    draft.commit_all("first");
+    fs::create_dir_all(draft.path(".05")).unwrap();
+    draft.write(".05/policy.toml", "[drift]\nscope = \"warn\"\n");
+    seed_quiet_gaps(&draft);
+    assert!(!doctor_words(&draft).contains("go quiet"), "{}", doctor_words(&draft));
+    draft.commit_all("policy");
+    assert!(doctor_words(&draft).contains("go quiet"), "{}", doctor_words(&draft));
+    // A reservation time of 0 is deliberate.
+    draft.write(".05/policy.toml", "[drift]\nreservation_idle_hours = 0\n");
+    draft.commit_all("free areas at once");
+    assert!(!doctor_words(&draft).contains("go quiet"), "{}", doctor_words(&draft));
+
+    // Too few gaps, or gaps older than thirty days, suggest nothing.
+    let t = Sandbox::initialised();
+    let old = now - 40 * 86_400;
+    for i in 0..30u64 {
+        use05_core::log::append_at(&t.path(".git/05"), "old", serde_json::json!({ "event": "tool_done", "tool": "Edit", "paths": ["a.rs"] }), old + i * 2460).unwrap();
+    }
+    assert!(!doctor_words(&t).contains("go quiet"), "{}", doctor_words(&t));
+}
+
+#[test]
+fn doctor_suggests_stop_budget() {
+    let s = Sandbox::new();
+    s.write("slow.sh", "#!/bin/sh\nsleep 2\n");
+    fs::set_permissions(s.path("slow.sh"), std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+    fs::create_dir_all(s.path(".05")).unwrap();
+    s.write(".05/policy.toml", "[[check]]\nname = \"slow\"\nrun = [\"./slow.sh\"]\n\n[evidence]\nstop_budget_secs = 1\n");
+    s.commit_all("first");
+    let quiet = doctor_words(&s);
+    assert!(!quiet.contains("Stop hook"), "nothing has run yet, so nothing is known: {quiet}");
+    assert!(!quiet.contains("tip shown above"), "{quiet}");
+    assert_eq!(code(&s.run(&["prove", "slow"])), 0);
+    let said = doctor_words(&s);
+    assert!(said.contains("Tip: your checks that have run take 2."), "{said}");
+    assert!(said.contains("more than the 1 s the Stop hook may spend") && said.contains("use05 policy set evidence.stop_budget_secs 10"), "{said}");
+    let set = s.run(&["policy", "set", "evidence.stop_budget_secs", "10"]);
+    assert_eq!(code(&set), 0, "{}", text(&set));
+    // Once the rule is committed the checks fit, and the tip goes. A budget turned off on purpose is left alone.
+    s.commit_all("allow the checks at stop");
+    assert!(!doctor_words(&s).contains("Stop hook may spend"), "{}", doctor_words(&s));
+    let off = s.run(&["policy", "set", "evidence.stop_budget_secs", "0"]);
+    assert_eq!(code(&off), 0, "{}", text(&off));
+    s.commit_all("no proving at stop");
+    assert!(!doctor_words(&s).contains("Stop hook may spend"));
+}
+
+#[test]
+fn the_stop_budget_tip_counts_the_longest_scoped_check_once() {
+    let s = Sandbox::new();
+    for (name, secs) in [("always", 1), ("web", 2), ("api", 2)] {
+        s.write(&format!("{name}.sh"), &format!("#!/bin/sh\nsleep {secs}\n"));
+        fs::set_permissions(s.path(&format!("{name}.sh")), std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+    }
+    fs::create_dir_all(s.path(".05")).unwrap();
+    s.write(
+        ".05/policy.toml",
+        &"[use05]\nmin_version = \"{ver}\"\n\n[[check]]\nname = \"always\"\nrun = [\"./always.sh\"]\n\n[[check]]\nname = \"web\"\nrun = [\"./web.sh\"]\npaths = [\"web/**\"]\n\n[[check]]\nname = \"api\"\nrun = [\"./api.sh\"]\npaths = [\"api/**\"]\n\n[evidence]\nstop_budget_secs = 1\n".replace("{ver}", env!("CARGO_PKG_VERSION")),
+    );
+    s.commit_all("first");
+    let proved = s.run(&["prove", "always", "web", "api"]);
+    assert_eq!(code(&proved), 0, "{}", text(&proved));
+    // One change rarely calls for both scoped checks to be run at stop; the figure is the checks
+    // that always apply (1 s) and the longest scoped one (2 s), not the 5 s of all three.
+    let said = doctor_words(&s);
+    assert!(said.contains("Tip: your checks that have run take 3."), "{said}");
+    assert!(!said.contains("take 5."), "{said}");
+}
+
+#[test]
+fn a_rule_that_asks_too_often_is_a_tip_not_something_unset() {
+    let s = Sandbox::initialised();
+    let before = json(&s.run(&["doctor", "--json"]));
+    let now = use05_core::time::now_secs();
+    let line = format!("{{\"at\":{now},\"approved\":true,\"asked\":[{{\"code\":\"PROTECTED_PATH\",\"area\":\"docs/\"}}]}}\n");
+    fs::write(s.path(".git/05/asked.jsonl"), line.repeat(5)).unwrap();
+    let after = json(&s.run(&["doctor", "--json"]));
+    let rule = after["details"]["record"].as_array().unwrap().iter().find(|l| l["text"].as_str().unwrap().contains("PROTECTED_PATH held 5 changes")).unwrap();
+    assert_eq!(rule["level"], "tip", "{after}");
+    assert_eq!(before["message"].as_str().unwrap().split(", ").nth(1), after["message"].as_str().unwrap().split(", ").nth(1), "not counted as a note");
+    assert!(doctor_words(&s).contains("1 tip shown above"), "{}", doctor_words(&s));
+}
+
+#[test]
+fn doctor_names_missing_hook_events() {
+    let s = Sandbox::with_agent_hooks();
+    assert!(!doctor_words(&s).contains("older 05"), "{}", doctor_words(&s));
+    for file in [".claude/settings.local.json", ".codex/hooks.json"] {
+        let old = fs::read_to_string(s.path(file)).unwrap();
+        assert!(old.contains("SubagentStart"), "{file}");
+        fs::write(s.path(file), old.replace(" SubagentStart", " Something").replace(" SubagentStop", " SomethingElse")).unwrap();
+    }
+    let said = doctor_words(&s);
+    assert!(said.contains("Agent hooks were installed by an older 05 and lack SubagentStart, SubagentStop."), "{said}");
+    assert!(said.contains("`use05 init`"), "{said}");
+    let init = s.run(&["init"]);
+    assert_eq!(code(&init), 0, "{}", text(&init));
+    assert!(!doctor_words(&s).contains("older 05"), "init brings the hooks up to date: {}", doctor_words(&s));
+}
+
+#[test]
+fn policy_set_replaces_the_commented_example() {
+    let s = Sandbox::initialised();
+    let before = fs::read_to_string(s.path(".05/policy.toml")).unwrap();
+    assert!(before.contains("# locked = []"), "the template offers it as a comment");
+    let out = s.run(&["policy", "set", "protect.locked", "[\"vendor/**\"]"]);
+    assert_eq!(code(&out), 0, "{}", text(&out));
+    let after = fs::read_to_string(s.path(".05/policy.toml")).unwrap();
+    assert!(after.contains("locked = [\"vendor/**\"]") && !after.contains("# locked = []"), "the example became the rule:\n{after}");
+    assert!(after.contains("never changed; no approval clears it"), "its comment stays:\n{after}");
+    assert_eq!(after.matches("locked = ").count(), 1, "{after}");
+    assert!(after.contains("# append_only = []"), "the other examples stay");
+}
+
+#[test]
+fn an_lfs_server_that_never_answers_stops_the_proof_at_the_time_limit() {
+    if !Command::new("git").args(["lfs", "version"]).stdin(Stdio::null()).output().is_ok_and(|o| o.status.success()) {
+        eprintln!("skipped: git-lfs is not installed here");
+        return;
+    }
+    let s = with_lfs_pointers(true);
+    // A git-lfs that hangs, ahead of the real one on PATH; `git lfs version` still answers.
+    let stub = tempfile::tempdir().unwrap();
+    let script = stub.path().join("git-lfs");
+    fs::write(&script, "#!/bin/sh\n[ \"$1\" = version ] && { echo git-lfs/3.0.0; exit 0; }\nsleep 60\n").unwrap();
+    fs::set_permissions(&script, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+    let path = format!("{}:{}", stub.path().display(), std::env::var("PATH").unwrap());
+    s.key("me.key");
+    let started = std::time::Instant::now();
+    let out = s.run_env(&["prove", "--key", "me.key", "--json", "--", "./test.sh"], &[("PATH", &path), ("USE05_LFS_TIMEOUT_SECS", "1")]);
+    assert!(started.elapsed() < std::time::Duration::from_secs(30), "gave up near the limit, not after the sleep");
+    assert_eq!(code(&out), 6, "{}", text(&out));
+    let report = json(&out);
+    assert_eq!(report["code"], "LFS_FAILED", "{report}");
+    assert!(report["message"].as_str().unwrap().contains("the LFS server did not answer within 1 seconds"), "{report}");
+    assert!(s.stored_receipts().is_empty());
+}
+
+// ----------------------------------------------------------------------------- monorepo checks (D97)
+
+/// Initialised, with a second check that is required only when something under `docs/` changes.
+fn with_a_docs_check() -> Sandbox {
+    let s = Sandbox::initialised();
+    let policy = fs::read_to_string(s.path(".05/policy.toml")).unwrap();
+    s.write(".05/policy.toml", &format!("{policy}\n[[check]]\nname = \"docs\"\nrun = [\"./test.sh\"]\npaths = [\"docs/**\"]\n"));
+    s.commit_all("a check for the docs");
+    s
+}
+
+fn check_states(s: &Sandbox) -> std::collections::BTreeMap<String, Value> {
+    let out = json(&s.run(&["brief", "--json"]));
+    out["brief"]["gate"]["checks"].as_array().unwrap().iter().map(|c| (c["name"].as_str().unwrap().to_string(), c.clone())).collect()
+}
+
+#[test]
+fn the_brief_says_a_check_was_not_required_and_why_and_a_change_to_its_paths_requires_it() {
+    let s = with_a_docs_check();
+    s.write("main.rs", "fn main() { 1; }\n");
+    let human = text(&s.run(&["brief"]));
+    assert!(human.contains("docs") && human.contains("not required: no change in its paths"), "{human}");
+    let states = check_states(&s);
+    assert_eq!((states["docs"]["state"].as_str(), states["docs"]["reason"].as_str(), states["docs"]["required"].as_bool()), (Some("not_required"), Some("no change in its paths"), Some(false)));
+    assert_eq!(states["test"]["state"], "missing", "a check without paths is required for every change");
+    let waiting: Vec<String> = json(&s.run(&["brief", "--json"]))["brief"]["gate"]["findings"].as_array().unwrap().iter().filter(|f| f["code"] == "CHECK_MISSING").map(|f| f["message"].to_string()).collect();
+    assert_eq!(waiting.len(), 1, "only the check that is required is missing: {waiting:?}");
+
+    // A receipt made for it anyway is shown, labelled; it decides nothing.
+    assert_eq!(code(&s.run(&["prove", "docs"])), 0);
+    let shown = text(&s.run(&["brief"]));
+    assert!(shown.contains("not required") && shown.contains("a receipt says it passed") && shown.contains("not counted"), "{shown}");
+
+    // Touch its paths and it is required, on this tree.
+    fs::create_dir_all(s.path("docs")).unwrap();
+    s.write("docs/guide.md", "words\n");
+    let states = check_states(&s);
+    assert_eq!(states["docs"]["state"], "stale", "required again, and its receipt is for the earlier tree: {}", states["docs"]);
+    assert_eq!(states["docs"]["required"], true);
+}
+
+#[test]
+fn use05_prove_with_no_names_still_runs_every_required_check_because_it_does_not_know_the_base() {
+    let s = with_a_docs_check();
+    s.write("main.rs", "fn main() { 2; }\n");
+    let out = json(&s.run(&["prove", "--json"]));
+    let names: Vec<&str> = out["details"]["checks"].as_array().unwrap().iter().filter_map(|c| c["check"].as_str()).collect();
+    assert!(names.contains(&"test") && names.contains(&"docs"), "{names:?}");
+}
+
+#[test]
+fn the_pre_push_hook_proves_the_checks_a_change_calls_for_and_not_the_ones_scoped_to_other_paths() {
+    let s = with_a_docs_check();
+    let remote = tempfile::tempdir().unwrap();
+    let remote_path = remote.path().display().to_string();
+    assert!(Command::new("git").args(["init", "-q", "--bare", "-b", "main", &remote_path]).status().unwrap().success());
+    s.git(&["remote", "add", "origin", &remote_path]);
+    s.git(&["branch", "-M", "main"]);
+    let push = || {
+        let mut cmd = Command::new("git");
+        cmd.arg("-C").arg(s.dir.path()).args(["push", "origin", "main"]);
+        cmd.env("PATH", format!("{}:{}", bin_dir(), std::env::var("PATH").unwrap())).env("USE05_HOME", s.home.path()).env("HOME", s.home.path()).env("LANG", "C.UTF-8").env("COLUMNS", "100");
+        cmd.output().unwrap()
+    };
+    assert!(push().status.success());
+    s.write("main.rs", "fn main() { 3; }\n");
+    s.commit_all("a change that is not about the docs");
+    let out = push();
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let states = check_states(&s);
+    assert_eq!(states["test"]["state"], "passed", "the hook proved what the change calls for");
+    assert!(states["docs"]["state"] == "not_required" && states["docs"]["result"].is_null(), "and ran nothing else: {}", states["docs"]);
+}
+
+#[test]
+fn the_stop_hook_does_not_prove_a_check_scoped_to_other_paths() {
+    let s = Sandbox::with_agent_hooks();
+    let policy = fs::read_to_string(s.path(".05/policy.toml")).unwrap();
+    s.write(".05/policy.toml", &format!("{policy}\n[[check]]\nname = \"docs\"\nrun = [\"./test.sh\"]\npaths = [\"docs/**\"]\n"));
+    s.commit_all("a check for the docs");
+    // Both have run before, so both would fit the budget; only the one the change calls for runs.
+    assert_eq!(code(&s.run(&["prove", "test", "docs"])), 0);
+    hook(&s, "s1", "PostToolUse", "Edit", "main.rs");
+    s.write("main.rs", "fn main() { 4; }\n");
+    let checks = |s: &Sandbox| s.stored_receipts().into_iter().filter(|(_, p)| p.starts_with("receipts/") && p.split('/').nth(1).is_some_and(|subject| subject.len() == 40)).count();
+    let before = checks(&s);
+    let out = stop(&s, "claude-code", "s1", false);
+    assert_eq!(code(&out), 0, "{}", text(&out));
+    assert_eq!(checks(&s), before + 1, "one fresh receipt, for the check the change calls for");
+    let log = log_text(&s, "s1");
+    assert!(log.contains("proved_at_stop") && log.contains("\"test\"") && !log.contains("\"docs\""), "{log}");
+}
+
+#[test]
+fn prove_runs_a_check_in_its_dir() {
+    let s = Sandbox::initialised();
+    fs::create_dir_all(s.path("pkg")).unwrap();
+    s.write("pkg/marker.txt", "here\n");
+    let policy = fs::read_to_string(s.path(".05/policy.toml")).unwrap();
+    s.write(
+        ".05/policy.toml",
+        &format!(
+            "{policy}\n[[check]]\nname = \"inside\"\nrun = [\"sh\", \"-c\", \"test -f marker.txt && test ! -f main.rs\"]\ndir = \"pkg\"\n\n[[check]]\nname = \"outside\"\nrun = [\"sh\", \"-c\", \"test -f marker.txt\"]\n"
+        ),
+    );
+    s.commit_all("two checks");
+    let inside = json(&s.run(&["prove", "inside", "--json"]));
+    assert_eq!(inside["details"]["checks"][0]["status"], "passed", "{inside}");
+    let outside = s.run(&["prove", "outside", "--json"]);
+    assert_eq!(code(&outside), 2, "the same command at the root does not find the file: {}", text(&outside));
+    // The receipt says which folder, and the gate counts it for this check only.
+    let states = check_states(&s);
+    assert_eq!(states["inside"]["state"], "passed", "{}", states["inside"]);
+    assert_eq!(states["inside"]["dir"], "pkg");
+    assert_eq!(states["outside"]["state"], "failed");
+    assert!(states["outside"]["dir"].is_null());
+}
+
+#[test]
+fn a_dir_that_leaves_the_tree_is_refused_with_its_code() {
+    let s = Sandbox::initialised();
+    let policy = fs::read_to_string(s.path(".05/policy.toml")).unwrap();
+    s.write(".05/policy.toml", &format!("{policy}\n[[check]]\nname = \"out\"\nrun = [\"true\"]\ndir = \"../elsewhere\"\n"));
+    s.commit_all("a check that runs outside");
+    let out = s.run(&["prove", "out", "--json"]);
+    assert_ne!(code(&out), 0, "{}", text(&out));
+    assert!(text(&out).contains("CHECK_DIR_OUTSIDE"), "{}", text(&out));
+}
+
+fn a_pnpm_monorepo() -> Sandbox {
+    let s = Sandbox::new();
+    s.write("package.json", "{\"private\":true,\"scripts\":{\"test\":\"pnpm -r test\"}}\n");
+    s.write("pnpm-workspace.yaml", "packages:\n  - 'packages/*'\n");
+    s.write("pnpm-lock.yaml", "lockfileVersion: '9.0'\n");
+    for (dir, test) in [("api", "true"), ("web", "true"), ("docs", "")] {
+        fs::create_dir_all(s.path(&format!("packages/{dir}"))).unwrap();
+        let scripts = if test.is_empty() { String::new() } else { format!(",\"scripts\":{{\"test\":\"{test}\"}}") };
+        s.write(&format!("packages/{dir}/package.json"), &format!("{{\"name\":\"@acme/{dir}\"{scripts}}}\n"));
+    }
+    s.commit_all("a monorepo");
+    s
+}
+
+#[test]
+fn init_suggests_a_check_per_pnpm_workspace() {
+    let s = a_pnpm_monorepo();
+    let out = s.run(&["init", "--defaults"]);
+    assert_eq!(code(&out), 0, "{}", text(&out));
+    let p = policy_of(&s);
+    let checks: Vec<(&str, Vec<String>, Vec<String>, Option<&str>)> = p.check.iter().map(|c| (c.name.as_str(), c.run.clone(), c.paths.clone(), c.dir.as_deref())).collect();
+    let to_vec = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+    assert_eq!(
+        checks,
+        [
+            ("test-api", to_vec(&["pnpm", "--filter", "./packages/api", "test"]), to_vec(&["packages/api/**", "pnpm-workspace.yaml", "package.json", "pnpm-lock.yaml"]), None),
+            ("test-web", to_vec(&["pnpm", "--filter", "./packages/web", "test"]), to_vec(&["packages/web/**", "pnpm-workspace.yaml", "package.json", "pnpm-lock.yaml"]), None),
+        ],
+        "one per package that has a test script, in place of the single test check"
+    );
+    assert!(p.use05.min_version.is_some(), "a policy that scopes checks says which version reads it");
+    let shown = text(&out);
+    assert!(shown.contains("Found 2 packages") && shown.contains("pnpm"), "{shown}");
+    assert!(shown.contains("packages/docs has no test script"), "what was left out is said: {shown}");
+    assert!(shown.contains("not rerun when only a package it depends on changes") && shown.contains("`paths`"), "{shown}");
+    assert!(shown.contains("test-api") && shown.contains("test-web"), "{shown}");
+    // The written file reads back with its comments, and changing only the docs asks for neither check.
+    let file = fs::read_to_string(s.path(".05/policy.toml")).unwrap();
+    assert!(file.contains("paths = [\"packages/api/**\", \"pnpm-workspace.yaml\", \"package.json\", \"pnpm-lock.yaml\"]   # required only when a change touches one of these"), "{file}");
+}
+
+#[test]
+fn init_suggests_a_check_per_cargo_member() {
+    let s = Sandbox::new();
+    s.write("Cargo.toml", "[workspace]\nmembers = [\"crates/*\"]\n");
+    s.write("Cargo.lock", "# lock\n");
+    for name in ["alpha", "beta"] {
+        fs::create_dir_all(s.path(&format!("crates/{name}/src"))).unwrap();
+        s.write(&format!("crates/{name}/Cargo.toml"), &format!("[package]\nname = \"acme-{name}\"\nversion = \"0.1.0\"\nedition = \"2021\"\n"));
+        s.write(&format!("crates/{name}/src/lib.rs"), "");
+    }
+    s.commit_all("a cargo workspace");
+    let out = s.run(&["init", "--defaults"]);
+    assert_eq!(code(&out), 0, "{}", text(&out));
+    let p = policy_of(&s);
+    let names: Vec<&str> = p.check.iter().map(|c| c.name.as_str()).collect();
+    assert_eq!(names, ["lint", "test-alpha", "test-beta"], "the workspace-wide test is replaced, the lint stays");
+    let alpha = p.check.iter().find(|c| c.name == "test-alpha").unwrap();
+    assert_eq!(alpha.run, ["cargo", "test", "-p", "acme-alpha"]);
+    assert_eq!(alpha.paths, ["crates/alpha/**", "Cargo.toml", "Cargo.lock"]);
+    assert_eq!(alpha.env, ["HOME"]);
+    assert!(alpha.dir.is_none());
+}
+
+#[test]
+fn init_suggests_a_go_module_with_its_own_dir() {
+    let s = Sandbox::new();
+    s.write("go.work", "go 1.22\n\nuse ./svc\n");
+    fs::create_dir_all(s.path("svc")).unwrap();
+    s.write("svc/go.mod", "module svc\n");
+    s.commit_all("a go workspace");
+    assert_eq!(code(&s.run(&["init", "--defaults"])), 0);
+    let p = policy_of(&s);
+    let svc = p.check.iter().find(|c| c.name == "test-svc").expect("a check for svc");
+    assert_eq!((svc.run.clone(), svc.dir.as_deref(), svc.paths.clone()), (vec!["go".to_string(), "test".into(), "./...".into()], Some("svc"), vec!["svc/**".to_string(), "go.work".to_string()]));
+    assert!(fs::read_to_string(s.path(".05/policy.toml")).unwrap().contains("dir = \"svc\""));
+}
+
+#[test]
+fn guided_init_shows_the_package_checks_and_asks_once_whether_to_use_them() {
+    // The flags answer the team, the landing branch and the environments, so the first thing read
+    // from stdin is the question about the package checks (step 4); after it, Enter takes defaults.
+    let flags = ["init", "--guided", "--team", "solo", "--target", "main", "--env", "dev=main"];
+    let enters = "\n".repeat(40);
+
+    // Enter: the package checks replace the single test check.
+    let s = a_pnpm_monorepo();
+    let out = s.run_with_stdin(&flags, &enters);
+    assert_eq!(code(&out), 0, "{}", text(&out));
+    let shown = text(&out);
+    assert!(shown.contains("Found 2 packages") && shown.contains("Use these checks?"), "{shown}");
+    assert!(shown.contains("not rerun when only a package it depends on changes"), "{shown}");
+    assert_eq!(shown.matches("Keep them?").count(), 0, "asked once, not twice: {shown}");
+    let names: Vec<String> = policy_of(&s).check.iter().map(|c| c.name.clone()).collect();
+    assert_eq!(names, ["test-api", "test-web"], "{shown}");
+
+    // `n` to that question: the checks found at the top stay, and they are asked about as before.
+    let s = a_pnpm_monorepo();
+    let out = s.run_with_stdin(&flags, &format!("n\n{enters}"));
+    assert_eq!(code(&out), 0, "{}", text(&out));
+    let names: Vec<String> = policy_of(&s).check.iter().map(|c| c.name.clone()).collect();
+    assert_eq!(names, ["test"], "{}", text(&out));
+    assert!(text(&out).contains("Keep them?"), "{}", text(&out));
+}
+
+// ----- the fixes of review round 1
+
+#[test]
+fn a_top_that_is_a_package_keeps_its_test_check_for_every_change() {
+    let s = Sandbox::new();
+    s.write("Cargo.toml", "[package]\nname = \"acme-root\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[workspace]\nmembers = [\"crates/alpha\"]\n");
+    fs::create_dir_all(s.path("src")).unwrap();
+    s.write("src/lib.rs", "");
+    fs::create_dir_all(s.path("crates/alpha/src")).unwrap();
+    s.write("crates/alpha/Cargo.toml", "[package]\nname = \"acme-alpha\"\nversion = \"0.1.0\"\nedition = \"2021\"\n");
+    s.write("crates/alpha/src/lib.rs", "");
+    s.commit_all("a root crate with a member");
+    let out = s.run(&["init", "--defaults"]);
+    assert_eq!(code(&out), 0, "{}", text(&out));
+    let p = policy_of(&s);
+    let root = p.check.iter().find(|c| c.name == "test").expect("the root keeps its test check");
+    assert!(root.paths.is_empty(), "unscoped: required for every change");
+    assert!(p.check.iter().any(|c| c.name == "test-alpha"));
+    assert!(text(&out).contains("top of the repository is a package too"), "{}", text(&out));
+}
+
+#[test]
+fn the_brief_names_changed_files_that_no_checks_paths_cover() {
+    let s = Sandbox::new();
+    fs::create_dir_all(s.path(".05")).unwrap();
+    s.write(".05/policy.toml", "[[check]]\nname = \"docs\"\nrun = [\"./test.sh\"]\npaths = [\"docs/**\"]\n");
+    s.commit_all("base");
+    s.write("main.rs", "fn main() { 1; }\n");
+    s.write("tsconfig.base.json", "{}\n");
+    s.git(&["add", "-A"]);
+    let human = text(&s.run(&["brief"]));
+    assert!(human.contains("2 changed files are outside every check's paths") && human.contains("main.rs") && human.contains("tsconfig.base.json"), "{human}");
+    // A change that does touch the paths has nothing to report; so does a policy with a check for everything.
+    s.git(&["reset", "-q"]);
+    s.git(&["checkout", "--", "."]);
+    fs::remove_file(s.path("tsconfig.base.json")).unwrap();
+    fs::create_dir_all(s.path("docs")).unwrap();
+    s.write("docs/a.md", "x\n");
+    s.git(&["add", "-A"]);
+    assert!(!text(&s.run(&["brief"])).contains("outside every check's paths"));
+    let policy = fs::read_to_string(s.path(".05/policy.toml")).unwrap();
+    s.write(".05/policy.toml", &format!("{policy}\n[[check]]\nname = \"all\"\nrun = [\"./test.sh\"]\n"));
+    s.commit_all("a check for everything");
+    s.write("main.rs", "fn main() { 2; }\n");
+    s.git(&["add", "-A"]);
+    assert!(!text(&s.run(&["brief"])).contains("outside every check's paths"), "an unscoped required check covers every file");
+}
+
+#[test]
+fn a_check_with_a_bare_double_star_is_required_for_every_change() {
+    let s = Sandbox::new();
+    fs::create_dir_all(s.path(".05")).unwrap();
+    s.write(".05/policy.toml", "[[check]]\nname = \"everything\"\nrun = [\"./test.sh\"]\npaths = [\"**\"]\n");
+    s.commit_all("base");
+    s.write("main.rs", "fn main() { 3; }\n");
+    s.git(&["add", "-A"]);
+    let states = check_states(&s);
+    assert_eq!(states["everything"]["state"], "missing", "{}", states["everything"]);
+}
+
+#[test]
+fn a_check_whose_folder_was_deleted_fails_alone_and_the_others_still_run() {
+    let s = Sandbox::initialised();
+    let policy = fs::read_to_string(s.path(".05/policy.toml")).unwrap();
+    s.write(".05/policy.toml", &format!("{policy}\n[[check]]\nname = \"gone\"\nrun = [\"./test.sh\"]\ndir = \"removed-package\"\n"));
+    s.commit_all("a check for a package that is not there");
+    let out = s.run(&["prove", "--json"]);
+    assert_eq!(code(&out), 2, "{}", text(&out));
+    let v = json(&out);
+    let by_name = |n: &str| v["details"]["checks"].as_array().unwrap().iter().find(|c| c["check"] == n).cloned().unwrap_or_else(|| panic!("no {n}: {v}"));
+    assert_eq!(by_name("test")["status"], "passed", "the other check still ran");
+    assert_eq!(by_name("gone")["status"], "failed");
+    assert!(by_name("gone")["reason"].as_str().unwrap().contains("removed-package"), "{v}");
+    let human = text(&s.run(&["prove", "gone"]));
+    assert!(human.contains("removed-package") && human.contains("not run"), "{human}");
+    // The gate sees a failed check, not a missing one.
+    assert_eq!(check_states(&s)["gone"]["state"], "failed");
+}
+
+#[test]
+fn the_ci_gate_does_not_run_or_fail_on_a_check_the_change_does_not_call_for() {
+    let extra = "\n[[check]]\nname = \"web\"\nrun = [\"no-such-tool-for-the-web\"]\npaths = [\"web/**\"]\n";
+    let (s, secret, _remote) = ci_fixture_with(extra);
+    s.write("main.rs", "fn main() { println!(\"not the web\"); }\n");
+    s.commit_all("a change outside web/");
+    let out = gate_ci(&s, Some(&secret), &[]);
+    assert_eq!(code(&out), 0, "a toolchain the change does not need cannot stop it: {}", text(&out));
+    assert!(text(&out).contains("not required: no change in its paths"), "{}", text(&out));
+    // A change to its paths does call for it, and then the missing tool is a real problem.
+    fs::create_dir_all(s.path("web")).unwrap();
+    s.write("web/app.js", "1\n");
+    s.commit_all("a change in web/");
+    let out = gate_ci(&s, Some(&secret), &[]);
+    assert_ne!(code(&out), 0, "{}", text(&out));
+}
+
+// ---------------------------------------------------------------- path owners (D92)
+
+/// A repository on `main`, pushed to a bare `origin`, whose policy makes another key Lee's, and
+/// `billing/**` owned by eng-managers (Dana, Lee). Dana's key is this machine's approver key when
+/// `mine_is_danas`, else a key from elsewhere. Alex's branch `alex/billing`, changing billing,
+/// was pushed from elsewhere and is fetched here only.
+fn owned_billing(mine_is_danas: bool) -> (Sandbox, TempDir) {
+    let s = Sandbox::new();
+    s.approver();
+    let dana = if mine_is_danas {
+        json(&s.run(&["key", "show", "--json"]))["details"]["approver"].as_str().unwrap().to_string()
+    } else {
+        s.key("dana.key");
+        let public = fs::read_to_string(s.path("dana.key.pub")).unwrap().trim().to_string();
+        for f in ["dana.key", "dana.key.pub"] {
+            fs::remove_file(s.path(f)).unwrap();
+        }
+        public
+    };
+    s.key("lee.key");
+    let lee = fs::read_to_string(s.path("lee.key.pub")).unwrap().trim().to_string();
+    for f in ["lee.key", "lee.key.pub"] {
+        fs::remove_file(s.path(f)).unwrap();
+    }
+    fs::create_dir_all(s.path(".05")).unwrap();
+    s.write(
+        ".05/policy.toml",
+        &format!("[[trust.key]]\nname = \"dana\"\nrole = \"approver\"\npublic = \"{dana}\"\nperson = \"Dana\"\n\n[[trust.key]]\nname = \"lee\"\nrole = \"approver\"\npublic = \"{lee}\"\nperson = \"Lee\"\n\n[[signer]]\nname = \"eng-managers\"\npeople = [\"Dana\", \"Lee\"]\n\n[[protect.owner]]\npaths = [\"billing/**\"]\nsigners = [\"eng-managers\"]\n"),
+    );
+    s.commit_all("base");
+    let remote = tempfile::tempdir().unwrap();
+    let remote_path = remote.path().display().to_string();
+    assert!(Command::new("git").args(["init", "-q", "--bare", "-b", "main", &remote_path]).status().unwrap().success());
+    s.git(&["remote", "add", "origin", &remote_path]);
+    s.git(&["push", "-q", "origin", "main"]);
+    s.git(&["checkout", "-q", "-b", "alex/billing"]);
+    fs::create_dir_all(s.path("billing")).unwrap();
+    s.write("billing/pay.rs", "fn pay() {}\n");
+    s.commit_all("billing change");
+    s.git(&["push", "-q", "origin", "alex/billing"]);
+    s.git(&["checkout", "-q", "main"]);
+    s.git(&["branch", "-q", "-D", "alex/billing"]);
+    s.git(&["fetch", "-q", "origin"]);
+    (s, remote)
+}
+
+#[test]
+fn an_owner_approves_someone_elses_branch_by_its_revision_and_the_brief_names_them() {
+    let (s, _remote) = owned_billing(true);
+    let rev = "origin/alex/billing";
+    let commit = s.git(&["rev-parse", rev]);
+    let short = &commit[..12];
+    let waiting = s.run(&["brief", "--rev", rev, "--json"]);
+    assert_eq!(decision_of(&waiting), "approval_required", "{}", text(&waiting));
+    let owner = json(&waiting)["brief"]["gate"]["findings"].as_array().unwrap().iter().find(|f| f["code"] == "OWNER_APPROVAL_REQUIRED").cloned().unwrap();
+    assert_eq!(owner["message"], "billing/** needs an approval from eng-managers (Dana, Lee): 0 of 1");
+    assert_eq!(owner["next"], "ask Dana or Lee to run: use05 approve --outcome --rev <commit>");
+    let words = text(&s.run(&["brief", "--rev", rev]));
+    assert!(words.contains("billing/** owned by eng-managers (Dana, Lee): 0 of 1, nobody yet"), "{words}");
+    assert!(words.contains(&format!("({rev} at commit {short})")), "the brief names the commit to approve: {words}");
+
+    // An agent has no terminal: it cannot approve someone else's work either.
+    let refused = s.run(&["approve", "--outcome", "--rev", rev, "--json"]);
+    assert_eq!(json(&refused)["code"], "NEEDS_A_PERSON", "{}", text(&refused));
+    assert!(s.stored_receipts().is_empty(), "nothing was signed or stored");
+    let missing = s.run(&["approve", "--outcome", "--rev", "origin/nobody", "--json"]);
+    assert_eq!(json(&missing)["code"], "REV_NOT_FOUND", "{}", text(&missing));
+
+    // By the commit the brief showed: what it binds and which owned files it changes, said first.
+    let approved = s.run_with_stdin(&["approve", "--outcome", "--rev", short, "--reason", "billing looks right", "--passphrase-stdin"], "correct horse\n");
+    assert_eq!(code(&approved), 0, "{}", text(&approved));
+    let said = text(&approved);
+    let before = said.find("You are about to approve").expect("the preview");
+    assert!(said[before..].contains(&format!("Commit {commit}.")), "{said}");
+    assert!(said[before..].contains("Owned by eng-managers (Dana, Lee) (billing/**): billing/pay.rs."), "{said}");
+    assert!(said.contains("It counts as an owner's approval for billing/**."), "{said}");
+    let brief = s.run(&["brief", "--rev", rev, "--json"]);
+    assert_eq!(decision_of(&brief), "allow", "{}", text(&brief));
+    assert_eq!(json(&brief)["brief"]["gate"]["owners"][0]["approved_by"], serde_json::json!(["Dana"]));
+    // Commit ids change from run to run; the undo line names two.
+    let shown = normalise(&s, &text(&s.run(&["brief", "--rev", rev]))).replace(&s.git(&["rev-parse", "--short", "main"]), "<BASE>").replace(&s.git(&["rev-parse", "--short", rev]), "<HEAD>");
+    snapshot_text("brief_owners", &shown);
+
+    let again = s.run_with_stdin(&["approve", "--outcome", "--rev", rev, "--passphrase-stdin", "--json"], "correct horse\n");
+    assert_eq!(json(&again)["details"]["owner_of"], serde_json::json!(["billing/**"]), "{}", text(&again));
+    assert_eq!(json(&again)["details"]["scope"], "outcome");
+}
+
+#[test]
+fn a_name_in_git_config_never_makes_this_machines_key_an_owners() {
+    // An agent can set user.name; only the policy's `person` makes a key someone's.
+    let (s, _remote) = owned_billing(false);
+    s.git(&["config", "user.name", "Dana"]);
+    let rev = "origin/alex/billing";
+    let approved = s.run_with_stdin(&["approve", "--outcome", "--rev", rev, "--passphrase-stdin", "--json"], "correct horse\n");
+    assert_eq!(code(&approved), 0, "{}", text(&approved));
+    assert_eq!(json(&approved)["details"]["owner_of"], serde_json::json!([]), "{}", text(&approved));
+    let brief = s.run(&["brief", "--rev", rev, "--json"]);
+    assert_eq!(decision_of(&brief), "approval_required", "{}", text(&brief));
+    assert_eq!(json(&brief)["brief"]["gate"]["owners"][0]["approved_by"], serde_json::json!([]));
+}
+
+#[test]
+fn an_organisation_floor_naming_a_group_it_does_not_define_is_not_signed() {
+    let s = Sandbox::new();
+    s.key("org.key");
+    s.write("floor.toml", "[[protect_owner]]\npaths = [\"infra/**\"]\nsigners = [\"security\"]\n");
+    let out = s.run(&["policy", "--json", "org-sign", "floor.toml", "--org", "Acme", "--key", "org.key", "--out", "org.json"]);
+    assert_eq!(json(&out)["code"], "UNKNOWN_SIGNER", "{}", text(&out));
+    assert!(json(&out)["message"].as_str().unwrap().contains("\"security\""), "{}", text(&out));
+    assert!(!s.path("org.json").exists(), "nothing was signed");
+}
+
+#[test]
+fn a_policy_naming_an_unknown_signer_is_refused_with_the_name() {
+    let s = Sandbox::new();
+    fs::create_dir_all(s.path(".05")).unwrap();
+    s.write(".05/policy.toml", "[[protect.owner]]\npaths = [\"billing/**\"]\nsigners = [\"eng-mgrs\"]\n");
+    s.commit_all("base");
+    let out = s.run(&["brief", "--json"]);
+    assert_eq!(json(&out)["code"], "UNKNOWN_SIGNER", "{}", text(&out));
+    assert!(json(&out)["message"].as_str().unwrap().contains("\"eng-mgrs\""), "{}", text(&out));
+}
+
+// ---------------------------------------------------------------- environments and promotion (D93)
+
+const ENVIRONMENTS: &str = "[[check]]\nname = \"test\"\nrun = [\"./test.sh\"]\n\n[[environment]]\nname = \"dev\"\nbranch = \"main\"\n\n[[environment]]\nname = \"uat\"\nbranch = \"uat\"\n\n[[environment]]\nname = \"prod\"\nbranch = \"prod\"\n";
+
+/// dev on main, uat and prod, all pushed to a bare origin; then one commit on main that uat has
+/// and prod lacks, its checks proved on uat's head. `prod_rules` go under prod's environment.
+fn promotion_fixture(prod_rules: &str) -> (Sandbox, TempDir) {
+    promotion_fixture_with("", prod_rules)
+}
+
+/// Like `promotion_fixture`, with `head` at the top of the policy (trusted keys, evidence).
+fn promotion_fixture_with(head: &str, prod_rules: &str) -> (Sandbox, TempDir) {
+    promotion_fixture_of(&format!("{head}\n{ENVIRONMENTS}{prod_rules}"))
+}
+
+/// Like `promotion_fixture`, with this whole policy on every branch.
+fn promotion_fixture_of(policy: &str) -> (Sandbox, TempDir) {
+    promotion_fixture_in(Sandbox::new(), policy)
+}
+
+/// Like `promotion_fixture`, for the CI gate: the policy trusts this machine's key (so its
+/// promotion records count) and a CI runner key, whose secret is returned.
+fn ci_promotion_fixture(prod_rules: &str) -> (Sandbox, TempDir, String) {
+    let s = Sandbox::new();
+    assert_eq!(code(&s.run(&["prove", "--", "./test.sh"])), 0, "creates this machine's key");
+    let machine = fs::read_to_string(s.home.path().join("local.pub")).unwrap().trim().to_string();
+    s.approver();
+    let approver = fs::read_to_string(s.home.path().join("approver.pub")).unwrap().trim().to_string();
+    s.key("runner.key");
+    let public = fs::read_to_string(s.path("runner.key.pub")).unwrap().trim().to_string();
+    let secret = fs::read_to_string(s.path("runner.key")).unwrap().trim().to_string();
+    fs::remove_file(s.path("runner.key")).unwrap();
+    fs::remove_file(s.path("runner.key.pub")).unwrap();
+    let trust = format!(
+        "[[trust.key]]\nname = \"ci\"\nrole = \"runner\"\npublic = \"{public}\"\n\n[[trust.key]]\nname = \"dev laptop\"\nrole = \"local\"\npublic = \"{machine}\"\n\n[[trust.key]]\nname = \"alex\"\nrole = \"approver\"\nperson = \"Alex Rivera\"\npublic = \"{approver}\"\n"
+    );
+    let (s, remote) = promotion_fixture_in(s, &format!("{trust}\n{ENVIRONMENTS}{prod_rules}"));
+    (s, remote, secret)
+}
+
+/// The CI gate as the 05 gate workflow runs it on a push of `head` to `branch`.
+fn gate_ci_push(s: &Sandbox, secret: &str, branch: &str, head: &str) -> Output {
+    let event = serde_json::json!({
+        "workflow_run": { "event": "push", "head_sha": head, "head_branch": branch, "head_repository": { "full_name": "acme/app" }, "pull_requests": [] },
+        "repository": { "full_name": "acme/app", "default_branch": "main" },
+    });
+    let (api, server) = statuses_api(2);
+    let summary = s.home.path().join("summary.md");
+    let out = gate_workflow_run_with(s, Some(secret), &event, &api, &summary, &[("USE05_RECORD_TRIES", "1")]);
+    let _ = server.join();
+    out
+}
+
+fn promotion_fixture_in(s: Sandbox, policy: &str) -> (Sandbox, TempDir) {
+    fs::create_dir_all(s.path(".05")).unwrap();
+    s.write(".05/policy.toml", policy);
+    s.commit_all("base");
+    s.git(&["branch", "uat"]);
+    s.git(&["branch", "prod"]);
+    let remote = tempfile::tempdir().unwrap();
+    let remote_path = remote.path().display().to_string();
+    assert!(Command::new("git").args(["init", "-q", "--bare", "-b", "main", &remote_path]).status().unwrap().success());
+    s.git(&["remote", "add", "origin", &remote_path]);
+    s.write("feature.rs", "pub fn feature() {}\n");
+    s.commit_all("Add the feature");
+    s.git(&["branch", "-f", "uat", "main"]);
+    s.git(&["push", "-q", "origin", "main", "uat", "prod"]);
+    let proved = s.run(&["prove", "--tree", "origin/uat"]);
+    assert_eq!(code(&proved), 0, "{}", text(&proved));
+    (s, remote)
+}
+
+/// Every ref here and on the remote, with what it points at.
+fn all_refs(s: &Sandbox, remote: &TempDir) -> (String, String) {
+    let here = s.git(&["for-each-ref", "--format=%(refname) %(objectname)"]);
+    let out = Command::new("git").arg("-C").arg(remote.path()).args(["for-each-ref", "--format=%(refname) %(objectname)"]).output().unwrap();
+    (here, String::from_utf8_lossy(&out.stdout).to_string())
+}
+
+#[test]
+fn promote_check_lists_every_rule_and_changes_nothing() {
+    let (s, remote) = promotion_fixture("");
+    let before = (all_refs(&s, &remote), s.git(&["status", "--porcelain"]));
+    let out = s.run(&["promote", "prod", "--check", "--json"]);
+    let j = json(&out);
+    assert_eq!(code(&out), 0, "{}", text(&out));
+    assert_eq!((j["command"].as_str(), j["code"].as_str(), j["outcome"].as_str()), (Some("promote"), Some("PROMOTE_CHECKED"), Some("allow")), "{j:#}");
+    let d = &j["details"];
+    assert_eq!((d["env"].as_str(), d["from"].as_str(), d["decision"].as_str(), d["how"].as_str()), (Some("prod"), Some("uat"), Some("allow"), Some("fast-forward")));
+    let rules: Vec<&str> = d["rules"].as_array().unwrap().iter().map(|r| r["rule"].as_str().unwrap()).collect();
+    assert_eq!(rules, ["source_checks", "source_confirmed", "soak", "migrations", "untasked", "sign_off"]);
+    let outcome = |name: &str| d["rules"].as_array().unwrap().iter().find(|r| r["rule"] == name).unwrap()["outcome"].as_str().unwrap().to_string();
+    assert_eq!(outcome("source_checks"), "pass", "proved on uat's head: {d:#}");
+    assert_eq!((outcome("source_confirmed"), outcome("untasked")), ("fail".to_string(), "fail".to_string()), "no deployment record, and the commit is no task's: {d:#}");
+    assert_eq!(d["delta"].as_array().unwrap().len(), 1);
+    assert_eq!(d["source_head"], s.git(&["rev-parse", "uat"]));
+    assert_eq!(d["rollback_point"], s.git(&["rev-parse", "prod"]));
+    assert_eq!(d["rules_from"], "prod's policy (origin/prod)");
+    let codes: Vec<&str> = d["findings"].as_array().unwrap().iter().map(|f| f["code"].as_str().unwrap()).collect();
+    assert!(codes.contains(&"SOURCE_NOT_CONFIRMED") && codes.contains(&"UNTASKED_COMMITS"), "{codes:?}");
+    assert_eq!((all_refs(&s, &remote), s.git(&["status", "--porcelain"])), before, "a check moves no branch, here or on origin, and touches no file");
+    snapshot("promote_check", &s, &s.run(&["promote", "prod", "--check"]));
+    assert_eq!((all_refs(&s, &remote), s.git(&["status", "--porcelain"])), before);
+}
+
+#[test]
+fn brief_promote_is_the_one_page_for_a_promotion() {
+    let (s, remote) = promotion_fixture("\n[environment.sign_off]\nquestions = [\"What did you check in uat?\"]\n\n[[environment.confirm]]\ntext = \"The release notes are published\"\n");
+    let before = all_refs(&s, &remote);
+    let out = s.run(&["brief", "--promote", "prod"]);
+    assert_eq!(code(&out), 3, "a statement only a person can give needs their sign-off: {}", text(&out));
+    snapshot("brief_promote", &s, &out);
+    let j = json(&s.run(&["brief", "--promote", "prod", "--json"]));
+    assert_eq!((j["command"].as_str(), j["decision"].as_str()), (Some("brief"), Some("approval_required")), "{j:#}");
+    assert_eq!(j["promotion"]["rules"].as_array().unwrap().len(), 6);
+    assert!(j["promotion"]["findings"].as_array().unwrap().iter().any(|f| f["code"] == "SIGNOFF_REQUIRED"), "{j:#}");
+    assert_eq!(all_refs(&s, &remote), before);
+}
+
+/// Every receipt on this repository's receipts branches: the envelope and its statement. A task's
+/// sealed log copy (`logs/<task>.jsonl`) is no receipt.
+fn envelopes(s: &Sandbox) -> Vec<(Value, Value)> {
+    use base64::Engine;
+    s.stored_receipts()
+        .iter()
+        .filter(|(_, path)| path.ends_with(".json"))
+        .map(|(branch, path)| {
+            let envelope: Value = serde_json::from_str(&s.git(&["show", &format!("{branch}:{path}")])).unwrap();
+            let body = base64::engine::general_purpose::STANDARD.decode(envelope["payload"].as_str().unwrap()).unwrap();
+            let statement = serde_json::from_slice(&body).unwrap();
+            (envelope, statement)
+        })
+        .collect()
+}
+
+/// The statements of one record type here, by its last word: `promotion`, `signoff`, `bypass`.
+fn records(s: &Sandbox, kind: &str) -> Vec<Value> {
+    envelopes(s).into_iter().map(|(_, st)| st).filter(|st| st["predicateType"] == format!("https://use05.dev/{kind}/v0")).collect()
+}
+
+fn remote_git(remote: &TempDir, args: &[&str]) -> String {
+    let out = Command::new("git").arg("-C").arg(remote.path()).args(args).output().unwrap();
+    assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+    String::from_utf8_lossy(&out.stdout).trim().to_string()
+}
+
+#[test]
+fn promote_fast_forwards_pushes_and_files_a_record() {
+    let (s, remote) = promotion_fixture("agent = true\n");
+    let (prod, uat) = (s.git(&["rev-parse", "prod"]), s.git(&["rev-parse", "uat"]));
+    let out = s.run(&["promote", "prod"]);
+    assert_eq!(code(&out), 0, "{}", text(&out));
+    snapshot("promote", &s, &out);
+    assert_eq!(remote_git(&remote, &["rev-parse", "prod"]), uat, "origin's prod is uat's head");
+    assert_eq!(s.git(&["rev-parse", "prod"]), uat, "this machine's prod, checked out nowhere, follows");
+    assert_eq!(s.git(&["worktree", "list"]).lines().count(), 1, "no worktree was made or left for a fast-forward");
+
+    let promotions = records(&s, "promotion");
+    assert_eq!(promotions.len(), 1, "one record");
+    let (st, p) = (&promotions[0], &promotions[0]["predicate"]);
+    assert_eq!(st["subject"][0]["digest"]["gitCommit"], uat, "its subject is the source commit");
+    assert_eq!((p["env"].as_str(), p["from"].as_str(), p["direction"].as_str(), p["how"].as_str()), (Some("prod"), Some("uat"), Some("up"), Some("fast-forward")));
+    assert_eq!((p["source_commit"].as_str(), p["result_commit"].as_str()), (Some(uat.as_str()), Some(uat.as_str())));
+    assert_eq!((p["target_before"].as_str(), p["rollback_point"].as_str()), (Some(prod.as_str()), Some(prod.as_str())));
+    assert_eq!(p["rules"].as_array().unwrap().len(), 6);
+    assert_eq!(p["policy_sha256"], policy_of(&s).digest());
+    assert!(all_refs(&s, &remote).1.contains("refs/heads/05-receipts/"), "the record went to origin on the receipts branch");
+
+    // Moved, so there is nothing left to promote; the record counts the commit as moved by 05.
+    let again = s.run(&["promote", "prod", "--json"]);
+    assert_eq!((code(&again), json(&again)["code"].as_str()), (0, Some("NOTHING_TO_PROMOTE")), "{}", text(&again));
+    assert_eq!(records(&s, "promotion").len(), 1, "nothing moved, so no new record");
+}
+
+#[test]
+fn ci_holds_a_push_to_prod_without_a_promotion_record() {
+    let (s, _remote, secret) = ci_promotion_fixture("agent = true\n");
+    let uat = s.git(&["rev-parse", "uat"]);
+    // Pushed by hand, past 05: no record says this move was made.
+    s.git(&["push", "-q", "origin", "uat:prod"]);
+    let out = gate_ci_push(&s, &secret, "prod", &uat);
+    assert_eq!(code(&out), 2, "{}", text(&out));
+    assert!(finding_codes(&out).contains(&"PROMOTION_RECORD_MISSING".to_string()), "{:?}", finding_codes(&out));
+}
+
+#[test]
+fn ci_allows_a_push_to_prod_with_a_counted_record() {
+    let (s, _remote, secret) = ci_promotion_fixture("agent = true\n");
+    let out = s.run(&["promote", "prod", "--no-wait"]);
+    assert_eq!(code(&out), 0, "{}", text(&out));
+    let prod = s.git(&["rev-parse", "origin/prod"]);
+    let out = gate_ci_push(&s, &secret, "prod", &prod);
+    assert_eq!(code(&out), 0, "{}", text(&out));
+    let codes = finding_codes(&out);
+    assert!(codes.contains(&"PROMOTION_RECORD".to_string()), "{codes:?}");
+    assert!(!codes.iter().any(|c| c == "PROMOTE_NOT_EVALUATED_MOVE" || c == "AGENT_MAY_NOT_PROMOTE"), "judged as of before the push: {codes:?}");
+    // Judged as of before the push, and put back after: origin's copies are as they were.
+    assert_eq!(s.git(&["rev-parse", "origin/prod"]), prod);
+}
+
+#[test]
+fn ci_holds_a_hand_push_on_top_of_a_promotion() {
+    let (s, _remote, secret) = ci_promotion_fixture("agent = true\n");
+    assert_eq!(code(&s.run(&["promote", "prod", "--no-wait"])), 0);
+    // Someone adds a commit to prod by hand: the record names the commit before it, not this one.
+    s.git(&["checkout", "-q", "prod"]);
+    s.write("sneaky.rs", "pub fn sneaky() {}\n");
+    s.commit_all("Sneak something onto prod");
+    s.git(&["push", "-q", "origin", "prod"]);
+    let out = gate_ci_push(&s, &secret, "prod", &s.git(&["rev-parse", "prod"]));
+    assert_eq!(code(&out), 2, "{}", text(&out));
+    assert!(finding_codes(&out).contains(&"PROMOTION_RECORD_MISSING".to_string()), "{:?}", finding_codes(&out));
+}
+
+#[test]
+fn ci_allows_a_counted_revert_and_holds_one_without_its_record() {
+    let (s, _remote, secret) = ci_promotion_fixture("agent = true\n");
+    let before = s.git(&["rev-parse", "prod"]);
+    assert_eq!(code(&s.run(&["promote", "prod", "--no-wait"])), 0);
+    let out = s.run(&["promote", "prod", "--rollback", "--no-wait"]);
+    assert_eq!(code(&out), 0, "{}", text(&out));
+    let reverted = s.git(&["rev-parse", "origin/prod"]);
+    assert_eq!(s.git(&["rev-parse", &format!("{reverted}^{{tree}}")]), s.git(&["rev-parse", &format!("{before}^{{tree}}")]), "the revert holds the rollback point's files");
+    let out = gate_ci_push(&s, &secret, "prod", &reverted);
+    assert_eq!(code(&out), 0, "a counted revert goes through: {}", text(&out));
+
+    // The same kind of commit made by hand, with no record: held.
+    s.git(&["checkout", "-q", "prod"]);
+    s.git(&["reset", "-q", "--hard", "origin/prod"]);
+    s.write("again.rs", "pub fn again() {}\n");
+    s.commit_all("Change prod by hand");
+    s.git(&["push", "-q", "origin", "prod"]);
+    let out = gate_ci_push(&s, &secret, "prod", &s.git(&["rev-parse", "prod"]));
+    assert_eq!(code(&out), 2, "{}", text(&out));
+    assert!(finding_codes(&out).contains(&"PROMOTION_RECORD_MISSING".to_string()), "{:?}", finding_codes(&out));
+}
+
+#[test]
+fn ci_allows_a_hotfix_landing_and_a_merge_back_by_their_records() {
+    let (s, remote, secret) = ci_promotion_fixture("");
+    let (_task, fix) = hotfix_ready(&s);
+    let approved = s.run_with_stdin(&["approve", "--outcome", "--tree", "HEAD", "--passphrase-stdin"], "correct horse\n");
+    assert_eq!(code(&approved), 0, "{}", text(&approved));
+    with_pre_push_hook(&s);
+    let landed = s.run(&["land", "--push", "--json"]);
+    assert_eq!((code(&landed), json(&landed)["code"].as_str()), (0, Some("LANDED")), "{}", text(&landed));
+    assert_eq!(remote_git(&remote, &["rev-parse", "prod"]), fix);
+    // CI has no task store of this machine's: it rebuilds the hotfix from its record, and its
+    // approval, which names the hotfix and is signed by a key the policy lists, counts.
+    let out = gate_ci_push(&s, &secret, "prod", &fix);
+    assert_eq!(code(&out), 0, "{}", text(&out));
+    assert!(finding_codes(&out).contains(&"HOTFIX_LANDING".to_string()), "{:?}", finding_codes(&out));
+
+    // Merged back into uat by 05, with its record: allowed in CI too.
+    s.git(&["checkout", "-q", "main"]);
+    let back = s.run(&["promote", "uat", "--back", "--json"]);
+    assert_eq!((code(&back), json(&back)["code"].as_str()), (0, Some("MERGED_BACK")), "{}", text(&back));
+    let uat = remote_git(&remote, &["rev-parse", "uat"]);
+    s.git(&["fetch", "-q", "origin"]);
+    let out = gate_ci_push(&s, &secret, "uat", &uat);
+    assert_eq!(code(&out), 0, "{}", text(&out));
+}
+
+#[test]
+fn ci_holds_a_promotion_record_signed_on_a_machine_when_only_ci_counts() {
+    // Only CI's evidence counts: a record a developer's machine signs is not enough.
+    let (s, _remote, secret) = ci_promotion_fixture("agent = true\n\n[evidence]\naccept = [\"runner\"]\n");
+    s.git(&["push", "-q", "origin", "uat:prod"]);
+    let out = gate_ci_push(&s, &secret, "prod", &s.git(&["rev-parse", "uat"]));
+    assert_eq!(code(&out), 2, "{}", text(&out));
+    let j = json(&out);
+    let said = j["brief"]["gate"]["findings"].as_array().unwrap().iter().find(|f| f["code"] == "PROMOTION_RECORD_MISSING").map(|f| f["message"].as_str().unwrap_or_default().to_string()).unwrap_or_default();
+    assert!(said.contains("promote from CI"), "{said}");
+}
+
+#[test]
+fn promote_merge_makes_a_merge_commit_with_trailers() {
+    let (s, remote) = promotion_fixture("how = \"merge\"\nagent = true\n");
+    let (prod, uat) = (s.git(&["rev-parse", "prod"]), s.git(&["rev-parse", "uat"]));
+    let out = s.run(&["promote", "prod", "--json"]);
+    assert_eq!((code(&out), json(&out)["code"].as_str()), (0, Some("PROMOTED")), "{}", text(&out));
+    let merge = remote_git(&remote, &["rev-parse", "prod"]);
+    assert_eq!(json(&out)["details"]["result_commit"], merge);
+    assert_eq!(remote_git(&remote, &["rev-list", "--parents", "-n", "1", &merge]), format!("{merge} {prod} {uat}"), "a merge commit on prod's head, with uat's as its second parent");
+    assert_eq!(remote_git(&remote, &["rev-parse", &format!("{merge}^{{tree}}")]), s.git(&["rev-parse", "uat^{tree}"]), "it holds exactly uat's tree");
+    let message = remote_git(&remote, &["log", "-1", "--format=%B", &merge]);
+    assert!(message.starts_with(&format!("Promote uat into prod ({})", &uat[..12])), "{message}");
+    let mut parse = Command::new("git").args(["interpret-trailers", "--parse"]).stdin(Stdio::piped()).stdout(Stdio::piped()).spawn().unwrap();
+    std::io::Write::write_all(&mut parse.stdin.take().unwrap(), message.as_bytes()).unwrap();
+    let trailers = String::from_utf8(parse.wait_with_output().unwrap().stdout).unwrap();
+    let lines: Vec<&str> = trailers.lines().collect();
+    assert_eq!(lines[..2], ["05-Promotion: prod from uat".to_string(), format!("05-Source: {uat}")], "git reads them as trailers: {trailers}");
+    assert!(lines[2].starts_with("05-Rules: source_checks=pass,source_confirmed=fail,soak=skipped,"), "{trailers}");
+    let promotions = records(&s, "promotion");
+    assert_eq!((promotions[0]["predicate"]["result_commit"].as_str(), promotions[0]["predicate"]["how"].as_str()), (Some(merge.as_str()), Some("merge")));
+    assert_eq!(s.git(&["worktree", "list"]).lines().count(), 1, "the temporary worktree is gone");
+    assert_eq!(s.git(&["status", "--porcelain"]), "", "the person's checkout was not touched");
+    // A merge that brings nothing of its own does not put prod ahead: nothing is left to promote.
+    let again = s.run(&["promote", "prod", "--json"]);
+    assert_eq!((code(&again), json(&again)["code"].as_str()), (0, Some("NOTHING_TO_PROMOTE")), "{}", text(&again));
+}
+
+#[test]
+fn a_refused_push_leaves_no_record_and_restores_the_branch() {
+    for how in ["fast-forward", "merge"] {
+        let (s, remote) = promotion_fixture(&format!("how = \"{how}\"\nagent = true\n"));
+        let hook = remote.path().join("hooks").join("pre-receive");
+        fs::write(&hook, "#!/bin/sh\necho \"prod is frozen today\" >&2\nexit 1\n").unwrap();
+        fs::set_permissions(&hook, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+        let before = all_refs(&s, &remote);
+        let out = s.run(&["promote", "prod", "--json"]);
+        let j = json(&out);
+        assert_eq!((code(&out), j["code"].as_str()), (4, Some("PROMOTE_PUSH_FAILED")), "{how}: {}", text(&out));
+        assert!(j["message"].as_str().unwrap().contains("remote: prod is frozen today"), "git's own first line: {j:#}");
+        assert!(j["notes"][0].as_str().unwrap().contains("no promotion record was written"), "{j:#}");
+        assert_eq!(all_refs(&s, &remote), before, "{how}: no branch moved, here or on origin, and nothing else was pushed");
+        assert!(records(&s, "promotion").is_empty(), "{how}: no record");
+        assert_eq!(s.git(&["worktree", "list"]).lines().count(), 1, "{how}: no worktree left behind");
+        assert_eq!(s.git(&["status", "--porcelain"]), "");
+    }
+}
+
+#[test]
+fn a_promotion_whose_record_did_not_reach_origin_says_so() {
+    let (s, remote) = promotion_fixture("agent = true\n");
+    // Origin takes prod, and refuses every receipts branch.
+    let hook = remote.path().join("hooks").join("pre-receive");
+    fs::write(&hook, "#!/bin/sh\nwhile read old new ref; do case \"$ref\" in refs/heads/05-receipts/*) echo \"no receipts here\" >&2; exit 1;; esac; done\nexit 0\n").unwrap();
+    fs::set_permissions(&hook, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+    let out = s.run(&["promote", "prod", "--json"]);
+    let j = json(&out);
+    assert_eq!((code(&out), j["code"].as_str(), j["details"]["record_on_origin"].as_bool()), (0, Some("PROMOTED_WITHOUT_RECORD"), Some(false)), "{}", text(&out));
+    assert!(j["message"].as_str().unwrap().ends_with("but its record is not on origin"), "{j:#}");
+    assert!(j["next"].as_str().unwrap().starts_with("git push origin 05-receipts/"), "{j:#}");
+    assert!(j["notes"].as_array().unwrap().iter().any(|n| n.as_str().unwrap().contains("CI holds prod's branch")), "{j:#}");
+    assert_eq!(remote_git(&remote, &["rev-parse", "prod"]), s.git(&["rev-parse", "uat"]), "the promotion itself went through");
+    assert_eq!(records(&s, "promotion").len(), 1, "the record is stored here");
+}
+
+/// Install 05's pre-push hook, as `use05 init` does.
+fn with_pre_push_hook(s: &Sandbox) {
+    let hook = s.path(".git").join("hooks").join("pre-push");
+    fs::write(&hook, "#!/bin/sh\nuse05 gate --git-hook pre-push \"$@\"\n").unwrap();
+    fs::set_permissions(&hook, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+}
+
+/// A `git push` by hand, through the hooks, with `use05` on PATH, and with no terminal (as from a
+/// script or CI), whatever terminal these tests run in.
+fn hand_push(s: &Sandbox, args: &[&str]) -> Output {
+    hand_push_as(s, args, &[])
+}
+
+/// Like `hand_push`, with these variables set too (an agent's session id, say).
+fn hand_push_as(s: &Sandbox, args: &[&str], envs: &[(&str, &str)]) -> Output {
+    use std::os::unix::process::CommandExt;
+    let mut cmd = Command::new("git");
+    // SAFETY: setsid is async-signal-safe; the push runs in a new session with no controlling terminal.
+    unsafe {
+        cmd.pre_exec(|| {
+            libc::setsid();
+            Ok(())
+        });
+    }
+    cmd.current_dir(s.dir.path()).arg("push").args(args).env("PATH", format!("{}:{}", bin_dir(), std::env::var("PATH").unwrap())).env("USE05_HOME", s.home.path()).env("HOME", s.home.path()).env("USE05_NO_TOUCH_ID", "1").env("LANG", "C.UTF-8").env("COLUMNS", "100");
+    for var in ["CLAUDE_CODE_SESSION_ID", "CODEX_SESSION_ID", "USE05_SESSION_ID"] {
+        cmd.env_remove(var);
+    }
+    cmd.envs(envs.iter().copied());
+    cmd.stdin(Stdio::null()).output().unwrap()
+}
+
+#[test]
+fn the_pre_push_hook_judges_an_environment_push_as_its_promotion() {
+    // What moves changes the policy file, which the task gate would hold for a person; the
+    // promotion's rules allow it, and the hook judges the push by those.
+    let (s, remote) = promotion_fixture("agent = true\n");
+    s.write(".05/policy.toml", &(fs::read_to_string(s.path(".05/policy.toml")).unwrap() + "\n# a note\n"));
+    s.commit_all("Note in the policy");
+    s.git(&["branch", "-f", "uat", "main"]);
+    s.git(&["push", "-q", "origin", "main", "uat"]);
+    assert_eq!(code(&s.run(&["prove", "--tree", "origin/uat"])), 0);
+    with_pre_push_hook(&s);
+    let out = s.run(&["promote", "prod", "--json"]);
+    assert_eq!((code(&out), json(&out)["code"].as_str()), (0, Some("PROMOTED")), "{}", text(&out));
+    assert_eq!(remote_git(&remote, &["rev-parse", "prod"]), s.git(&["rev-parse", "uat"]));
+
+    // A push by hand that is not the move 05 judged is held, here, by the same rules.
+    s.git(&["checkout", "-q", "-b", "other", "prod"]);
+    s.write("hotfix.rs", "pub fn fix() {}\n");
+    s.commit_all("Fix prod by hand");
+    s.git(&["checkout", "-q", "main"]);
+    let held = hand_push(&s, &["origin", "other:prod"]);
+    assert!(!held.status.success(), "{}", text(&held));
+    assert!(text(&held).contains("PROMOTE_NOT_EVALUATED_MOVE") && text(&held).contains("use05 promote prod"), "{}", text(&held));
+    assert!(!text(&held).contains("use05 bypass"), "no bypass clears what is built in: {}", text(&held));
+    assert_eq!(remote_git(&remote, &["rev-parse", "prod"]), s.git(&["rev-parse", "uat"]), "origin's prod did not move");
+}
+
+#[test]
+fn an_environment_push_that_cannot_be_judged_is_held() {
+    let (s, remote) = promotion_fixture("agent = true\n");
+    // The source is gone everywhere, so the promotion into prod cannot be judged.
+    s.git(&["push", "-q", "origin", ":uat"]);
+    s.git(&["branch", "-D", "uat"]);
+    s.git(&["update-ref", "-d", "refs/remotes/origin/uat"]);
+    with_pre_push_hook(&s);
+    s.git(&["checkout", "-q", "-b", "fix-a", "prod"]);
+    s.write("hotfix.rs", "pub fn fix() {}\n");
+    s.commit_all("Fix prod by hand");
+    s.git(&["checkout", "-q", "main"]);
+    let before = remote_git(&remote, &["rev-parse", "prod"]);
+    let held = hand_push(&s, &["origin", "fix-a:prod"]);
+    assert!(!held.status.success(), "it must not fail open: {}", text(&held));
+    assert!(text(&held).contains("PROMOTE_NOT_JUDGED") && !text(&held).contains("NOT blocked"), "{}", text(&held));
+    assert_eq!(remote_git(&remote, &["rev-parse", "prod"]), before, "origin's prod did not move");
+}
+
+#[test]
+fn a_hand_push_where_people_promote_needs_a_person_at_a_terminal() {
+    // prod is the last rung: kept for people. A script or CI pushing uat to it is held.
+    let (s, remote) = promotion_fixture("");
+    with_pre_push_hook(&s);
+    let before = remote_git(&remote, &["rev-parse", "prod"]);
+    let held = hand_push(&s, &["origin", "uat:prod"]);
+    assert!(!held.status.success(), "{}", text(&held));
+    assert!(text(&held).contains("AGENT_MAY_NOT_PROMOTE") && text(&held).contains("nothing here shows a person pushing"), "{}", text(&held));
+    assert_eq!(remote_git(&remote, &["rev-parse", "prod"]), before);
+    // A person at a terminal promotes it, through the same hook.
+    s.approver();
+    let (exit, screen) = on_a_terminal(&s, &["promote", "prod"], &["correct horse"]);
+    assert_eq!(exit, 0, "{screen}");
+    assert_eq!(remote_git(&remote, &["rev-parse", "prod"]), s.git(&["rev-parse", "uat"]));
+}
+
+#[test]
+fn deleting_an_environment_branch_is_held_without_a_person() {
+    let (s, remote) = promotion_fixture("");
+    s.git(&["push", "-q", "origin", "main:agent/old-work"]);
+    with_pre_push_hook(&s);
+    for branch in ["uat", "prod", "main"] {
+        let held = hand_push(&s, &["origin", &format!(":{branch}")]);
+        assert!(!held.status.success(), "{branch}: {}", text(&held));
+        assert!(text(&held).contains("ENVIRONMENT_DELETE_HELD"), "{branch}: {}", text(&held));
+        assert!(remote_git(&remote, &["branch", "--list", branch]).contains(branch), "{branch} is still on origin");
+    }
+    // An agent's working branch is not kept: deleting it is fine.
+    let gone = hand_push(&s, &["origin", "--delete", "agent/old-work"]);
+    assert!(gone.status.success(), "{}", text(&gone));
+    // The agent hooks refuse it before it runs.
+    let payload = serde_json::json!({ "session_id": "sess-1234abcd", "cwd": s.dir.path(), "hook_event_name": "PreToolUse", "tool_name": "Bash", "tool_input": { "command": "git push origin --delete prod" } }).to_string();
+    let out = s.run_with_stdin(&["hook", "claude-code", "PreToolUse"], &payload);
+    let v: Value = serde_json::from_slice(&out.stdout).unwrap_or(Value::Null);
+    assert_eq!(v["hookSpecificOutput"]["permissionDecision"], "deny", "{}", text(&out));
+}
+
+#[test]
+fn deleting_an_environment_branch_is_held_from_a_checkout_whose_policy_names_none() {
+    let (s, remote) = promotion_fixture("");
+    // This checkout's policy knows no environments: prod is kept by prod's own policy and
+    // origin's default branch's, and those decide too.
+    s.git(&["checkout", "-q", "-b", "elsewhere"]);
+    s.write(".05/policy.toml", "[[check]]\nname = \"test\"\nrun = [\"./test.sh\"]\n");
+    s.commit_all("A policy with no environments");
+    with_pre_push_hook(&s);
+    let held = hand_push(&s, &["origin", ":prod"]);
+    assert!(!held.status.success(), "{}", text(&held));
+    assert!(text(&held).contains("ENVIRONMENT_DELETE_HELD"), "{}", text(&held));
+    assert!(remote_git(&remote, &["branch", "--list", "prod"]).contains("prod"), "prod is still on origin");
+    // The agent hooks read the same policies, from git, with no network.
+    let payload = serde_json::json!({ "session_id": "sess-1234abcd", "cwd": s.dir.path(), "hook_event_name": "PreToolUse", "tool_name": "Bash", "tool_input": { "command": "git push origin :prod" } }).to_string();
+    let out = s.run_with_stdin(&["hook", "claude-code", "PreToolUse"], &payload);
+    let v: Value = serde_json::from_slice(&out.stdout).unwrap_or(Value::Null);
+    assert_eq!(v["hookSpecificOutput"]["permissionDecision"], "deny", "{}", text(&out));
+}
+
+#[test]
+fn a_hand_push_of_the_source_to_an_environment_is_held_by_its_rules() {
+    let (s, remote) = promotion_fixture("agent = true\n\n[environment.rules]\nuntasked = \"deny\"\n");
+    with_pre_push_hook(&s);
+    let before = remote_git(&remote, &["rev-parse", "prod"]);
+    let held = hand_push(&s, &["origin", "uat:prod"]);
+    assert!(!held.status.success(), "{}", text(&held));
+    assert!(text(&held).contains("UNTASKED_COMMITS") && text(&held).contains("use05 bypass --promote prod --rule"), "a rule a bypass can clear says how: {}", text(&held));
+    assert_eq!(remote_git(&remote, &["rev-parse", "prod"]), before);
+    // The landing branch keeps the task gate: an ordinary change there still goes through.
+    s.write("more.rs", "pub fn more() {}\n");
+    s.commit_all("More");
+    assert_eq!(code(&s.run(&["prove", "--tree", "HEAD"])), 0);
+    let landed = hand_push(&s, &["origin", "main"]);
+    assert!(landed.status.success(), "{}", text(&landed));
+}
+
+#[test]
+fn an_agent_cannot_promote_where_agent_is_false() {
+    let (s, remote) = promotion_fixture("");
+    let before = all_refs(&s, &remote);
+    // Under an agent the rules deny it, whatever else holds.
+    let out = s.run_env(&["promote", "prod", "--json"], &[("CLAUDE_CODE_SESSION_ID", "s-1")]);
+    assert_eq!((code(&out), json(&out)["code"].as_str()), (2, Some("AGENT_MAY_NOT_PROMOTE")), "{}", text(&out));
+    assert!(json(&out)["message"].as_str().unwrap().ends_with("nothing moved"), "{}", text(&out));
+    // No agent session, and no terminal either (CI, a pipe): nothing proves a person, so it fails closed.
+    let out = s.run(&["promote", "prod", "--json"]);
+    assert_eq!((code(&out), json(&out)["code"].as_str()), (3, Some("NEEDS_A_PERSON")), "{}", text(&out));
+    // The agent's hooks hold it before it runs; checking it is anyone's.
+    let hook = |command: &str| {
+        let payload = serde_json::json!({ "session_id": "sess-1234abcd", "cwd": s.dir.path(), "hook_event_name": "PreToolUse", "tool_name": "Bash", "tool_input": { "command": command } }).to_string();
+        let out = s.run_with_stdin(&["hook", "claude-code", "PreToolUse"], &payload);
+        let v: Value = serde_json::from_slice(&out.stdout).unwrap_or(Value::Null);
+        (v["hookSpecificOutput"]["permissionDecision"].as_str().map(str::to_string), text(&out))
+    };
+    let (held, why) = hook("use05 promote prod");
+    assert_eq!(held.as_deref(), Some("deny"), "{why}");
+    assert!(why.contains("use05 promote prod --check"), "{why}");
+    assert_eq!(hook("use05 promote prod --check").0, None);
+    assert_eq!(hook("use05 promote uat").0, None, "below the last rung an agent may");
+    assert_eq!(all_refs(&s, &remote), before, "nothing moved, here or on origin");
+    assert!(records(&s, "promotion").is_empty());
+    let help = s.run(&["promote", "--help"]);
+    assert!(text(&help).contains("use05 approve --promote prod"), "{}", text(&help));
+}
+
+#[test]
+fn a_person_at_a_terminal_promotes_where_agents_may_not_and_signs_the_record() {
+    let (s, remote) = promotion_fixture("");
+    s.approver();
+    let (exit, screen) = on_a_terminal(&s, &["promote", "prod"], &["correct horse"]);
+    assert_eq!(exit, 0, "{screen}");
+    assert!(screen.contains("You are about to promote") && screen.contains("Promoted uat → prod"), "{screen}");
+    assert!(!screen.contains("correct horse"), "{screen}");
+    let uat = s.git(&["rev-parse", "uat"]);
+    assert_eq!(remote_git(&remote, &["rev-parse", "prod"]), uat);
+    let signed: Vec<(Value, Value)> = envelopes(&s).into_iter().filter(|(_, st)| st["predicateType"] == "https://use05.dev/promotion/v0").collect();
+    assert_eq!(signed.len(), 1);
+    assert_eq!(signed[0].0["signatures"].as_array().unwrap().len(), 2, "this machine's signature and the person's: {:#}", signed[0].0);
+    assert_eq!(signed[0].1["predicate"]["by"], "approver", "the person, as this machine names them");
+
+    // The person's own key verifies it, and 05 reads the machine as its signer and the person as
+    // its co-signer, whichever order the policy lists them in.
+    let public = |file: &str| fs::read_to_string(s.home.path().join(file)).unwrap().trim().to_string();
+    let (machine, person) = (public("local.pub"), public("approver.pub"));
+    let at = envelopes(&s).iter().position(|(_, st)| st["predicateType"] == "https://use05.dev/promotion/v0").unwrap();
+    let (branch, path) = s.stored_receipts()[at].clone();
+    let bytes = s.git(&["show", &format!("{branch}:{path}")]).into_bytes();
+    assert!(use05_receipt::verify_any(&bytes, &use05_receipt::parse_public_key(&person).unwrap()).is_ok(), "the person's signature checks out with their key");
+    let laptop = format!("[[trust.key]]\nname = \"laptop\"\nrole = \"local\"\npublic = \"{machine}\"\n\n");
+    let me = format!("[[trust.key]]\nname = \"alex\"\nrole = \"approver\"\npublic = \"{person}\"\nperson = \"Alex Rivera\"\n\n");
+    for keys in [format!("{laptop}{me}"), format!("{me}{laptop}")] {
+        let trust = use05_core::evidence::Trust::new(&use05_core::policy::Policy::parse(&keys).unwrap(), false);
+        let found = use05_core::evidence::classify(&trust, &[use05_core::store::Raw { source: branch.clone(), path: path.clone(), bytes: bytes.clone() }]);
+        assert_eq!(found.promotions.len(), 1, "{keys}");
+        let p = &found.promotions[0];
+        assert_eq!((p.signer.name.as_str(), p.cosigners.iter().map(|c| c.name.as_str()).collect::<Vec<_>>()), ("laptop", vec!["alex"]), "{keys}");
+        assert_eq!(trust.person_of(&p.cosigners[0].key_id).as_deref(), Some("Alex Rivera"));
+    }
+}
+
+const SIGN_OFF_RULES: &str = "\n[environment.rules]\nsign_off = \"approval\"\n\n[environment.sign_off]\nmin_length = 20\nquestions = [\"What did you check in uat?\"]\n\n[[environment.confirm]]\ntext = \"The release notes are published\"\n";
+
+#[test]
+fn a_signoff_shorter_than_min_length_is_refused() {
+    let (s, _remote) = promotion_fixture(SIGN_OFF_RULES);
+    s.approver();
+    let confirm = "The release notes are published";
+    let (exit, screen) = on_a_terminal(&s, &["approve", "--promote", "prod", "--note", "looks fine", "--answer", "checkout", "--confirm", confirm], &[]);
+    assert_eq!(exit, 6, "{screen}");
+    assert!(screen.contains("your words are 10 characters; prod asks for at least 20"), "{screen}");
+    assert!(records(&s, "signoff").is_empty(), "nothing was signed");
+    assert_eq!(code(&s.run(&["promote", "prod", "--check"])), 3, "still waiting for a sign-off");
+
+    // At a terminal, what no flag gives is asked: the words, each question, each statement.
+    let (exit, screen) = on_a_terminal(&s, &["approve", "--promote", "prod"], &["Tried checkout in uat for an hour", "checkout and refunds", "y", "correct horse"]);
+    assert_eq!(exit, 0, "{screen}");
+    assert!(screen.contains("What did you check in uat?") && screen.contains("Confirm: The release notes are published? [y/N]"), "{screen}");
+    assert!(screen.contains("Signed off on promoting"), "{screen}");
+    let signoffs = records(&s, "signoff");
+    assert_eq!(signoffs.len(), 1);
+    let p = &signoffs[0]["predicate"];
+    assert_eq!((p["text"].as_str(), p["answers"][0].as_str(), p["confirmations"][0].as_str()), (Some("Tried checkout in uat for an hour"), Some("checkout and refunds"), Some(confirm)));
+    assert_eq!(signoffs[0]["subject"][0]["digest"]["gitCommit"], s.git(&["rev-parse", "uat"]));
+    let out = s.run(&["promote", "prod", "--check", "--json"]);
+    assert_eq!((code(&out), rule_outcome(&out, "sign_off")), (0, "pass".to_string()), "{}", text(&out));
+}
+
+#[test]
+fn a_signoff_for_a_passkey_is_prepared_unsigned_and_filed_signed() {
+    let dana = use05_receipt::SigningKey::from_bytes(&[21; 32]);
+    let (s, _remote) = promotion_fixture_with(&key_entry("dana", "approver", &dana, Some("Dana")), SIGN_OFF_RULES);
+    let confirm = "The release notes are published";
+    // Without a terminal nothing can be asked, so every answer comes by flag.
+    let out = s.run(&["approve", "--promote", "prod", "--unsigned", "--approver", "Dana", "--note", "Tried checkout in uat for an hour", "--json"]);
+    assert_eq!((code(&out), json(&out)["code"].as_str()), (6, Some("ANSWER_REQUIRED")), "{}", text(&out));
+    let out = s.run(&["approve", "--promote", "prod", "--unsigned", "--approver", "Dana", "--note", "Tried checkout in uat for an hour", "--answer", "checkout", "--confirm", confirm, "--json"]);
+    let j = json(&out);
+    assert_eq!((code(&out), j["code"].as_str(), j["details"]["kind"].as_str()), (0, Some("UNSIGNED"), Some("signoff")), "{}", text(&out));
+    assert!(j["details"]["challenge"].is_string() && j["details"]["cosignature"].is_object(), "a passkey signs the challenge; this machine co-signs: {j:#}");
+    assert!(records(&s, "signoff").is_empty(), "nothing is stored until it is signed");
+    // Signed elsewhere with Dana's key, then filed here.
+    use base64::Engine;
+    let body = base64::engine::general_purpose::STANDARD.decode(j["details"]["payload"].as_str().unwrap()).unwrap();
+    let envelope = use05_receipt::seal_bytes(&body, &dana).to_json_bytes();
+    fs::write(s.path("signoff.json"), &envelope).unwrap();
+    let out = s.run(&["approve", "--signed", "signoff.json", "--json"]);
+    assert_eq!((code(&out), json(&out)["code"].as_str(), json(&out)["details"]["counts"].as_bool()), (0, Some("SIGNED_OFF"), Some(true)), "{}", text(&out));
+    let out = s.run(&["promote", "prod", "--check", "--json"]);
+    assert_eq!(rule_outcome(&out, "sign_off"), "pass", "{}", text(&out));
+}
+
+#[test]
+fn a_signoff_by_a_passkey_pinned_here_counts_where_no_signers_are_named() {
+    // As the console files it: the person's passkey, pinned on their machine, which co-signs.
+    let (s, _remote) = promotion_fixture(SIGN_OFF_RULES);
+    let (sk, key) = test_passkey(37);
+    s.pin_passkey(&key, "Laptop");
+    let unsigned = json(&s.run(&["approve", "--promote", "prod", "--unsigned", "--note", "Tried checkout in uat for an hour", "--answer", "checkout", "--confirm", "The release notes are published", "--json"]));
+    assert_eq!(unsigned["code"], "UNSIGNED", "{unsigned:#}");
+    s.write("signed.json", &sign_with_passkey(&unsigned, &sk));
+    let out = s.run(&["approve", "--signed", "signed.json", "--json"]);
+    assert_eq!((code(&out), json(&out)["code"].as_str(), json(&out)["details"]["counts"].as_bool()), (0, Some("SIGNED_OFF"), Some(true)), "{}", text(&out));
+    let out = s.run(&["promote", "prod", "--check", "--json"]);
+    assert_eq!(rule_outcome(&out, "sign_off"), "pass", "{}", text(&out));
+}
+
+#[test]
+fn a_signoff_from_outside_the_signers_does_not_count() {
+    let (dana, sam) = (use05_receipt::SigningKey::from_bytes(&[21; 32]), use05_receipt::SigningKey::from_bytes(&[22; 32]));
+    let keys = format!("{}{}[[signer]]\nname = \"eng-managers\"\npeople = [\"Dana\"]\n\n", key_entry("dana", "approver", &dana, Some("Dana")), key_entry("sam", "approver", &sam, Some("Sam")));
+    let (s, _remote) = promotion_fixture_with(&keys, "\n[environment.rules]\nsign_off = \"approval\"\n\n[environment.sign_off]\nsigners = [\"eng-managers\"]\n");
+    // At a terminal, a key the policy names for no signer is told so before anything is signed.
+    s.approver();
+    let (exit, screen) = on_a_terminal(&s, &["approve", "--promote", "prod", "--note", "looks right to me"], &[]);
+    assert_eq!(exit, 2, "{screen}");
+    assert!(screen.contains("would not count") && screen.contains("nothing was signed"), "{screen}");
+    assert!(records(&s, "signoff").is_empty());
+    // Sam signs one elsewhere: it is on the receipts branch, and it does not count.
+    let uat = s.git(&["rev-parse", "uat"]);
+    let signoff = |person: &str| use05_receipt::Statement::new(vec![use05_receipt::commit_subject(&uat)], use05_receipt::SignOff {
+        env: "prod".into(), from: "uat".into(), source_commit: uat.clone(), decision: use05_receipt::Decision::Approve, signer_person: person.into(), text: "checked it in uat".into(),
+        answers: vec![], confirmations: vec![], policy_sha256: policy_of(&s).digest(),
+        created: use05_core::time::now_rfc3339(), expires: use05_core::time::rfc3339(use05_core::time::now_secs() + 3600),
+    });
+    file_record(&s, &signoff("Sam"), &sam, &uat);
+    let out = s.run(&["promote", "prod", "--check", "--json"]);
+    assert_eq!(code(&out), 3, "{}", text(&out));
+    let required = json(&out)["details"]["findings"].as_array().unwrap().iter().find(|f| f["code"] == "SIGNOFF_REQUIRED").cloned().unwrap_or_else(|| panic!("{}", text(&out)));
+    assert!(required["message"].as_str().unwrap().contains("Sam's does not count: Sam is not among those who may sign (eng-managers (Dana))"), "{required}");
+    // Dana is one of them: hers counts.
+    file_record(&s, &signoff("Dana"), &dana, &uat);
+    let out = s.run(&["promote", "prod", "--check", "--json"]);
+    assert_eq!((code(&out), rule_outcome(&out, "sign_off")), (0, "pass".to_string()), "{}", text(&out));
+}
+
+#[test]
+fn bypass_of_a_never_rule_is_refused() {
+    let (s, _remote) = promotion_fixture("agent = true\n\n[environment.rules]\nuntasked = \"deny\"\n\n[environment.bypass]\nnever = [\"source_checks\"]\n");
+    s.approver();
+    let bypass = |rule: &str, reason: &str, lines: &[&str]| on_a_terminal(&s, &["bypass", "--promote", "prod", "--rule", rule, "--reason", reason], lines);
+    let why = "a hand-made fix, reviewed by two of us";
+    for (rule, exit, said) in [
+        ("source_checks", 2, "prod never lets a bypass clear source_checks"),
+        ("target_ahead", 2, "built in and never bypassed"),
+        ("PROMOTE_NOT_EVALUATED_HEAD", 2, "built in and never bypassed"),
+        ("nonsense", 6, "not a promotion rule"),
+        ("soak", 6, "holds nothing back"),
+    ] {
+        let (code, screen) = bypass(rule, why, &[]);
+        assert_eq!(code, exit, "{rule}: {screen}");
+        assert!(screen.contains(said), "{rule}: {screen}");
+    }
+    let (code_short, screen) = bypass("untasked", "quick", &[]);
+    assert_eq!(code_short, 6, "{screen}");
+    assert!(screen.contains("at least 10 characters"), "{screen}");
+    assert!(records(&s, "bypass").is_empty(), "nothing was signed");
+
+    // A rule a person may bypass: held before, through after, and carried in the record.
+    assert_eq!(code(&s.run(&["promote", "prod", "--check"])), 2);
+    let (exit, screen) = bypass("untasked", why, &["correct horse"]);
+    assert_eq!(exit, 0, "{screen}");
+    assert!(screen.contains("Break-glass: untasked bypassed"), "{screen}");
+    let out = s.run(&["promote", "prod", "--check", "--json"]);
+    assert_eq!((code(&out), rule_outcome(&out, "untasked")), (0, "bypassed".to_string()), "{}", text(&out));
+    let out = s.run(&["promote", "prod", "--json"]);
+    assert_eq!(json(&out)["code"], "PROMOTED", "{}", text(&out));
+    let promotion = &records(&s, "promotion")[0]["predicate"];
+    assert_eq!(promotion["bypasses"].as_array().unwrap().len(), 1, "{promotion:#}");
+    assert!(promotion["rules"].as_array().unwrap().iter().any(|r| r["rule"] == "untasked" && r["outcome"] == "bypassed"), "{promotion:#}");
+    let b = &records(&s, "bypass")[0];
+    assert_eq!((b["predicate"]["env"].as_str(), b["predicate"]["rule"].as_str(), b["subject"][0]["digest"]["gitCommit"].as_str()), (Some("prod"), Some("untasked"), Some(s.git(&["rev-parse", "uat"]).as_str())));
+    // It verifies like any receipt, and says what it clears.
+    let at = envelopes(&s).iter().position(|(_, st)| st["predicateType"] == "https://use05.dev/bypass/v0").unwrap();
+    let (branch, path) = &s.stored_receipts()[at];
+    let out = s.run(&["verify", &format!("{branch}:{path}")]);
+    assert_eq!(code(&out), 0, "{}", text(&out));
+    assert!(text(&out).contains("untasked, promoting") && text(&out).contains("from uat into prod"), "{}", text(&out));
+}
+
+#[test]
+fn under_an_agent_approve_promote_and_bypass_promote_are_refused() {
+    let (s, _remote) = promotion_fixture("\n[environment.rules]\nuntasked = \"deny\"\n");
+    s.approver();
+    let agent = [("CLAUDE_CODE_SESSION_ID", "s-1")];
+    let approve = ["approve", "--promote", "prod", "--note", "checked it all in uat today"];
+    let bypass = ["bypass", "--promote", "prod", "--rule", "untasked", "--reason", "a hand-made fix, reviewed"];
+    for args in [&approve[..], &bypass[..]] {
+        // Even at a terminal: the agent's session says it is not a person.
+        let (exit, screen) = on_a_terminal_with(&s, args, &[], &agent);
+        assert_eq!(exit, 3, "{args:?}: {screen}");
+        assert!(screen.contains("runs under an agent"), "{args:?}: {screen}");
+        // No terminal (CI, a pipe, --json): nothing proves a person, so it is refused as well.
+        let out = s.run(&[args, &["--json"]].concat());
+        assert_eq!((code(&out), json(&out)["code"].as_str()), (3, Some("NEEDS_A_PERSON")), "{args:?}: {}", text(&out));
+    }
+    let out = s.run_with_stdin(&[&approve[..], &["--passphrase-stdin"]].concat(), "correct horse\n");
+    assert_eq!(code(&out), 3, "a passphrase on stdin is no terminal: {}", text(&out));
+    assert!(records(&s, "signoff").is_empty() && records(&s, "bypass").is_empty(), "nothing was signed");
+}
+
+#[test]
+fn an_unknown_or_lowest_environment_is_named_with_the_choices() {
+    let (s, _remote) = promotion_fixture("");
+    let out = s.run(&["promote", "staging", "--check", "--json"]);
+    assert_eq!((code(&out), json(&out)["code"].as_str()), (6, Some("UNKNOWN_ENVIRONMENT")), "{}", text(&out));
+    assert!(json(&out)["message"].as_str().unwrap().contains("dev, uat, prod"), "{}", text(&out));
+    let out = s.run(&["promote", "dev", "--check", "--json"]);
+    assert_eq!((code(&out), json(&out)["code"].as_str()), (6, Some("NOTHING_PROMOTES_HERE")), "{}", text(&out));
+}
+
+#[test]
+fn an_agent_may_check_but_not_promote_onto_the_last_rung() {
+    let (s, _remote) = promotion_fixture("");
+    let agent = [("CLAUDE_CODE_SESSION_ID", "s-1")];
+    let out = s.run_env(&["promote", "prod", "--check", "--json"], &agent);
+    assert_eq!(code(&out), 2, "{}", text(&out));
+    assert_eq!(json(&out)["details"]["findings"][0]["code"], "AGENT_MAY_NOT_PROMOTE", "{}", text(&out));
+    let out = s.run_env(&["promote", "uat", "--check", "--json"], &agent);
+    assert_eq!(json(&out)["details"]["decision"], "allow", "below the last rung an agent may: {}", text(&out));
+    assert_eq!(json(&out)["details"]["findings"][0]["code"], "NOTHING_TO_PROMOTE", "uat already has main's head: {}", text(&out));
+}
+
+#[test]
+fn a_target_with_commits_the_source_lacks_is_denied() {
+    let (s, _remote) = promotion_fixture("");
+    s.git(&["checkout", "-q", "prod"]);
+    s.write("hotfix.rs", "pub fn fix() {}\n");
+    s.commit_all("Fix prod by hand");
+    s.git(&["push", "-q", "origin", "prod"]);
+    s.git(&["checkout", "-q", "main"]);
+    let out = s.run(&["promote", "prod", "--check", "--json"]);
+    assert_eq!(code(&out), 2, "{}", text(&out));
+    assert_eq!(json(&out)["details"]["findings"][0]["code"], "PROMOTE_TARGET_AHEAD", "{}", text(&out));
+}
+
+#[test]
+fn the_rules_come_from_the_target_branch_and_loosening_them_needs_a_person() {
+    // prod's own branch denies untasked commits; main, then uat, loosen that.
+    let (s, _remote) = promotion_fixture("\n[environment.rules]\nuntasked = \"deny\"\n");
+    let policy = fs::read_to_string(s.path(".05/policy.toml")).unwrap();
+    s.write(".05/policy.toml", &policy.replace("untasked = \"deny\"", "untasked = \"allow\""));
+    s.commit_all("Loosen prod");
+    s.git(&["branch", "-f", "uat", "main"]);
+    s.git(&["push", "-q", "origin", "main", "uat"]);
+    let out = s.run(&["promote", "prod", "--check", "--json"]);
+    let d = &json(&out)["details"];
+    assert_eq!(code(&out), 2, "judged by prod's rules, not the ones coming in: {}", text(&out));
+    let codes: Vec<&str> = d["findings"].as_array().unwrap().iter().map(|f| f["code"].as_str().unwrap()).collect();
+    assert!(codes.contains(&"UNTASKED_COMMITS") && codes.contains(&"POLICY_LOOSENED"), "{codes:?}");
+}
+
+#[test]
+fn promoting_into_a_branch_that_does_not_exist_yet_says_it_creates_it() {
+    let (s, remote) = promotion_fixture("");
+    s.git(&["branch", "-D", "prod"]);
+    s.git(&["update-ref", "-d", "refs/remotes/origin/prod"]);
+    assert!(Command::new("git").arg("-C").arg(remote.path()).args(["branch", "-D", "prod"]).status().unwrap().success());
+    let out = s.run(&["promote", "prod", "--check", "--json"]);
+    let d = &json(&out)["details"];
+    assert!(d["findings"].as_array().unwrap().iter().any(|f| f["code"] == "PROMOTE_CREATES_BRANCH"), "{}", text(&out));
+    assert!(d["findings"].as_array().unwrap().iter().any(|f| f["code"] == "RULES_FROM_SOURCE"), "{}", text(&out));
+    assert_eq!(d["rollback_point"], Value::Null);
+    assert_eq!(d["delta"].as_array().unwrap().len(), 2, "everything on uat moves");
+}
+
+const PROMOTION_SETTINGS: &str = "from = \"uat\"\nagent = false\nsoak_minutes = 30\n\n[environment.rules]\nuntasked = \"deny\"\n\n[environment.sign_off]\nmin_length = 20\n\n[[environment.confirm]]\ntext = \"Notes are out\"\n\n[environment.bypass]\nnever = [\"source_checks\"]\n";
+
+#[test]
+fn rerunning_setup_keeps_every_promotion_setting() {
+    let s = with_environment_branches();
+    assert_eq!(code(&s.run(&["init", "--env", "dev=main", "--env", "uat=uat", "--env", "prod=production"])), 0);
+    let policy = fs::read_to_string(s.path(".05/policy.toml")).unwrap();
+    let prod = "[[environment]]\nname = \"prod\"\nbranch = \"production\"\n";
+    assert!(policy.contains(prod), "{policy}");
+    s.write(".05/policy.toml", &policy.replacen(prod, &format!("{prod}{PROMOTION_SETTINGS}"), 1));
+    let before = policy_of(&s).environment;
+    assert_eq!(before[2].rules.untasked, use05_core::policy::Severity::Deny);
+    for args in [&["policy", "--edit", "--guided"][..], &["init", "--guided"][..]] {
+        let out = s.run_with_stdin(args, &"\n".repeat(60));
+        assert_eq!(code(&out), 0, "{args:?}: {}", text(&out));
+        let after = fs::read_to_string(s.path(".05/policy.toml")).unwrap();
+        assert!(after.contains(&format!("{prod}{PROMOTION_SETTINGS}")), "{args:?} kept prod's table as it was:\n{after}");
+        assert_eq!(policy_of(&s).environment, before, "{args:?}");
+    }
+}
+
+/// Sign a statement with `key` and file it on that key's receipts branch, as 05 files its own.
+fn file_record<P: use05_receipt::Predicate>(s: &Sandbox, statement: &use05_receipt::Statement<P>, key: &use05_receipt::SigningKey, subject: &str) {
+    let envelope = use05_receipt::seal(statement, key).to_json_bytes();
+    use05_core::store::put(s.dir.path(), subject, &envelope, &use05_receipt::key_id(&key.verifying_key())).unwrap();
+}
+
+fn key_entry(name: &str, role: &str, key: &use05_receipt::SigningKey, person: Option<&str>) -> String {
+    let person = person.map(|p| format!("person = \"{p}\"\n")).unwrap_or_default();
+    format!("[[trust.key]]\nname = \"{name}\"\nrole = \"{role}\"\npublic = \"{}\"\n{person}\n", use05_receipt::public_key_text(&key.verifying_key()).trim())
+}
+
+fn confirmed_deployment(sha: &str) -> use05_receipt::Statement<use05_receipt::Deployment> {
+    deployment_at(sha, use05_core::time::now_secs())
+}
+
+/// uat's record that its probe showed `sha`, as made at `at` (seconds).
+fn deployment_at(sha: &str, at: u64) -> use05_receipt::Statement<use05_receipt::Deployment> {
+    let probe = use05_receipt::ProbeResult { name: "version".into(), matched: true, output_sha256: "00".repeat(32), attempts: 1, seconds: 0 };
+    use05_receipt::Statement::new(vec![use05_receipt::commit_subject(sha)], use05_receipt::Deployment {
+        env: "uat".into(), commit: sha.into(), probes: vec![probe], smoke: vec![], confirmed: true, created: use05_core::time::rfc3339(at), action: use05_receipt::DeployAction::None,
+    })
+}
+
+fn rule_outcome(out: &Output, name: &str) -> String {
+    let j = json(out);
+    j["details"]["rules"].as_array().unwrap_or_else(|| panic!("{j:#}")).iter().find(|r| r["rule"] == name).unwrap()["outcome"].as_str().unwrap().to_string()
+}
+
+#[test]
+fn a_deployment_record_counts_only_from_a_kind_of_key_the_policy_takes_evidence_from() {
+    let machine = use05_receipt::SigningKey::from_bytes(&[11; 32]);
+    let runner = use05_receipt::SigningKey::from_bytes(&[12; 32]);
+    let keys = format!("{}{}", key_entry("laptop", "local", &machine, None), key_entry("ci", "runner", &runner, None));
+    // By default this machine's records count: advisory, and the page says so.
+    let (s, _remote) = promotion_fixture_with(&keys, "");
+    let uat = s.git(&["rev-parse", "uat"]);
+    file_record(&s, &confirmed_deployment(&uat), &machine, &uat);
+    let out = s.run(&["promote", "prod", "--check", "--json"]);
+    assert_eq!(rule_outcome(&out, "source_confirmed"), "pass", "{}", text(&out));
+    assert!(json(&out)["notes"].as_array().unwrap().iter().any(|n| n.as_str().unwrap().contains("rest on its own word")), "{}", text(&out));
+    // Under accept = ["runner"], only CI's record counts.
+    let (s, _remote) = promotion_fixture_with(&format!("[evidence]\naccept = [\"runner\"]\n\n{keys}"), "");
+    let uat = s.git(&["rev-parse", "uat"]);
+    file_record(&s, &confirmed_deployment(&uat), &machine, &uat);
+    assert_eq!(rule_outcome(&s.run(&["promote", "prod", "--check", "--json"]), "source_confirmed"), "fail", "this machine's word is not enough");
+    file_record(&s, &confirmed_deployment(&uat), &runner, &uat);
+    assert_eq!(rule_outcome(&s.run(&["promote", "prod", "--check", "--json"]), "source_confirmed"), "pass", "CI's record counts");
+}
+
+#[test]
+fn an_unreachable_origin_is_said_and_the_last_fetched_copies_are_judged() {
+    let (s, _remote) = promotion_fixture("");
+    s.git(&["remote", "set-url", "origin", &s.path("no-such-remote").display().to_string()]);
+    let out = s.run(&["promote", "prod", "--check", "--json"]);
+    let notes: Vec<String> = json(&out)["details"]["notes"].as_array().unwrap().iter().map(|n| n.as_str().unwrap().to_string()).collect();
+    assert!(notes.iter().any(|n| n.starts_with("Could not reach origin") && n.contains("judged on what this machine last fetched")), "{notes:?}");
+    assert_eq!(json(&out)["details"]["source_ref"], "origin/uat", "the copy this machine last fetched");
+}
+
+#[test]
+fn a_receipt_whose_tree_content_does_not_match_denies_whatever_source_checks_says() {
+    let (s, _remote) = promotion_fixture("\n[environment.rules]\nsource_checks = \"allow\"\n");
+    // This machine's own record of the tree's content now disagrees with the receipt's.
+    assert_eq!(code(&s.run(&["promote", "prod", "--check"])), 0);
+    let tree = s.git(&["rev-parse", "uat^{tree}"]);
+    let cache = s.dir.path().join(".git").join("05").join("digests").join(&tree);
+    assert!(cache.exists(), "the digest is kept once it is worked out");
+    fs::write(&cache, "ab".repeat(32)).unwrap();
+    let out = s.run(&["promote", "prod", "--check", "--json"]);
+    assert_eq!(code(&out), 2, "{}", text(&out));
+    assert_eq!(json(&out)["details"]["findings"][0]["code"], "TREE_DIGEST_MISMATCH", "{}", text(&out));
+}
+
+#[test]
+fn brief_promote_says_when_the_rules_come_from_the_source() {
+    // prod's branch has a policy that knows nothing of environments; uat's names them.
+    let s = Sandbox::new();
+    fs::create_dir_all(s.path(".05")).unwrap();
+    s.write(".05/policy.toml", "[[check]]\nname = \"test\"\nrun = [\"./test.sh\"]\n");
+    s.commit_all("base");
+    s.git(&["branch", "uat"]);
+    s.git(&["branch", "prod"]);
+    s.write(".05/policy.toml", &format!("{ENVIRONMENTS}"));
+    s.commit_all("Name the environments");
+    s.git(&["branch", "-f", "uat", "main"]);
+    let out = s.run(&["promote", "prod", "--check", "--json"]);
+    let from = json(&out)["details"]["findings"].as_array().unwrap().iter().find(|f| f["code"] == "RULES_FROM_SOURCE").cloned().unwrap_or_else(|| panic!("{}", text(&out)));
+    assert_eq!(from["effect"], "warn", "prod has rules, just none for prod: {from}");
+    assert!(from["message"].as_str().unwrap().contains("uat's policy"), "{from}");
+    snapshot("brief_promote_rules_from_source", &s, &s.run(&["brief", "--promote", "prod"]));
+}
+
+#[test]
+fn brief_promote_says_why_a_sign_off_does_not_count() {
+    let dana = use05_receipt::SigningKey::from_bytes(&[13; 32]);
+    let (s, _remote) = promotion_fixture_with(&key_entry("dana", "approver", &dana, Some("Dana")), "\n[environment.rules]\nsign_off = \"approval\"\n\n[environment.sign_off]\nmin_length = 20\n");
+    let uat = s.git(&["rev-parse", "uat"]);
+    let signoff = use05_receipt::Statement::new(vec![use05_receipt::commit_subject(&uat)], use05_receipt::SignOff {
+        env: "prod".into(), from: "uat".into(), source_commit: uat.clone(), decision: use05_receipt::Decision::Approve, signer_person: "Dana".into(), text: "looks fine".into(),
+        answers: vec![], confirmations: vec![], policy_sha256: policy_of(&s).digest(),
+        created: use05_core::time::now_rfc3339(), expires: use05_core::time::rfc3339(use05_core::time::now_secs() + 3600),
+    });
+    file_record(&s, &signoff, &dana, &uat);
+    let out = s.run(&["brief", "--promote", "prod"]);
+    assert_eq!(code(&out), 3, "{}", text(&out));
+    let j = json(&s.run(&["brief", "--promote", "prod", "--json"]));
+    assert_eq!(j["promotion"]["signoffs"][0]["void"], "its words are shorter than the 20 characters the policy asks", "{j:#}");
+    assert!(j["promotion"]["findings"].as_array().unwrap().iter().any(|f| f["code"] == "SIGNOFF_REQUIRED" && f["message"].as_str().unwrap().contains("Dana's does not count")), "{j:#}");
+    snapshot("brief_promote_signoff_not_counted", &s, &out);
+}
+
+// ---------------------------------------------------------------- deploy confirmation, failure and rollback (D93 4–5)
+
+/// The policy: dev on main, then uat and prod, with `uat` and `prod` under each.
+fn ladder(uat: &str, prod: &str) -> String {
+    format!("[[check]]\nname = \"test\"\nrun = [\"./test.sh\"]\n\n[[environment]]\nname = \"dev\"\nbranch = \"main\"\n\n[[environment]]\nname = \"uat\"\nbranch = \"uat\"\n{uat}\n[[environment]]\nname = \"prod\"\nbranch = \"prod\"\n{prod}")
+}
+
+/// A probe that prints the file `$DEPLOYED` names: what the environment says it runs. One try.
+const PROBE: &str = "\n[[environment.probe]]\nname = \"version\"\nrun = ['sh', '-c', 'cat \"$DEPLOYED\"']\nenv = [\"DEPLOYED\"]\nwait_minutes = 0\n";
+
+/// The environment says it runs `what`: the file the probe reads, outside the repository.
+fn says_it_runs(s: &Sandbox, what: &str) -> String {
+    let file = s.home.path().join("deployed");
+    fs::write(&file, format!("running {what}\n")).unwrap();
+    file.display().to_string()
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    use sha2::Digest;
+    hex::encode(sha2::Sha256::digest(bytes))
+}
+
+#[test]
+fn a_probe_that_shows_the_commit_confirms() {
+    let (s, remote) = promotion_fixture_of(&ladder("", &format!("agent = true\n{PROBE}")));
+    let uat = s.git(&["rev-parse", "uat"]);
+    let file = says_it_runs(&s, &uat[..12]);
+    let out = s.run_env(&["promote", "prod", "--json"], &[("DEPLOYED", &file)]);
+    let j = json(&out);
+    assert_eq!((code(&out), j["code"].as_str()), (0, Some("PROMOTED")), "{}", text(&out));
+    assert_eq!((j["details"]["deploy"]["confirmed"].as_bool(), j["details"]["deploy"]["commit"].as_str()), (Some(true), Some(uat.as_str())), "{j:#}");
+    let deployments = records(&s, "deployment");
+    assert_eq!(deployments.len(), 1);
+    let (st, d) = (&deployments[0], &deployments[0]["predicate"]);
+    assert_eq!(st["subject"][0]["digest"]["gitCommit"], uat, "its subject is the deployed commit");
+    assert_eq!((d["env"].as_str(), d["commit"].as_str(), d["confirmed"].as_bool(), d["action"].as_str()), (Some("prod"), Some(uat.as_str()), Some(true), Some("none")));
+    assert_eq!((d["probes"][0]["name"].as_str(), d["probes"][0]["matched"].as_bool(), d["probes"][0]["attempts"].as_u64()), (Some("version"), Some(true), Some(1)));
+    assert_eq!(d["probes"][0]["output_sha256"], sha256_hex(format!("running {}\n", &uat[..12]).as_bytes()), "a hash of what it printed, never the text");
+    assert!(!serde_json::to_string(d).unwrap().contains("running"), "{d}");
+    assert!(remote_git(&remote, &["for-each-ref", "--format=%(refname)"]).contains("refs/heads/05-receipts/"));
+    // Confirming again, as CI would, says the same in words.
+    let again = s.run_env(&["promote", "prod", "--confirm"], &[("DEPLOYED", &file)]);
+    assert_eq!(code(&again), 0, "{}", text(&again));
+    snapshot("promote_confirm", &s, &again);
+    assert!(records(&s, "deployment").iter().all(|d| d["predicate"]["confirmed"] == true));
+}
+
+#[test]
+fn a_probe_is_asked_again_until_it_shows_the_commit() {
+    // It shows the commit on its third try. The waits between tries are pretend in this test.
+    let probe = "\n[[environment.probe]]\nname = \"version\"\nrun = ['sh', '-c', 'n=$(cat \"$DEPLOYED.n\" 2>/dev/null || echo 0); n=$((n+1)); echo $n > \"$DEPLOYED.n\"; [ $n -ge 3 ] && cat \"$DEPLOYED\"']\nenv = [\"DEPLOYED\"]\nwait_minutes = 1\ninterval_secs = 15\n";
+    let (s, _remote) = promotion_fixture_of(&ladder("", &format!("agent = true\n{probe}")));
+    let uat = s.git(&["rev-parse", "uat"]);
+    let file = says_it_runs(&s, &uat);
+    let started = std::time::Instant::now();
+    let out = s.run_env(&["promote", "prod", "--json"], &[("DEPLOYED", &file), ("USE05_TEST_NO_SLEEP", "1")]);
+    assert_eq!((code(&out), json(&out)["code"].as_str()), (0, Some("PROMOTED")), "{}", text(&out));
+    assert!(started.elapsed() < std::time::Duration::from_secs(25), "no real waiting");
+    let d = &records(&s, "deployment")[0]["predicate"];
+    assert_eq!((d["probes"][0]["matched"].as_bool(), d["probes"][0]["attempts"].as_u64()), (Some(true), Some(3)), "{d}");
+    assert!((30..32).contains(&d["probes"][0]["seconds"].as_u64().unwrap()), "two waits of 15 seconds: {d}");
+}
+
+#[test]
+fn a_probe_that_never_shows_it_times_out_and_reports() {
+    let (s, remote) = promotion_fixture_of(&ladder("", &format!("agent = true\n{PROBE}")));
+    let (prod, uat) = (s.git(&["rev-parse", "prod"]), s.git(&["rev-parse", "uat"]));
+    let file = says_it_runs(&s, &prod);
+    let out = s.run_env(&["promote", "prod", "--json"], &[("DEPLOYED", &file)]);
+    let j = json(&out);
+    assert_eq!((code(&out), j["code"].as_str()), (2, Some("DEPLOY_NOT_CONFIRMED")), "{}", text(&out));
+    assert_eq!(j["next"], "use05 promote prod --rollback", "{j:#}");
+    assert_eq!(j["details"]["deploy"]["action"], "none");
+    assert_eq!(remote_git(&remote, &["rev-parse", "prod"]), uat, "the promotion went through; nothing was rolled back by itself");
+    let d = &records(&s, "deployment")[0]["predicate"];
+    assert_eq!((d["confirmed"].as_bool(), d["probes"][0]["matched"].as_bool(), d["probes"][0]["attempts"].as_u64(), d["action"].as_str()), (Some(false), Some(false), Some(1), Some("none")), "wait 0 is one try: {d}");
+    assert_eq!(records(&s, "promotion").len(), 1, "the promotion's own record is kept");
+    let again = s.run_env(&["promote", "prod", "--confirm"], &[("DEPLOYED", &file)]);
+    assert_eq!(code(&again), 2, "{}", text(&again));
+    snapshot("promote_confirm_not_confirmed", &s, &again);
+}
+
+#[test]
+fn a_missing_probe_program_fails_that_probe() {
+    let probe = "\n[[environment.probe]]\nname = \"version\"\nrun = [\"no-such-probe-05\"]\n";
+    let (s, _remote) = promotion_fixture_of(&ladder("", &format!("agent = true\n{probe}")));
+    let out = s.run(&["promote", "prod", "--json"]);
+    assert_eq!((code(&out), json(&out)["code"].as_str()), (2, Some("DEPLOY_NOT_CONFIRMED")), "not a crash: {}", text(&out));
+    assert!(text(&out).contains("could not run no-such-probe-05"), "{}", text(&out));
+    let d = &records(&s, "deployment")[0]["predicate"];
+    assert_eq!((d["probes"][0]["matched"].as_bool(), d["probes"][0]["attempts"].as_u64(), d["confirmed"].as_bool()), (Some(false), Some(1), Some(false)), "no second try of a program that is not there: {d}");
+}
+
+#[test]
+fn smoke_failure_means_not_confirmed() {
+    let smoke = "\n[[environment.smoke]]\nname = \"health\"\nrun = ['sh', '-c', 'exit 1']\n";
+    let (s, _remote) = promotion_fixture_of(&ladder("", &format!("agent = true\n{PROBE}{smoke}")));
+    let uat = s.git(&["rev-parse", "uat"]);
+    let file = says_it_runs(&s, &uat);
+    let out = s.run_env(&["promote", "prod", "--json"], &[("DEPLOYED", &file)]);
+    assert_eq!((code(&out), json(&out)["code"].as_str()), (2, Some("DEPLOY_NOT_CONFIRMED")), "{}", text(&out));
+    let d = &records(&s, "deployment")[0]["predicate"];
+    assert_eq!((d["probes"][0]["matched"].as_bool(), d["smoke"][0]["name"].as_str(), d["smoke"][0]["passed"].as_bool(), d["confirmed"].as_bool()), (Some(true), Some("health"), Some(false), Some(false)), "{d}");
+}
+
+#[test]
+fn on_failure_revert_pushes_a_revert_commit_not_a_force_push() {
+    let (s, remote) = promotion_fixture_of(&ladder("", &format!("agent = true\non_failure = \"revert\"\n{PROBE}")));
+    with_pre_push_hook(&s);
+    let (prod, uat) = (s.git(&["rev-parse", "prod"]), s.git(&["rev-parse", "uat"]));
+    let before: Vec<String> = remote_git(&remote, &["rev-list", "prod"]).lines().map(str::to_string).collect();
+    // prod still says it runs the old commit, so neither the promotion nor its revert is confirmed.
+    let file = says_it_runs(&s, &prod);
+    let out = s.run_env(&["promote", "prod"], &[("DEPLOYED", &file)]);
+    assert_eq!(code(&out), 2, "{}", text(&out));
+    snapshot("promote_reverted", &s, &out);
+    let head = remote_git(&remote, &["rev-parse", "prod"]);
+    assert_eq!(remote_git(&remote, &["rev-list", "--parents", "-n", "1", &head]), format!("{head} {uat}"), "a new commit on what was promoted");
+    assert_eq!(remote_git(&remote, &["rev-parse", &format!("{head}^{{tree}}")]), s.git(&["rev-parse", &format!("{prod}^{{tree}}")]), "holding the rollback point's files");
+    let after: Vec<String> = remote_git(&remote, &["rev-list", "prod"]).lines().map(str::to_string).collect();
+    assert!(before.iter().all(|c| after.contains(c)) && after.contains(&uat), "origin's history only grew: no force-push");
+    let message = remote_git(&remote, &["log", "-1", "--format=%B", &head]);
+    assert!(message.starts_with(&format!("Revert prod to {} (deploy not confirmed)", &prod[..12])), "{message}");
+    assert!(message.contains(&format!("05-Reverts: {uat}")) && message.contains(&format!("05-Rollback-To: {prod}")), "{message}");
+    // Confirmed once more, and no further: the revert is not confirmed either, and nothing else moves.
+    let deployments = records(&s, "deployment");
+    let of = |c: &str| deployments.iter().map(|d| &d["predicate"]).find(|d| d["commit"] == c).cloned().unwrap_or_else(|| panic!("{deployments:#?}"));
+    assert_eq!(deployments.len(), 2, "{deployments:#?}");
+    assert_eq!((of(&uat)["action"].as_str(), of(&uat)["confirmed"].as_bool()), (Some("reverted"), Some(false)));
+    assert_eq!((of(&head)["action"].as_str(), of(&head)["confirmed"].as_bool()), (Some("none"), Some(false)));
+    let revert = records(&s, "promotion").into_iter().map(|p| p["predicate"].clone()).find(|p| p["how"] == "revert").unwrap();
+    assert_eq!((revert["reverts"].as_str(), revert["result_commit"].as_str(), revert["target_before"].as_str()), (Some(uat.as_str()), Some(head.as_str()), Some(uat.as_str())));
+    let words = text(&out).split_whitespace().collect::<Vec<_>>().join(" ");
+    assert!(words.contains(&format!("05 reverted prod to {}", &prod[..12])) && words.contains("prod now has a commit uat lacks (the revert)"), "{words}");
+    // prod has the revert, which uat lacks: promoting into prod waits until uat has it.
+    let check = s.run(&["promote", "prod", "--check", "--json"]);
+    assert_eq!(json(&check)["details"]["findings"][0]["code"], "PROMOTE_TARGET_AHEAD", "{}", text(&check));
+}
+
+#[test]
+fn on_failure_command_runs_rollback_with_env() {
+    let out_dir = tempfile::tempdir().unwrap();
+    let said = out_dir.path().join("rollback.txt");
+    // It says which files it runs in: the rollback point's lack the feature that moved.
+    let rollback = format!("on_failure = \"command\"\nrollback = ['sh', '-c', 'echo \"$USE05_ENV $USE05_ROLLBACK_TO [$DEPLOYED] [$ROLLBACK_TOKEN] $(test -e feature.rs && echo new || echo old)\" > {}']\nrollback_env = [\"ROLLBACK_TOKEN\"]\nrollback_timeout_secs = 30\n", said.display());
+    let (s, remote) = promotion_fixture_of(&ladder("", &format!("agent = true\n{rollback}{PROBE}")));
+    let (prod, uat) = (s.git(&["rev-parse", "prod"]), s.git(&["rev-parse", "uat"]));
+    let file = says_it_runs(&s, &prod);
+    let out = s.run_env(&["promote", "prod", "--json"], &[("DEPLOYED", &file), ("ROLLBACK_TOKEN", "s3cret")]);
+    let j = json(&out);
+    assert_eq!((code(&out), j["code"].as_str(), j["details"]["deploy"]["action"].as_str()), (2, Some("DEPLOY_NOT_CONFIRMED"), Some("rollback-command")), "{}", text(&out));
+    assert_eq!(fs::read_to_string(&said).unwrap(), format!("prod {prod} [] [s3cret] old\n"), "the environment, the rollback point and the variables it names, in the rollback point's files");
+    assert_eq!(records(&s, "deployment")[0]["predicate"]["action"], "rollback-command");
+    assert_eq!(remote_git(&remote, &["rev-parse", "prod"]), uat, "the command is the developer's; 05 moved no branch");
+}
+
+#[test]
+fn soak_counts_from_the_source_deployment() {
+    let (s, _remote) = promotion_fixture_of(&ladder(PROBE, "soak_minutes = 60\n\n[environment.rules]\nsoak = \"deny\"\n"));
+    let uat = s.git(&["rev-parse", "uat"]);
+    let file = says_it_runs(&s, &uat);
+    let confirmed = s.run_env(&["promote", "uat", "--confirm", "--json"], &[("DEPLOYED", &file)]);
+    assert_eq!((code(&confirmed), json(&confirmed)["code"].as_str()), (0, Some("DEPLOY_CONFIRMED")), "{}", text(&confirmed));
+    let out = s.run(&["promote", "prod", "--check", "--json"]);
+    assert_eq!((rule_outcome(&out, "source_confirmed"), rule_outcome(&out, "soak")), ("pass".to_string(), "fail".to_string()), "{}", text(&out));
+    assert!(json(&out)["details"]["findings"].as_array().unwrap().iter().any(|f| f["code"] == "SOAK_NOT_DONE" && f["message"].as_str().unwrap().contains("for 0 minutes")), "{}", text(&out));
+    // uat was confirmed two hours ago too, and has been since: the soak counts from then.
+    let key = use05_core::keys::read_secret_file(&s.home.path().join("local.key")).unwrap();
+    file_record(&s, &deployment_at(&uat, use05_core::time::now_secs() - 7200), &key, &uat);
+    assert_eq!(rule_outcome(&s.run(&["promote", "prod", "--check", "--json"]), "soak"), "pass");
+}
+
+#[test]
+fn no_probes_never_claims_confirmed() {
+    let (s, _remote) = promotion_fixture("agent = true\n");
+    // uat has no probe: its confirmation says so, and so does a promotion from it.
+    let uat = s.run(&["promote", "uat", "--confirm", "--json"]);
+    assert_eq!((code(&uat), json(&uat)["code"].as_str()), (5, Some("NO_PROBES")), "{}", text(&uat));
+    assert!(json(&uat)["message"].as_str().unwrap().contains("no probes: 05 cannot tell what uat runs"), "{}", text(&uat));
+    let check = s.run(&["promote", "prod", "--check", "--json"]);
+    let finding = json(&check)["details"]["findings"].as_array().unwrap().iter().find(|f| f["code"] == "SOURCE_NOT_CONFIRMED").cloned().unwrap();
+    assert!(finding["message"].as_str().unwrap().contains("no probes: 05 cannot tell what uat runs"), "{finding}");
+    let out = s.run(&["promote", "prod", "--json"]);
+    let j = json(&out);
+    assert_eq!((code(&out), j["code"].as_str()), (0, Some("PROMOTED")), "{}", text(&out));
+    assert_eq!((j["details"]["deploy"]["confirmed"].as_bool(), j["details"]["deploy"]["summary"].as_str()), (Some(false), Some("no probes: 05 cannot tell what prod runs")), "{j:#}");
+    let prod = records(&s, "deployment").into_iter().map(|d| d["predicate"].clone()).find(|d| d["env"] == "prod").unwrap();
+    assert_eq!((prod["probes"].as_array().map(Vec::len), prod["confirmed"].as_bool(), prod["action"].as_str()), (Some(0), Some(false), Some("none")), "{prod}");
+}
+
+#[test]
+fn no_wait_leaves_confirmation_to_confirm_and_rollback_reverts_with_a_new_commit() {
+    let (s, remote) = promotion_fixture("agent = true\n");
+    with_pre_push_hook(&s);
+    let (prod, uat) = (s.git(&["rev-parse", "prod"]), s.git(&["rev-parse", "uat"]));
+    let out = s.run(&["promote", "prod", "--no-wait", "--json"]);
+    let j = json(&out);
+    assert_eq!((code(&out), j["code"].as_str()), (0, Some("PROMOTED")), "{}", text(&out));
+    assert!(records(&s, "deployment").is_empty() && j["details"]["deploy"].is_null(), "nothing was confirmed: {j:#}");
+    assert!(j["notes"].as_array().unwrap().iter().any(|n| n.as_str().unwrap().contains("use05 promote prod --confirm")), "{j:#}");
+    // A push that only looks like a revert, onto the right commit but with other files, is held.
+    s.git(&["checkout", "-q", "-b", "not-a-revert", &uat]);
+    s.write("other.rs", "pub fn other() {}\n");
+    s.commit_all("Looks like a revert");
+    s.git(&["checkout", "-q", "main"]);
+    let held = hand_push(&s, &["origin", "not-a-revert:prod"]);
+    assert!(!held.status.success() && text(&held).contains("PROMOTE_NOT_EVALUATED_MOVE"), "{}", text(&held));
+    // The rollback: a new commit with the rollback point's files, through the same hook.
+    let out = s.run(&["promote", "prod", "--rollback", "--json"]);
+    let j = json(&out);
+    assert_eq!((code(&out), j["code"].as_str()), (0, Some("ROLLED_BACK")), "{}", text(&out));
+    let head = remote_git(&remote, &["rev-parse", "prod"]);
+    assert_eq!((j["details"]["rollback_to"].as_str(), j["details"]["reverts"].as_str(), j["details"]["result_commit"].as_str()), (Some(prod.as_str()), Some(uat.as_str()), Some(head.as_str())), "{j:#}");
+    assert_eq!(remote_git(&remote, &["rev-list", "--parents", "-n", "1", &head]), format!("{head} {uat}"));
+    assert_eq!(remote_git(&remote, &["rev-parse", &format!("{head}^{{tree}}")]), s.git(&["rev-parse", &format!("{prod}^{{tree}}")]));
+    assert!(remote_git(&remote, &["log", "-1", "--format=%s", &head]).starts_with(&format!("Revert prod to {} (rolled back by", &prod[..12])));
+    assert_eq!(records(&s, "promotion").iter().filter(|p| p["predicate"]["how"] == "revert").count(), 1);
+    // prod now holds the rollback point's files: there is nothing more to roll back.
+    let again = s.run(&["promote", "prod", "--rollback", "--json"]);
+    assert_eq!((code(&again), json(&again)["code"].as_str()), (0, Some("NOTHING_TO_ROLL_BACK")), "{}", text(&again));
+    assert_eq!(remote_git(&remote, &["rev-parse", "prod"]), head);
+}
+
+#[test]
+fn a_merge_back_that_brings_a_rollback_down_is_held_for_a_person() {
+    let (s, _remote) = promotion_fixture("agent = true\n");
+    with_pre_push_hook(&s);
+    assert_eq!(code(&s.run(&["promote", "prod", "--no-wait"])), 0);
+    let rolled = json(&s.run(&["promote", "prod", "--rollback", "--json"]));
+    assert_eq!(rolled["code"], "ROLLED_BACK", "{rolled:#}");
+    let (undone, revert) = (rolled["details"]["reverts"].as_str().unwrap().to_string(), rolled["details"]["result_commit"].as_str().unwrap().to_string());
+    // Merged down, prod's rollback would undo on uat the work it undid on prod.
+    let out = s.run(&["promote", "uat", "--back", "--check", "--json"]);
+    let j = json(&out);
+    let f = j["details"]["findings"].as_array().unwrap().iter().find(|f| f["code"] == "BACK_MERGE_CARRIES_ROLLBACK").cloned().unwrap_or_else(|| panic!("{j:#}"));
+    assert_eq!(code(&out), 3, "held for a person, not refused: {j:#}");
+    let message = f["message"].as_str().unwrap();
+    assert!(message.contains(&format!("the rollback of prod ({})", &revert[..12])) && message.contains(&undone[..12]), "{f:#}");
+    assert!(f["next"].as_str().unwrap().contains("use05 approve --promote uat --back"), "{f:#}");
+    // A person's sign-off on that merge back says uat should lose that work too.
+    s.approver();
+    let (exit, screen) = on_a_terminal(&s, &["approve", "--promote", "uat", "--back", "--note", "uat goes back with prod"], &["correct horse"]);
+    assert_eq!(exit, 0, "{screen}");
+    let out = s.run(&["promote", "uat", "--back", "--json"]);
+    assert_eq!((code(&out), json(&out)["code"].as_str()), (0, Some("MERGED_BACK")), "{}", text(&out));
+}
+
+#[test]
+fn rollback_is_for_a_person_where_agents_may_not_promote() {
+    let (s, remote) = promotion_fixture("");
+    with_pre_push_hook(&s);
+    s.approver();
+    let (exit, screen) = on_a_terminal(&s, &["promote", "prod", "--no-wait"], &["correct horse"]);
+    assert_eq!(exit, 0, "{screen}");
+    let uat = s.git(&["rev-parse", "uat"]);
+    // Under an agent, or with no terminal, it is refused, and nothing moves.
+    let out = s.run_env(&["promote", "prod", "--rollback", "--json"], &[("CLAUDE_CODE_SESSION_ID", "s-1")]);
+    assert_eq!((code(&out), json(&out)["code"].as_str()), (3, Some("NEEDS_A_PERSON")), "{}", text(&out));
+    let out = s.run(&["promote", "prod", "--rollback", "--json"]);
+    assert_eq!((code(&out), json(&out)["code"].as_str()), (3, Some("NEEDS_A_PERSON")), "{}", text(&out));
+    assert_eq!(remote_git(&remote, &["rev-parse", "prod"]), uat);
+    // The agent's hooks hold it before it runs; confirming is anyone's.
+    let hook = |command: &str| {
+        let payload = serde_json::json!({ "session_id": "sess-1234abcd", "cwd": s.dir.path(), "hook_event_name": "PreToolUse", "tool_name": "Bash", "tool_input": { "command": command } }).to_string();
+        let out = s.run_with_stdin(&["hook", "claude-code", "PreToolUse"], &payload);
+        let v: Value = serde_json::from_slice(&out.stdout).unwrap_or(Value::Null);
+        (v["hookSpecificOutput"]["permissionDecision"].as_str().map(str::to_string), text(&out))
+    };
+    let (held, why) = hook("use05 promote prod --rollback");
+    assert_eq!(held.as_deref(), Some("deny"), "{why}");
+    assert!(why.contains("rolling back prod is for a person"), "{why}");
+    assert_eq!(hook("use05 promote prod --confirm").0, None);
+    // A person at a terminal rolls it back, and signs the record beside the machine.
+    let (exit, screen) = on_a_terminal(&s, &["promote", "prod", "--rollback"], &["correct horse"]);
+    assert_eq!(exit, 0, "{screen}");
+    assert!(screen.contains("You are about to roll prod back") && screen.contains("Rolled prod back"), "{screen}");
+    let head = remote_git(&remote, &["rev-parse", "prod"]);
+    assert_eq!(remote_git(&remote, &["rev-list", "--parents", "-n", "1", &head]), format!("{head} {uat}"));
+    let signed: Vec<(Value, Value)> = envelopes(&s).into_iter().filter(|(_, st)| st["predicate"]["how"] == "revert").collect();
+    assert_eq!(signed.len(), 1);
+    assert_eq!(signed[0].0["signatures"].as_array().unwrap().len(), 2, "this machine's signature and the person's");
+}
+
+#[test]
+fn rollback_says_what_it_did() {
+    let (s, _remote) = promotion_fixture("agent = true\n");
+    assert_eq!(code(&s.run(&["promote", "prod", "--no-wait"])), 0);
+    let out = s.run(&["promote", "prod", "--rollback"]);
+    assert_eq!(code(&out), 0, "{}", text(&out));
+    snapshot("promote_rollback", &s, &out);
+}
+
+#[test]
+fn confirm_with_no_probes_says_so() {
+    let (s, _remote) = promotion_fixture("");
+    let out = s.run(&["promote", "uat", "--confirm"]);
+    assert_eq!(code(&out), 5, "{}", text(&out));
+    snapshot("promote_confirm_no_probes", &s, &out);
+}
+
+#[test]
+fn a_forged_rollback_point_off_the_branch_history_is_held() {
+    let (s, remote) = promotion_fixture("agent = true\n");
+    with_pre_push_hook(&s);
+    assert_eq!(code(&s.run(&["promote", "prod", "--no-wait"])), 0);
+    let uat = s.git(&["rev-parse", "uat"]);
+    // Any files at all, on a commit prod never had.
+    s.git(&["checkout", "-q", "--orphan", "anything"]);
+    s.write("payload.rs", "pub fn payload() {}\n");
+    s.commit_all("Anything");
+    let off = s.git(&["rev-parse", "HEAD"]);
+    s.git(&["checkout", "-q", "-f", "main"]);
+    // This machine's key says prod was at that commit before the promotion.
+    let forged = use05_receipt::Statement::new(vec![use05_receipt::commit_subject(&uat)], use05_receipt::Promotion {
+        env: "prod".into(), from: "uat".into(), direction: use05_receipt::Direction::Up, source_commit: uat.clone(), target_before: Some(off.clone()), result_commit: uat.clone(), how: "fast-forward".into(),
+        rollback_point: Some(off.clone()), rules: vec![], bypasses: vec![], signoffs: vec![], policy_sha256: policy_of(&s).digest(), created: use05_core::time::rfc3339(use05_core::time::now_secs() + 60), by: "this machine".into(), reverts: None, task: None,
+    });
+    let key = use05_core::keys::read_secret_file(&s.home.path().join("local.key")).unwrap();
+    file_record(&s, &forged, &key, &uat);
+    // A "revert" to it, on prod's head, is no revert 05 knows: held.
+    let fake = s.git(&["commit-tree", &format!("{off}^{{tree}}"), "-p", &uat, "-m", "Revert prod"]);
+    let held = hand_push(&s, &["origin", &format!("{fake}:refs/heads/prod")]);
+    assert!(!held.status.success() && text(&held).contains("PROMOTE_NOT_EVALUATED_MOVE"), "{}", text(&held));
+    assert_eq!(remote_git(&remote, &["rev-parse", "prod"]), uat);
+    let out = s.run(&["promote", "prod", "--rollback", "--json"]);
+    assert_eq!((code(&out), json(&out)["code"].as_str()), (6, Some("NO_ROLLBACK_POINT")), "{}", text(&out));
+}
+
+#[test]
+fn the_hook_holds_an_agents_revert_where_people_promote() {
+    let (s, remote) = promotion_fixture("");
+    with_pre_push_hook(&s);
+    s.approver();
+    let (prod, uat) = (s.git(&["rev-parse", "prod"]), s.git(&["rev-parse", "uat"]));
+    let (exit, screen) = on_a_terminal(&s, &["promote", "prod", "--no-wait"], &["correct horse"]);
+    assert_eq!(exit, 0, "{screen}");
+    // Exactly the revert 05 would make, pushed by an agent, or by a script with no terminal.
+    let revert = s.git(&["commit-tree", &format!("{prod}^{{tree}}"), "-p", &uat, "-m", "Revert prod"]);
+    let held = hand_push_as(&s, &["origin", &format!("{revert}:refs/heads/prod")], &[("CLAUDE_CODE_SESSION_ID", "s-1")]);
+    assert!(!held.status.success() && text(&held).contains("AGENT_MAY_NOT_PROMOTE") && text(&held).split_whitespace().collect::<Vec<_>>().join(" ").contains("may not roll back prod"), "{}", text(&held));
+    let held = hand_push(&s, &["origin", &format!("{revert}:refs/heads/prod")]);
+    assert!(!held.status.success() && text(&held).split_whitespace().collect::<Vec<_>>().join(" ").contains("there is no terminal"), "{}", text(&held));
+    assert_eq!(remote_git(&remote, &["rev-parse", "prod"]), uat);
+}
+
+#[test]
+fn where_people_promote_a_failed_deploy_is_reported_not_reverted_by_itself() {
+    let (s, remote) = promotion_fixture_of(&ladder("", &format!("on_failure = \"revert\"\n{PROBE}")));
+    s.approver();
+    let (prod, uat) = (s.git(&["rev-parse", "prod"]), s.git(&["rev-parse", "uat"]));
+    let (exit, screen) = on_a_terminal(&s, &["promote", "prod", "--no-wait"], &["correct horse"]);
+    assert_eq!(exit, 0, "{screen}");
+    let file = says_it_runs(&s, &prod);
+    // CI, or anyone with no terminal: reported, nothing moves.
+    let out = s.run_env(&["promote", "prod", "--confirm", "--json"], &[("DEPLOYED", &file)]);
+    let j = json(&out);
+    assert_eq!((code(&out), j["code"].as_str(), j["details"]["action"].as_str()), (2, Some("DEPLOY_NOT_CONFIRMED"), Some("none")), "{}", text(&out));
+    assert_eq!(j["next"], "use05 promote prod --rollback");
+    assert!(j["notes"].as_array().unwrap().iter().any(|n| n.as_str().unwrap().starts_with("05 did not revert prod")), "{j:#}");
+    // A person at the terminal: no key is asked for after the wait; they roll back themselves.
+    let (exit, screen) = on_a_terminal_with(&s, &["promote", "prod", "--confirm"], &[], &[("DEPLOYED", &file)]);
+    assert_eq!(exit, 2, "{screen}");
+    let words = screen.split_whitespace().collect::<Vec<_>>().join(" ");
+    assert!(words.contains("05 did not revert prod by itself") && !words.contains("passphrase"), "{words}");
+    assert_eq!(remote_git(&remote, &["rev-parse", "prod"]), uat, "nothing was reverted");
+    assert!(records(&s, "promotion").iter().all(|p| p["predicate"]["how"] != "revert"));
+}
+
+#[test]
+fn under_runner_only_evidence_this_machine_does_not_revert_on_its_own_word() {
+    let prod = format!("agent = true\non_failure = \"revert\"\n{PROBE}\n[environment.rules]\nsource_checks = \"allow\"\n");
+    let (s, remote) = promotion_fixture_of(&format!("[evidence]\naccept = [\"runner\"]\n\n{}", ladder("", &prod)));
+    let (before, uat) = (s.git(&["rev-parse", "prod"]), s.git(&["rev-parse", "uat"]));
+    let file = says_it_runs(&s, &before);
+    let out = s.run_env(&["promote", "prod", "--json"], &[("DEPLOYED", &file)]);
+    let j = json(&out);
+    assert_eq!((code(&out), j["code"].as_str(), j["details"]["deploy"]["action"].as_str()), (2, Some("DEPLOY_NOT_CONFIRMED"), Some("none")), "{}", text(&out));
+    assert!(j["notes"].as_array().unwrap().iter().any(|n| n.as_str().unwrap().starts_with("05 did not revert prod: no promotion record into prod that counts here")), "{j:#}");
+    assert_eq!(remote_git(&remote, &["rev-parse", "prod"]), uat);
+}
+
+// ---------------------------------------------------------------- hotfix and back-merge (D93 6)
+
+/// Start a hotfix for prod, commit a fix on it, prove and finish it: the task's id and the fix.
+fn hotfix_ready(s: &Sandbox) -> (String, String) {
+    hotfix_ready_with(s, |s| s.write("fix.rs", "pub fn fix() {}\n"))
+}
+
+/// Like `hotfix_ready`, with the fix that `edit` makes.
+fn hotfix_ready_with(s: &Sandbox, edit: impl Fn(&Sandbox)) -> (String, String) {
+    let started = s.run(&["start", "--hotfix", "prod", "Fix the checkout total", "--json"]);
+    assert_eq!(code(&started), 0, "{}", text(&started));
+    let task = json(&started)["details"]["task"].as_str().unwrap().to_string();
+    edit(s);
+    s.commit_all("Fix the checkout total");
+    assert_eq!(code(&s.run(&["prove", "--tree", "HEAD"])), 0);
+    assert_eq!(code(&s.run(&["finish", "--outcome", "Fixed the checkout total"])), 0);
+    (task, s.git(&["rev-parse", "HEAD"]))
+}
+
+/// A hotfix for prod, approved by a person and landed and pushed through the pre-push hook.
+fn hotfix_landed(s: &Sandbox) -> (String, String) {
+    hotfix_landed_with(s, hotfix_ready(s))
+}
+
+/// Approve, land and push the hotfix `ready` made.
+fn hotfix_landed_with(s: &Sandbox, ready: (String, String)) -> (String, String) {
+    let (task, fix) = ready;
+    s.approver();
+    let approved = s.run_with_stdin(&["approve", "--outcome", "--tree", "HEAD", "--passphrase-stdin"], "correct horse\n");
+    assert_eq!(code(&approved), 0, "{}", text(&approved));
+    with_pre_push_hook(s);
+    let landed = s.run(&["land", "--push", "--json"]);
+    assert_eq!((code(&landed), json(&landed)["code"].as_str(), json(&landed)["details"]["pushed"].as_bool()), (0, Some("LANDED"), Some(true)), "{}", text(&landed));
+    (task, fix)
+}
+
+#[test]
+fn a_hotfix_task_starts_from_the_environment_branch() {
+    let (s, _remote) = promotion_fixture("");
+    let prod = s.git(&["rev-parse", "origin/prod"]);
+    assert_ne!(prod, s.git(&["rev-parse", "main"]), "main has moved on from prod");
+    let out = s.run(&["start", "--hotfix", "prod", "Fix the checkout total", "--json"]);
+    let j = json(&out);
+    assert_eq!((code(&out), j["code"].as_str()), (0, Some("TASK_STARTED")), "{}", text(&out));
+    let d = &j["details"];
+    assert_eq!((d["hotfix"].as_str(), d["target"].as_str(), d["base_commit"].as_str()), (Some("prod"), Some("prod"), Some(prod.as_str())), "{j:#}");
+    let branch = s.git(&["branch", "--show-current"]);
+    assert!(branch.starts_with("05/hotfix-prod-"), "{branch}");
+    assert_eq!(s.git(&["rev-parse", "HEAD"]), prod, "the work starts from origin's prod");
+    assert_eq!(s.git(&["rev-parse", "--abbrev-ref", "@{upstream}"]), "origin/prod", "and is judged by prod's rules");
+    let shown = s.run(&["start", "--hotfix", "prod", "Fix it again"]);
+    assert_eq!(code(&shown), 0, "{}", text(&shown));
+    snapshot_text("start_hotfix", &normalise(&s, &text(&shown)).replace(&prod[..10], "<PROD10>"));
+    // Not where work lands, and not with uncommitted work in the way.
+    let lowest = s.run(&["start", "--hotfix", "dev", "Fix dev", "--json"]);
+    assert_eq!((code(&lowest), json(&lowest)["code"].as_str()), (6, Some("HOTFIX_ON_LANDING_BRANCH")), "{}", text(&lowest));
+    s.write(".05/policy.toml", &(fs::read_to_string(s.path(".05/policy.toml")).unwrap() + "# a change not committed\n"));
+    let dirty = s.run(&["start", "--hotfix", "prod", "Fix it", "--json"]);
+    assert_eq!((code(&dirty), json(&dirty)["code"].as_str()), (6, Some("UNCOMMITTED")), "{}", text(&dirty));
+}
+
+#[test]
+fn a_hotfix_needs_an_approval_even_when_nothing_else_does() {
+    let (s, remote) = promotion_fixture("");
+    let before = s.git(&["rev-parse", "origin/prod"]);
+    let (task, fix) = hotfix_ready(&s);
+    let brief = json(&s.run(&["brief", "--json"]));
+    let holding: Vec<&str> = brief["brief"]["gate"]["findings"].as_array().unwrap().iter().filter(|f| f["effect"] == "approval" || f["effect"] == "deny" || f["effect"] == "wait").map(|f| f["code"].as_str().unwrap()).collect();
+    assert_eq!(holding, ["HOTFIX_NEEDS_APPROVAL"], "nothing else holds it: {brief:#}");
+    let held = s.run(&["land", "--json"]);
+    assert_eq!((code(&held), json(&held)["code"].as_str()), (3, Some("NOT_ALLOWED")), "{}", text(&held));
+    assert!(json(&held)["message"].as_str().unwrap().contains("a hotfix lands straight on prod"), "{}", text(&held));
+    assert_eq!(json(&held)["next"], "ask a person to approve it: use05 approve --outcome");
+    // A push of it by hand is held by the pre-push hook for the same reason.
+    with_pre_push_hook(&s);
+    let pushed = hand_push(&s, &["origin", "HEAD:prod"]);
+    assert!(!pushed.status.success() && text(&pushed).contains("HOTFIX_NEEDS_APPROVAL"), "{}", text(&pushed));
+    assert_eq!(remote_git(&remote, &["rev-parse", "prod"]), before);
+    // Approved, it lands on prod and goes out through the same hook, with a hotfix record.
+    s.approver();
+    let approved = s.run_with_stdin(&["approve", "--outcome", "--tree", "HEAD", "--passphrase-stdin"], "correct horse\n");
+    assert_eq!(code(&approved), 0, "{}", text(&approved));
+    let landed = s.run(&["land", "--push", "--json"]);
+    let j = json(&landed);
+    assert_eq!((code(&landed), j["code"].as_str(), j["details"]["target"].as_str(), j["details"]["pushed"].as_bool()), (0, Some("LANDED"), Some("prod"), Some(true)), "{}", text(&landed));
+    assert_eq!(remote_git(&remote, &["rev-parse", "prod"]), fix, "origin's prod is the fix");
+    let hotfixes: Vec<Value> = records(&s, "promotion").into_iter().filter(|p| p["predicate"]["direction"] == "hotfix").collect();
+    assert_eq!(hotfixes.len(), 1, "{hotfixes:#?}");
+    let p = &hotfixes[0]["predicate"];
+    assert_eq!((p["env"].as_str(), p["from"].as_str(), p["task"].as_str(), p["how"].as_str()), (Some("prod"), Some("prod"), Some(task.as_str()), Some("fast-forward")));
+    assert_eq!((p["source_commit"].as_str(), p["result_commit"].as_str(), p["target_before"].as_str()), (Some(fix.as_str()), Some(fix.as_str()), Some(before.as_str())));
+}
+
+#[test]
+fn promotion_into_prod_after_a_hotfix_is_refused_until_back_merged() {
+    let (s, _remote) = promotion_fixture("");
+    let (task, _fix) = hotfix_landed(&s);
+    s.git(&["checkout", "-q", "main"]);
+    let out = s.run(&["promote", "prod", "--check", "--json"]);
+    let j = json(&out);
+    let f = &j["details"]["findings"][0];
+    assert_eq!((code(&out), f["code"].as_str()), (2, Some("PROMOTE_TARGET_AHEAD")), "{}", text(&out));
+    assert!(f["message"].as_str().unwrap().contains(&format!("they come from the hotfix task {task}")), "{f:#}");
+    assert_eq!(f["next"], "merge it down into uat first: use05 promote uat --back");
+    let back = s.run(&["promote", "uat", "--back", "--json"]);
+    assert_eq!((code(&back), json(&back)["code"].as_str()), (0, Some("MERGED_BACK")), "{}", text(&back));
+    let out = json(&s.run(&["promote", "prod", "--check", "--json"]));
+    let codes: Vec<&str> = out["details"]["findings"].as_array().unwrap().iter().map(|f| f["code"].as_str().unwrap()).collect();
+    assert!(!codes.contains(&"PROMOTE_TARGET_AHEAD"), "uat has the fix now: {codes:?}");
+    // uat is now ahead of dev by the same hotfix: the next rung down says so.
+    let uat = json(&s.run(&["promote", "uat", "--check", "--json"]));
+    let f = &uat["details"]["findings"][0];
+    assert_eq!(f["code"], "PROMOTE_TARGET_AHEAD", "{uat:#}");
+    assert!(f["message"].as_str().unwrap().contains(&format!("they come from the hotfix task {task}")), "{f:#}");
+    assert_eq!(f["next"], "merge it down into dev first: use05 promote dev --back");
+}
+
+#[test]
+fn back_merge_merges_down_one_rung_with_a_record() {
+    let (s, remote) = promotion_fixture("");
+    let (_task, fix) = hotfix_landed(&s);
+    s.git(&["checkout", "-q", "main"]);
+    let (uat, main) = (remote_git(&remote, &["rev-parse", "uat"]), remote_git(&remote, &["rev-parse", "main"]));
+    let checked = s.run(&["promote", "uat", "--back", "--check", "--json"]);
+    assert_eq!((code(&checked), json(&checked)["code"].as_str(), json(&checked)["details"]["direction"].as_str()), (0, Some("PROMOTE_CHECKED"), Some("back")), "{}", text(&checked));
+    // A sign-off on it is bound to uat, as it comes from prod.
+    let signoff = json(&s.run(&["approve", "--promote", "uat", "--back", "--unsigned", "--note", "checked the fix in uat", "--json"]));
+    assert_eq!((signoff["details"]["env"].as_str(), signoff["details"]["from"].as_str(), signoff["details"]["source_commit"].as_str()), (Some("uat"), Some("prod"), Some(fix.as_str())), "{signoff:#}");
+    assert_eq!(remote_git(&remote, &["rev-parse", "uat"]), uat, "a check moves nothing");
+    let out = s.run(&["promote", "uat", "--back"]);
+    assert_eq!(code(&out), 0, "{}", text(&out));
+    snapshot("promote_back", &s, &out);
+    let merge = remote_git(&remote, &["rev-parse", "uat"]);
+    assert_eq!(remote_git(&remote, &["rev-list", "--parents", "-n", "1", &merge]), format!("{merge} {uat} {fix}"), "a merge commit on uat's head, with prod's as its second parent");
+    assert!(remote_git(&remote, &["log", "-1", "--format=%B", &merge]).starts_with(&format!("Merge prod back into uat ({})", &fix[..12])));
+    let backs: Vec<Value> = records(&s, "promotion").into_iter().filter(|p| p["predicate"]["direction"] == "back").collect();
+    assert_eq!(backs.len(), 1);
+    let p = &backs[0]["predicate"];
+    assert_eq!((p["env"].as_str(), p["from"].as_str(), p["how"].as_str()), (Some("uat"), Some("prod"), Some("merge")));
+    assert_eq!((p["source_commit"].as_str(), p["target_before"].as_str(), p["result_commit"].as_str(), p["rollback_point"].as_str()), (Some(fix.as_str()), Some(uat.as_str()), Some(merge.as_str()), Some(uat.as_str())));
+    // One rung at a time: next into dev, which is where work lands and keeps the task gate.
+    let j = json(&s.run(&["promote", "dev", "--back", "--json"]));
+    assert_eq!(j["code"], "MERGED_BACK", "{j:#}");
+    let into_main = remote_git(&remote, &["rev-parse", "main"]);
+    assert_eq!(remote_git(&remote, &["rev-list", "--parents", "-n", "1", &into_main]), format!("{into_main} {main} {merge}"));
+    assert_eq!(records(&s, "promotion").iter().filter(|p| p["predicate"]["direction"] == "back" && p["predicate"]["env"] == "dev").count(), 1);
+    let again = s.run(&["promote", "dev", "--back", "--json"]);
+    assert_eq!(json(&again)["code"], "NOTHING_TO_MERGE_BACK", "{}", text(&again));
+}
+
+#[test]
+fn back_merge_conflict_leaves_nothing_behind() {
+    let (s, remote) = promotion_fixture("");
+    for (branch, content) in [("prod", "prod's fix\n"), ("uat", "uat's change\n")] {
+        s.git(&["checkout", "-q", branch]);
+        s.write("feature.rs", content);
+        s.commit_all(&format!("Change the feature on {branch}"));
+        s.git(&["push", "-q", "origin", branch]);
+    }
+    s.git(&["checkout", "-q", "main"]);
+    // What git itself records when it fetches origin's default branch (origin/HEAD) is not a move.
+    let state = || {
+        let (here, there) = all_refs(&s, &remote);
+        (here.lines().filter(|l| !l.starts_with("refs/remotes/origin/HEAD ")).collect::<Vec<_>>().join("\n"), there, s.git(&["status", "--porcelain"]), s.git(&["worktree", "list"]))
+    };
+    let before = state();
+    let out = s.run(&["promote", "uat", "--back", "--json"]);
+    let j = json(&out);
+    assert_eq!((code(&out), j["code"].as_str()), (2, Some("BACK_MERGE_CONFLICT")), "{}", text(&out));
+    assert!(j["message"].as_str().unwrap().contains("feature.rs"), "{j:#}");
+    assert!(j["next"].as_str().unwrap().contains("by hand"), "{j:#}");
+    assert_eq!(state(), before, "no branch, file or worktree changed, here or on origin");
+    assert!(records(&s, "promotion").is_empty());
+}
+
+#[test]
+fn a_back_merge_onto_the_landing_branch_is_judged_as_one_before_the_task_gate() {
+    // The hotfix touches 05's own policy file, which the task gate holds for a person; merged
+    // back down, the landing branch judges it by its rules but those about the source.
+    let (s, remote) = promotion_fixture("");
+    let note = |s: &Sandbox| s.write(".05/policy.toml", &(fs::read_to_string(s.path(".05/policy.toml")).unwrap() + "# hotfix note\n"));
+    let (_task, _fix) = hotfix_landed_with(&s, hotfix_ready_with(&s, note));
+    s.git(&["checkout", "-q", "main"]);
+    let back = s.run(&["promote", "uat", "--back", "--json"]);
+    assert_eq!(json(&back)["code"], "MERGED_BACK", "{}", text(&back));
+    let main = remote_git(&remote, &["rev-parse", "main"]);
+    // A merge of the same two heads made by hand, with something else in it, is the task gate's.
+    s.git(&["checkout", "-q", "-b", "by-hand", "origin/main"]);
+    s.git(&["merge", "-q", "--no-ff", "-m", "Merge uat by hand", "origin/uat"]);
+    s.write("extra.rs", "pub fn extra() {}\n");
+    s.git(&["add", "-A"]);
+    s.git(&["commit", "-q", "--amend", "--no-edit"]);
+    let held = hand_push(&s, &["origin", "by-hand:main"]);
+    assert!(!held.status.success() && text(&held).contains("PROTECTED_PATH"), "{}", text(&held));
+    assert_eq!(remote_git(&remote, &["rev-parse", "main"]), main);
+    s.git(&["checkout", "-q", "main"]);
+    let into_dev = s.run(&["promote", "dev", "--back", "--json"]);
+    assert_eq!((code(&into_dev), json(&into_dev)["code"].as_str()), (0, Some("MERGED_BACK")), "{}", text(&into_dev));
+    assert_ne!(remote_git(&remote, &["rev-parse", "main"]), main, "the hook let the back-merge onto main");
+}
+
+#[test]
+fn an_agent_may_start_a_hotfix_and_its_hook_seals_it_from_the_environments_branch() {
+    let s = Sandbox::with_agent_hooks();
+    let ladder = ENVIRONMENTS.split_once("[[environment]]").map(|(_, rest)| format!("[[environment]]{rest}")).unwrap();
+    s.write(".05/policy.toml", &(fs::read_to_string(s.path(".05/policy.toml")).unwrap() + "\n" + &ladder));
+    s.commit_all("Environments");
+    s.git(&["branch", "uat"]);
+    s.git(&["branch", "prod"]);
+    let remote = tempfile::tempdir().unwrap();
+    assert!(Command::new("git").args(["init", "-q", "--bare", "-b", "main", &remote.path().display().to_string()]).status().unwrap().success());
+    s.git(&["remote", "add", "origin", &remote.path().display().to_string()]);
+    s.write("feature.rs", "pub fn feature() {}\n");
+    s.commit_all("Add the feature");
+    s.git(&["push", "-q", "origin", "main", "uat", "prod"]);
+    let prod = s.git(&["rev-parse", "prod"]);
+    let out = s.run_env(&["start", "--hotfix", "prod", "Fix the checkout total", "--scope", "src/**"], &[("CODEX_SESSION_ID", "s1")]);
+    assert_eq!(code(&out), 0, "{}", text(&out));
+    assert!(text(&out).contains("Declared: Fix the checkout total") && text(&out).contains("lands on prod"), "{}", text(&out));
+    assert_eq!(s.git(&["rev-parse", "HEAD"]), prod, "the agent works from prod");
+    codex_hook(&s, "s1", "PreToolUse", "src/a.rs");
+    let task = task_json(&s, "s1");
+    assert_eq!((task["hotfix"].as_str(), task["base_commit"].as_str()), (Some("prod"), Some(prod.as_str())), "{task}");
+    assert!(task["branch"].as_str().unwrap().starts_with("05/hotfix-prod-"), "{task}");
+}
+
+// ---------------------------------------------------------------- hotfix and back-merge, fix round 1
+
+/// Approve the current tree as a person, with these words.
+fn approve_outcome(s: &Sandbox, args: &[&str]) -> Output {
+    let mut all = vec!["approve", "--outcome", "--passphrase-stdin"];
+    all.extend_from_slice(args);
+    s.run_with_stdin(&all, "correct horse\n")
+}
+
+#[test]
+fn an_approval_given_for_something_else_does_not_land_a_hotfix() {
+    let (s, _remote) = promotion_fixture("");
+    hotfix_ready(&s);
+    s.approver();
+    // An approval of the same tree, given as someone else's work and not as this hotfix.
+    let other = approve_outcome(&s, &["--rev", "HEAD", "--reason", "looked at the commit"]);
+    assert_eq!(code(&other), 0, "{}", text(&other));
+    let held = s.run(&["land", "--json"]);
+    assert_eq!((code(&held), json(&held)["code"].as_str()), (3, Some("NOT_ALLOWED")), "{}", text(&held));
+    assert!(json(&held)["message"].as_str().unwrap().contains("an approval of this tree given for something else does not count for it"), "{}", text(&held));
+    // Given for this hotfix, it counts.
+    assert_eq!(code(&approve_outcome(&s, &["--tree", "HEAD"])), 0);
+    let records = records(&s, "approval");
+    assert!(records.iter().any(|a| a["predicate"]["hotfix"] == "prod"), "{records:#?}");
+    let landed = s.run(&["land", "--json"]);
+    assert_eq!((code(&landed), json(&landed)["code"].as_str()), (0, Some("LANDED")), "{}", text(&landed));
+}
+
+#[test]
+fn a_hotfix_that_carries_other_work_onto_prod_is_refused() {
+    let (s, remote) = promotion_fixture("");
+    s.approver();
+    let feature = s.git(&["rev-parse", "main"]);
+    // A person approved main's head, for main.
+    assert_eq!(code(&approve_outcome(&s, &["--tree", "HEAD"])), 0);
+    // A hotfix that is main's work, not its own: approved for the hotfix too, it is still refused.
+    assert_eq!(code(&s.run(&["start", "--hotfix", "prod", "Bring the feature"])), 0);
+    s.git(&["merge", "-q", "--ff-only", "origin/main"]);
+    assert_eq!(code(&s.run(&["finish", "--outcome", "Fixed"])), 0);
+    assert_eq!(code(&approve_outcome(&s, &["--tree", "HEAD"])), 0);
+    let held = s.run(&["land", "--json"]);
+    let j = json(&held);
+    assert_eq!((code(&held), j["code"].as_str()), (2, Some("NOT_ALLOWED")), "{}", text(&held));
+    assert!(j["message"].as_str().unwrap().contains(&format!("{} is already on main", &feature[..12])), "{j:#}");
+    with_pre_push_hook(&s);
+    let before = remote_git(&remote, &["rev-parse", "prod"]);
+    let pushed = hand_push(&s, &["origin", "HEAD:prod"]);
+    assert!(!pushed.status.success() && text(&pushed).contains("HOTFIX_NOT_ITS_WORK"), "{}", text(&pushed));
+    assert_eq!(remote_git(&remote, &["rev-parse", "prod"]), before);
+    // A merge commit in the range is no hotfix's own work either.
+    s.git(&["checkout", "-q", "-b", "side", "origin/prod"]);
+    s.write("side.rs", "pub fn side() {}\n");
+    s.commit_all("Side work");
+    assert_eq!(code(&s.run(&["start", "--hotfix", "prod", "Merge side work"])), 0);
+    s.git(&["merge", "-q", "--no-ff", "-m", "Merge side", "side"]);
+    let held = s.run(&["land", "--json"]);
+    assert!(json(&held)["message"].as_str().unwrap().contains("is a merge commit"), "{}", text(&held));
+}
+
+#[test]
+fn a_hotfix_is_held_to_prods_signers_words_and_statements() {
+    let dana = use05_receipt::SigningKey::from_bytes(&[13; 32]);
+    let (s, _remote) = promotion_fixture_with(&key_entry("dana", "approver", &dana, Some("Dana")), "\n[environment.sign_off]\nsigners = [\"Dana\"]\n");
+    hotfix_ready(&s);
+    s.approver();
+    assert_eq!(code(&approve_outcome(&s, &["--tree", "HEAD", "--reason", "fixed and checked"])), 0);
+    let held = s.run(&["land", "--json"]);
+    assert_eq!(code(&held), 3, "{}", text(&held));
+    assert!(json(&held)["message"].as_str().unwrap().contains("'s approval does not count for it: its key names no person in the policy"), "only Dana may sign, and the policy knows this key for nobody: {}", text(&held));
+
+    let (s, _remote) = promotion_fixture("\n[environment.sign_off]\nmin_length = 20\n\n[[environment.confirm]]\ntext = \"The release notes are published\"\n");
+    hotfix_ready(&s);
+    s.approver();
+    // Words too short for prod's sign-off are refused before anything is signed, not held later.
+    let short = approve_outcome(&s, &["--tree", "HEAD", "--reason", "ok", "--json"]);
+    assert_eq!((code(&short), json(&short)["code"].as_str()), (6, Some("HOTFIX_WORDS_TOO_SHORT")), "{}", text(&short));
+    assert!(json(&short)["message"].as_str().unwrap().contains("at least 20 characters") && records(&s, "approval").is_empty(), "{}", text(&short));
+    assert_eq!(code(&approve_outcome(&s, &["--tree", "HEAD", "--reason", "fixed the total, tried it"])), 0);
+    // A statement only a person can give needs a sign-off that gives it.
+    let held = s.run(&["land", "--json"]);
+    assert_eq!(code(&held), 3, "{}", text(&held));
+    assert_eq!(json(&held)["next"], "use05 approve --promote prod --hotfix --note \"<what you checked>\"", "{}", text(&held));
+    let (exit, screen) = on_a_terminal(&s, &["approve", "--promote", "prod", "--hotfix", "--note", "tried the fixed total by hand", "--confirm", "The release notes are published"], &["correct horse"]);
+    assert_eq!(exit, 0, "{screen}");
+    let signoff = &records(&s, "signoff")[0]["predicate"];
+    assert_eq!((signoff["env"].as_str(), signoff["from"].as_str(), signoff["source_commit"].as_str()), (Some("prod"), Some("prod"), Some(s.git(&["rev-parse", "HEAD"]).as_str())));
+    let landed = s.run(&["land", "--json"]);
+    assert_eq!((code(&landed), json(&landed)["code"].as_str()), (0, Some("LANDED")), "{}", text(&landed));
+}
+
+#[test]
+fn a_hotfix_record_is_filed_only_once_its_push_went_through() {
+    let (s, remote) = promotion_fixture("");
+    hotfix_ready(&s);
+    s.approver();
+    assert_eq!(code(&approve_outcome(&s, &["--tree", "HEAD"])), 0);
+    with_pre_push_hook(&s);
+    let hook = remote.path().join("hooks").join("pre-receive");
+    fs::write(&hook, "#!/bin/sh\nwhile read old new ref; do [ \"$ref\" = refs/heads/prod ] && { echo \"prod is frozen\" >&2; exit 1; }; done\nexit 0\n").unwrap();
+    fs::set_permissions(&hook, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+    let refused = s.run(&["land", "--push", "--json"]);
+    let j = json(&refused);
+    assert_eq!((j["code"].as_str(), j["details"]["pushed"].as_bool()), (Some("LANDED"), Some(false)), "{j:#}");
+    assert!(j["notes"].as_array().unwrap().iter().any(|n| n.as_str().unwrap().contains("no hotfix record exists yet")), "{j:#}");
+    assert!(records(&s, "promotion").is_empty(), "no record, here or on origin");
+    // Once the push goes through, the record is filed.
+    fs::remove_file(&hook).unwrap();
+    let pushed = s.run(&["land", "--push", "--json"]);
+    assert_eq!((json(&pushed)["code"].as_str(), json(&pushed)["details"]["pushed"].as_bool()), (Some("LANDED"), Some(true)), "{}", text(&pushed));
+    assert_eq!(records(&s, "promotion").iter().filter(|p| p["predicate"]["direction"] == "hotfix").count(), 1);
+    assert!(remote_git(&remote, &["for-each-ref", "refs/heads/05-receipts/"]).contains("05-receipts/"), "the record is on origin");
+}
+
+#[test]
+fn a_hotfix_whose_environment_moved_on_is_refused() {
+    let (s, _remote) = promotion_fixture("");
+    hotfix_ready(&s);
+    s.approver();
+    assert_eq!(code(&approve_outcome(&s, &["--tree", "HEAD"])), 0);
+    let here = s.git(&["branch", "--show-current"]);
+    s.git(&["checkout", "-q", "prod"]);
+    s.write("other.rs", "pub fn other() {}\n");
+    s.commit_all("Something else on prod");
+    s.git(&["push", "-q", "origin", "prod"]);
+    s.git(&["checkout", "-q", &here]);
+    let held = s.run(&["land", "--json"]);
+    assert_eq!(code(&held), 2, "{}", text(&held));
+    assert!(json(&held)["message"].as_str().unwrap().contains("prod moved on since it started"), "{}", text(&held));
+}
+
+#[test]
+fn a_refused_hotfix_start_leaves_the_checkout_as_it_was() {
+    let (s, _remote) = promotion_fixture_with("[drift]\noverlap = \"deny\"\n", "");
+    assert_eq!(code(&s.run(&["start", "Cap retries", "--scope", "src/**"])), 0);
+    let before = (s.git(&["branch", "--show-current"]), s.git(&["rev-parse", "HEAD"]), s.git(&["branch", "--list"]));
+    let out = s.run(&["start", "--hotfix", "prod", "Fix retries", "--scope", "src/**", "--json"]);
+    assert_eq!(json(&out)["code"], "OVERLAP", "{}", text(&out));
+    assert_eq!((s.git(&["branch", "--show-current"]), s.git(&["rev-parse", "HEAD"]), s.git(&["branch", "--list"])), before, "no branch made, nothing checked out");
+}
+
+/// prod and uat each change feature.rs their own way, pushed: they conflict.
+fn conflicting_rungs() -> (Sandbox, TempDir) {
+    let (s, remote) = promotion_fixture("");
+    for (branch, content) in [("prod", "prod's fix\n"), ("uat", "uat's change\n")] {
+        s.git(&["checkout", "-q", branch]);
+        s.write("feature.rs", content);
+        s.commit_all(&format!("Change the feature on {branch}"));
+        s.git(&["push", "-q", "origin", branch]);
+    }
+    s.git(&["checkout", "-q", "main"]);
+    (s, remote)
+}
+
+/// Merge origin/prod into a copy of origin/uat by hand, resolving feature.rs: the merge commit.
+fn resolve_by_hand(s: &Sandbox, branch: &str, extra: Option<&str>) -> String {
+    s.git(&["checkout", "-q", "-b", branch, "origin/uat"]);
+    let _ = Command::new("git").current_dir(s.dir.path()).args(["-c", "user.name=t", "-c", "user.email=t@example.com", "merge", "-q", "origin/prod"]).output().unwrap();
+    s.write("feature.rs", "both changes\n");
+    if let Some(path) = extra {
+        s.write(path, "more\n");
+    }
+    s.git(&["add", "-A"]);
+    s.git(&["commit", "-q", "--no-edit"]);
+    s.git(&["checkout", "-q", "main"]);
+    s.git(&["rev-parse", branch])
+}
+
+#[test]
+fn a_back_merge_resolved_by_hand_passes_with_a_persons_sign_off_on_it() {
+    let (s, remote) = conflicting_rungs();
+    let refused = json(&s.run(&["promote", "uat", "--back", "--json"]));
+    assert_eq!(refused["code"], "BACK_MERGE_CONFLICT");
+    let next = refused["next"].as_str().unwrap();
+    assert!(next.contains("git merge origin/prod") && next.contains("use05 approve --promote uat --back --rev <merge commit>"), "{next}");
+    with_pre_push_hook(&s);
+    let merge = resolve_by_hand(&s, "resolved", None);
+    let held = hand_push(&s, &["origin", "resolved:uat"]);
+    assert!(!held.status.success() && text(&held).contains("BACK_MERGE_RESOLVED"), "{}", text(&held));
+    s.approver();
+    let (exit, screen) = on_a_terminal(&s, &["approve", "--promote", "uat", "--back", "--rev", &merge, "--note", "kept both changes to feature.rs"], &["correct horse"]);
+    assert_eq!(exit, 0, "{screen}");
+    let pushed = hand_push(&s, &["origin", "resolved:uat"]);
+    assert!(pushed.status.success(), "{}", text(&pushed));
+    assert_eq!(remote_git(&remote, &["rev-parse", "uat"]), merge);
+    // A merge that changes anything beyond the conflicted files is no back-merge.
+    let (s, remote) = conflicting_rungs();
+    with_pre_push_hook(&s);
+    let before = remote_git(&remote, &["rev-parse", "uat"]);
+    resolve_by_hand(&s, "more", Some("extra.rs"));
+    let held = hand_push(&s, &["origin", "more:uat"]);
+    assert!(!held.status.success() && text(&held).contains("PROMOTE_NOT_EVALUATED_MOVE"), "{}", text(&held));
+    assert_eq!(remote_git(&remote, &["rev-parse", "uat"]), before);
+}
+
+#[test]
+fn a_forged_back_merge_into_uat_is_held() {
+    let (s, remote) = promotion_fixture("");
+    hotfix_landed(&s);
+    s.git(&["checkout", "-q", "main"]);
+    let before = remote_git(&remote, &["rev-parse", "uat"]);
+    // Its second parent is not prod's head.
+    let tree = s.git(&["rev-parse", "origin/main^{tree}"]);
+    let wrong = s.git(&["commit-tree", &tree, "-p", "origin/uat", "-p", "origin/main", "-m", "Merge prod back into uat"]);
+    let held = hand_push(&s, &["origin", &format!("{wrong}:refs/heads/uat")]);
+    assert!(!held.status.success() && text(&held).contains("PROMOTE_NOT_EVALUATED_MOVE"), "{}", text(&held));
+    // The right parents, with something added to the clean merge.
+    s.git(&["checkout", "-q", "-b", "forged", "origin/uat"]);
+    s.git(&["merge", "-q", "--no-ff", "-m", "Merge prod back into uat", "origin/prod"]);
+    s.write("extra.rs", "pub fn extra() {}\n");
+    s.git(&["add", "-A"]);
+    s.git(&["commit", "-q", "--amend", "--no-edit"]);
+    let held = hand_push(&s, &["origin", "forged:uat"]);
+    assert!(!held.status.success() && text(&held).contains("PROMOTE_NOT_EVALUATED_MOVE"), "{}", text(&held));
+    assert_eq!(remote_git(&remote, &["rev-parse", "uat"]), before);
+}
+
+#[test]
+fn a_back_merges_rule_can_be_bypassed_by_a_person_for_that_merge() {
+    let uat = "\n[environment.rules]\nuntasked = \"deny\"\n";
+    let (s, remote) = promotion_fixture_of(&ladder(uat, ""));
+    // A commit made on prod by hand, which belongs to no task.
+    s.git(&["checkout", "-q", "prod"]);
+    s.write("hand.rs", "pub fn hand() {}\n");
+    s.commit_all("Fix prod by hand");
+    s.git(&["push", "-q", "origin", "prod"]);
+    s.git(&["checkout", "-q", "main"]);
+    let held = s.run(&["promote", "uat", "--back", "--json"]);
+    assert_eq!((code(&held), json(&held)["code"].as_str()), (2, Some("UNTASKED_COMMITS")), "{}", text(&held));
+    // The pre-push hook says how to break glass for it.
+    with_pre_push_hook(&s);
+    s.git(&["checkout", "-q", "-b", "by-hand", "origin/uat"]);
+    s.git(&["merge", "-q", "--no-ff", "-m", "Merge prod back into uat", "origin/prod"]);
+    s.git(&["checkout", "-q", "main"]);
+    let pushed = hand_push(&s, &["origin", "by-hand:uat"]);
+    assert!(!pushed.status.success() && text(&pushed).contains("use05 bypass --promote uat --back --rule <rule>"), "{}", text(&pushed));
+    s.approver();
+    let (exit, screen) = on_a_terminal(&s, &["bypass", "--promote", "uat", "--back", "--rule", "untasked", "--reason", "fixed by hand during the outage"], &["correct horse"]);
+    assert_eq!(exit, 0, "{screen}");
+    let bypass = &records(&s, "bypass")[0];
+    assert_eq!((bypass["predicate"]["env"].as_str(), bypass["predicate"]["from"].as_str(), bypass["subject"][0]["digest"]["gitCommit"].as_str()), (Some("uat"), Some("prod"), Some(s.git(&["rev-parse", "origin/prod"]).as_str())));
+    let out = s.run(&["promote", "uat", "--back", "--json"]);
+    assert_eq!((code(&out), json(&out)["code"].as_str()), (0, Some("MERGED_BACK")), "{}", text(&out));
+    assert_eq!(remote_git(&remote, &["rev-parse", "uat"]), json(&out)["details"]["result_commit"].as_str().unwrap());
+}
+
+// ---------------------------------------------------------------- destinations and agent remotes (D93 7)
+
+/// A repository whose landing branch `main` holds `product/` and is on a bare origin, its checks
+/// proved there, and a second, empty bare repository: the destination. `dest` goes into the
+/// policy, with `{REMOTE}` standing for the destination's path.
+fn destination_fixture(dest: &str) -> (Sandbox, TempDir, TempDir) {
+    let s = Sandbox::new();
+    let public = tempfile::tempdir().unwrap();
+    let public_path = public.path().display().to_string();
+    assert!(Command::new("git").args(["init", "-q", "--bare", "-b", "main", &public_path]).status().unwrap().success());
+    fs::create_dir_all(s.path(".05")).unwrap();
+    fs::create_dir_all(s.path("product/src")).unwrap();
+    s.write(".05/policy.toml", &format!("[[check]]\nname = \"test\"\nrun = [\"./test.sh\"]\n\n{}", dest.replace("{REMOTE}", &public_path)));
+    s.write("product/README.md", "# The product\n");
+    s.write("product/src/lib.rs", "pub fn product() {}\n");
+    s.commit_all("base");
+    s.write("notes.md", "internal notes\n");
+    s.commit_all("Internal notes");
+    let origin = tempfile::tempdir().unwrap();
+    let origin_path = origin.path().display().to_string();
+    assert!(Command::new("git").args(["init", "-q", "--bare", "-b", "main", &origin_path]).status().unwrap().success());
+    s.git(&["remote", "add", "origin", &origin_path]);
+    s.git(&["push", "-q", "origin", "main"]);
+    let proved = s.run(&["prove", "--tree", "origin/main"]);
+    assert_eq!(code(&proved), 0, "{}", text(&proved));
+    (s, origin, public)
+}
+
+const EXPORT: &str = "[[destination]]\nname = \"public\"\nhow = \"export\"\nfrom = \"product/\"\nremote = \"{REMOTE}\"\nbranch = \"main\"\nagent = true\n";
+const MIRROR: &str = "[[destination]]\nname = \"mirror\"\nhow = \"push\"\nremote = \"{REMOTE}\"\nbranch = \"main\"\nagent = true\n";
+
+#[test]
+fn export_destination_copies_the_folder_as_one_commit() {
+    let (s, _origin, public) = destination_fixture(EXPORT);
+    let head = s.git(&["rev-parse", "origin/main"]);
+    // Not committed, so never exported.
+    s.write("product/scratch.txt", "work in progress\n");
+    let checked = s.run(&["promote", "public", "--check", "--json"]);
+    let j = json(&checked);
+    assert_eq!((code(&checked), j["code"].as_str(), j["details"]["how"].as_str(), j["details"]["from"].as_str()), (0, Some("PROMOTE_CHECKED"), Some("export"), Some("main")), "{}", text(&checked));
+    assert_eq!(j["details"]["rules"].as_array().unwrap().len(), 6, "{j:#}");
+    assert_eq!(j["details"]["rules_from"], "main's policy (origin/main)", "{j:#}");
+    assert!(remote_git(&public, &["for-each-ref"]).is_empty(), "a check pushes nothing");
+    let brief = s.run(&["brief", "--promote", "public"]);
+    assert_eq!(code(&brief), 0, "{}", text(&brief));
+    assert!(text(&brief).contains("main → public"), "{}", text(&brief));
+
+    let out = s.run(&["promote", "public", "--json"]);
+    let j = json(&out);
+    assert_eq!((code(&out), j["code"].as_str()), (0, Some("PROMOTED")), "{}", text(&out));
+    let sync = remote_git(&public, &["rev-parse", "main"]);
+    assert_eq!(j["details"]["result_commit"], sync);
+    assert_eq!(remote_git(&public, &["rev-parse", "main^{tree}"]), s.git(&["rev-parse", &format!("{head}:product")]), "its whole tree is the folder's exact committed content");
+    assert_eq!(remote_git(&public, &["ls-tree", "-r", "--name-only", "main"]), "README.md\nsrc/lib.rs", "the folder's files, and nothing from outside it or uncommitted");
+    assert_eq!(remote_git(&public, &["rev-list", "--count", "main"]), "1", "one commit");
+    let message = remote_git(&public, &["log", "-1", "--format=%B", "main"]);
+    assert!(message.starts_with(&format!("Sync from {}", &head[..12])), "{message}");
+    assert!(message.contains("05-Promotion: public from main") && message.contains(&format!("05-Source: {head}")), "{message}");
+    let promotions = records(&s, "promotion");
+    assert_eq!(promotions.len(), 1);
+    let p = &promotions[0]["predicate"];
+    assert_eq!((p["env"].as_str(), p["from"].as_str(), p["direction"].as_str(), p["how"].as_str()), (Some("public"), Some("main"), Some("up"), Some("export")));
+    assert_eq!((p["source_commit"].as_str(), p["result_commit"].as_str(), p["target_before"].as_str()), (Some(head.as_str()), Some(sync.as_str()), None));
+
+    // Nothing changed in the folder: nothing to sync, even though main moved.
+    fs::remove_file(s.path("product/scratch.txt")).unwrap();
+    s.write("notes.md", "more internal notes\n");
+    s.commit_all("More notes");
+    s.git(&["push", "-q", "origin", "main"]);
+    let again = s.run(&["promote", "public", "--json"]);
+    assert_eq!((code(&again), json(&again)["code"].as_str()), (0, Some("NOTHING_TO_PROMOTE")), "{}", text(&again));
+    assert_eq!(remote_git(&public, &["rev-parse", "main"]), sync);
+    assert_eq!(records(&s, "promotion").len(), 1, "nothing moved, so no new record");
+
+    // A change in it: one more commit on top, never forced.
+    s.write("product/src/more.rs", "pub fn more() {}\n");
+    s.commit_all("More product");
+    s.git(&["push", "-q", "origin", "main"]);
+    assert_eq!(code(&s.run(&["prove", "--tree", "origin/main"])), 0);
+    let next = s.run(&["promote", "public", "--json"]);
+    assert_eq!((code(&next), json(&next)["code"].as_str()), (0, Some("PROMOTED")), "{}", text(&next));
+    let second = remote_git(&public, &["rev-parse", "main"]);
+    assert_eq!(remote_git(&public, &["rev-parse", "main^"]), sync, "on top of the last sync");
+    assert_eq!(remote_git(&public, &["rev-parse", "main^{tree}"]), s.git(&["rev-parse", "origin/main:product"]));
+    assert_eq!(records(&s, "promotion").iter().filter(|r| r["predicate"]["target_before"] == sync.as_str()).count(), 1);
+    assert_ne!(second, sync);
+}
+
+#[test]
+fn a_destination_check_is_the_promotion_page() {
+    // Named by a remote here, so the page reads the same on every machine.
+    let (s, _origin, public) = destination_fixture(&EXPORT.replace("{REMOTE}", "public"));
+    s.git(&["remote", "add", "public", &public.path().display().to_string()]);
+    let out = s.run(&["promote", "public", "--check"]);
+    assert_eq!(code(&out), 0, "{}", text(&out));
+    snapshot("promote_destination_check", &s, &out);
+}
+
+#[test]
+fn an_export_is_held_by_its_rules_and_refused_cleanly() {
+    let (s, _origin, public) = destination_fixture(&format!("{EXPORT}\n[destination.rules]\nuntasked = \"deny\"\n"));
+    let held = s.run(&["promote", "public", "--json"]);
+    assert_eq!((code(&held), json(&held)["code"].as_str()), (2, Some("UNTASKED_COMMITS")), "{}", text(&held));
+    assert!(remote_git(&public, &["for-each-ref"]).is_empty(), "held: nothing pushed");
+    // A refused push leaves no record.
+    let (s, _origin, public) = destination_fixture(EXPORT);
+    let hook = public.path().join("hooks").join("pre-receive");
+    fs::write(&hook, "#!/bin/sh\necho \"public is frozen\" >&2\nexit 1\n").unwrap();
+    fs::set_permissions(&hook, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+    let out = s.run(&["promote", "public", "--json"]);
+    let j = json(&out);
+    assert_eq!((code(&out), j["code"].as_str()), (4, Some("PROMOTE_PUSH_FAILED")), "{}", text(&out));
+    assert!(j["message"].as_str().unwrap().contains("public is frozen"), "{j:#}");
+    assert!(records(&s, "promotion").is_empty(), "no record");
+    assert!(remote_git(&public, &["for-each-ref"]).is_empty());
+    // Under an agent, where agent is not set, it is for a person.
+    let (s, _origin, _public) = destination_fixture(&EXPORT.replace("agent = true\n", ""));
+    let out = s.run_env(&["promote", "public", "--json"], &[("CLAUDE_CODE_SESSION_ID", "s-1")]);
+    assert_eq!((code(&out), json(&out)["code"].as_str()), (2, Some("AGENT_MAY_NOT_PROMOTE")), "{}", text(&out));
+    for flag in ["--back", "--confirm", "--rollback"] {
+        let out = s.run(&["promote", "public", flag, "--json"]);
+        assert_eq!((code(&out), json(&out)["code"].as_str()), (6, Some("NOT_FOR_A_DESTINATION")), "{flag}: {}", text(&out));
+    }
+}
+
+#[test]
+fn push_destination_fast_forwards_only() {
+    let (s, _origin, public) = destination_fixture(MIRROR);
+    let head = s.git(&["rev-parse", "origin/main"]);
+    let out = s.run(&["promote", "mirror", "--json"]);
+    let j = json(&out);
+    assert_eq!((code(&out), j["code"].as_str(), j["details"]["how"].as_str()), (0, Some("PROMOTED"), Some("push")), "{}", text(&out));
+    assert_eq!(remote_git(&public, &["rev-parse", "main"]), head, "the landing branch's head, as it is");
+    let p = &records(&s, "promotion")[0]["predicate"];
+    assert_eq!((p["env"].as_str(), p["from"].as_str(), p["how"].as_str(), p["result_commit"].as_str()), (Some("mirror"), Some("main"), Some("push"), Some(head.as_str())));
+    let again = s.run(&["promote", "mirror", "--json"]);
+    assert_eq!((code(&again), json(&again)["code"].as_str()), (0, Some("NOTHING_TO_PROMOTE")), "{}", text(&again));
+
+    // The destination gains a commit of its own: promoting would leave it behind, so it is refused.
+    let other = tempfile::tempdir().unwrap();
+    let other_path = other.path().display().to_string();
+    assert!(Command::new("git").args(["clone", "-q", &public.path().display().to_string(), &other_path]).status().unwrap().success());
+    fs::write(other.path().join("theirs.md"), "theirs\n").unwrap();
+    for args in [vec!["add", "-A"], vec!["-c", "user.name=t", "-c", "user.email=t@example.com", "commit", "-q", "-m", "Theirs"], vec!["push", "-q", "origin", "main"]] {
+        assert!(Command::new("git").arg("-C").arg(other.path()).args(&args).status().unwrap().success(), "{args:?}");
+    }
+    let theirs = remote_git(&public, &["rev-parse", "main"]);
+    s.write("product/src/more.rs", "pub fn more() {}\n");
+    s.commit_all("More product");
+    s.git(&["push", "-q", "origin", "main"]);
+    assert_eq!(code(&s.run(&["prove", "--tree", "origin/main"])), 0);
+    let held = s.run(&["promote", "mirror", "--json"]);
+    assert_eq!((code(&held), json(&held)["code"].as_str()), (2, Some("PROMOTE_TARGET_AHEAD")), "{}", text(&held));
+    assert_eq!(remote_git(&public, &["rev-parse", "main"]), theirs, "never forced");
+    assert_eq!(records(&s, "promotion").len(), 1);
+}
+
+#[test]
+fn an_agent_push_to_another_remote_is_held() {
+    let (s, origin, public) = destination_fixture("[push]\nagent = [\"origin\"]\n");
+    let public_path = public.path().display().to_string();
+    s.git(&["remote", "add", "public", &public_path]);
+    with_pre_push_hook(&s);
+    let agent = [("CLAUDE_CODE_SESSION_ID", "s-1")];
+    for remote in ["public", public_path.as_str()] {
+        let held = hand_push_as(&s, &[remote, "main"], &agent);
+        assert!(!held.status.success(), "{remote}: {}", text(&held));
+        let said = text(&held).split_whitespace().collect::<Vec<_>>().join(" ");
+        assert!(said.contains("PUSH_REMOTE_NOT_ALLOWED") && said.contains("ask the person to push it, or add the remote to [push] agent"), "{remote}: {said}");
+        assert!(remote_git(&public, &["for-each-ref"]).is_empty(), "{remote}: nothing reached it");
+    }
+    // Origin is listed, by name or by its URL.
+    s.git(&["branch", "agent/work", "main"]);
+    let pushed = hand_push_as(&s, &["origin", "agent/work"], &agent);
+    assert!(pushed.status.success(), "{}", text(&pushed));
+    let pushed = hand_push_as(&s, &[&origin.path().display().to_string(), "agent/work:agent/other"], &agent);
+    assert!(pushed.status.success(), "{}", text(&pushed));
+    // A person's push, with no agent session, is not held by it.
+    let pushed = hand_push(&s, &["public", "main"]);
+    assert!(pushed.status.success(), "{}", text(&pushed));
+    assert_eq!(remote_git(&public, &["rev-parse", "main"]), s.git(&["rev-parse", "main"]));
+}
+
+#[test]
+fn agent_hook_holds_git_push_to_unlisted_remote() {
+    let (s, origin, public) = destination_fixture(&format!("[push]\nagent = [\"origin\"]\n\n{}", EXPORT.replace("agent = true\n", "")));
+    s.git(&["remote", "add", "public", &public.path().display().to_string()]);
+    let hook = |command: &str| {
+        let payload = serde_json::json!({ "session_id": "sess-1234abcd", "cwd": s.dir.path(), "hook_event_name": "PreToolUse", "tool_name": "Bash", "tool_input": { "command": command } }).to_string();
+        let out = s.run_with_stdin(&["hook", "claude-code", "PreToolUse"], &payload);
+        let v: Value = serde_json::from_slice(&out.stdout).unwrap_or(Value::Null);
+        (v["hookSpecificOutput"]["permissionDecision"].as_str().map(str::to_string), v["hookSpecificOutput"]["permissionDecisionReason"].as_str().unwrap_or_default().to_string())
+    };
+    let public_url = public.path().display().to_string();
+    for held in ["git push public main".to_string(), format!("git push {public_url} main"), "git -C . push public".to_string(), "sh -c 'git push public HEAD:main'".to_string(), "git push -u public main".to_string(), "cd app && git push public".to_string()] {
+        let (decision, why) = hook(&held);
+        assert_eq!(decision.as_deref(), Some("deny"), "should be held: {held}");
+        assert!(why.contains("PUSH_REMOTE_NOT_ALLOWED") && why.contains("ask the person to push it, or add the remote to [push] agent"), "{held}: {why}");
+    }
+    for ok in ["git push origin main".to_string(), "git push".to_string(), format!("git push {} main", origin.path().display()), "git status".to_string(), "echo git push public".to_string()] {
+        assert_eq!(hook(&ok).0, None, "should be allowed: {ok}");
+    }
+    // A destination kept for people: the agent hooks hold its promotion, and checking it is anyone's.
+    let (decision, why) = hook("use05 promote public");
+    assert_eq!(decision.as_deref(), Some("deny"), "{why}");
+    assert!(why.contains("use05 promote public --check"), "{why}");
+    assert_eq!(hook("use05 promote public --check").0, None);
+    // With no [push] agent, any remote.
+    let (s, _origin, public) = destination_fixture("");
+    s.git(&["remote", "add", "public", &public.path().display().to_string()]);
+    let payload = serde_json::json!({ "session_id": "sess-1234abcd", "cwd": s.dir.path(), "hook_event_name": "PreToolUse", "tool_name": "Bash", "tool_input": { "command": "git push public main" } }).to_string();
+    let out = s.run_with_stdin(&["hook", "claude-code", "PreToolUse"], &payload);
+    let v: Value = serde_json::from_slice(&out.stdout).unwrap_or(Value::Null);
+    assert_eq!(v["hookSpecificOutput"]["permissionDecision"], Value::Null, "{}", text(&out));
+}
+
+#[test]
+fn a_destination_is_signed_off_on_and_bypassed_as_an_environment_is() {
+    let (s, _origin, public) = destination_fixture(&format!("{EXPORT}\n[destination.rules]\nsign_off = \"approval\"\nuntasked = \"deny\"\n\n[[destination.confirm]]\ntext = \"The licence is in the folder\"\n"));
+    let held = s.run(&["promote", "public", "--check", "--json"]);
+    let codes: Vec<String> = json(&held)["details"]["findings"].as_array().unwrap().iter().map(|f| f["code"].as_str().unwrap().to_string()).collect();
+    assert_eq!(code(&held), 2, "{}", text(&held));
+    assert!(codes.contains(&"SIGNOFF_REQUIRED".to_string()) && codes.contains(&"UNTASKED_COMMITS".to_string()), "{codes:?}");
+    let page = text(&s.run(&["brief", "--promote", "public"]));
+    assert!(page.contains("confirms: The licence is in the folder") && page.contains("05 never rolls public back"), "{page}");
+    s.approver();
+    let (exit, screen) = on_a_terminal(&s, &["approve", "--promote", "public", "--note", "Read every file in the folder", "--confirm", "The licence is in the folder"], &["correct horse"]);
+    assert_eq!(exit, 0, "{screen}");
+    assert!(screen.contains("Signed off on promoting"), "{screen}");
+    let signoff = &records(&s, "signoff")[0]["predicate"];
+    assert_eq!((signoff["env"].as_str(), signoff["from"].as_str()), (Some("public"), Some("main")));
+    let (exit, screen) = on_a_terminal(&s, &["bypass", "--promote", "public", "--rule", "untasked", "--reason", "the folder was written by hand before 05"], &["correct horse"]);
+    assert_eq!(exit, 0, "{screen}");
+    let out = s.run(&["promote", "public", "--json"]);
+    assert_eq!((code(&out), json(&out)["code"].as_str()), (0, Some("PROMOTED")), "{}", text(&out));
+    let message = remote_git(&public, &["log", "-1", "--format=%B", "main"]);
+    assert!(message.contains("signed off: Read every file in the folder") && message.contains("05-Bypass: untasked"), "{message}");
+    let p = &records(&s, "promotion")[0]["predicate"];
+    assert_eq!((p["signoffs"].as_array().unwrap().len(), p["bypasses"].as_array().unwrap().len()), (1, 1), "{p:#}");
+    // A destination has no back-merge, hotfix or merge resolved by hand to sign off on.
+    let (exit, screen) = on_a_terminal(&s, &["approve", "--promote", "public", "--back"], &[]);
+    assert_eq!(exit, 6, "{screen}");
+    assert!(screen.contains("public is a destination"), "{screen}");
+}
+
+#[test]
+fn a_push_destination_goes_out_through_the_pre_push_hook_and_a_hand_push_is_held() {
+    let (s, _origin, public) = destination_fixture(&format!("[push]\nagent = [\"origin\"]\n\n{MIRROR}"));
+    let public_path = public.path().display().to_string();
+    s.git(&["remote", "add", "public", &public_path]);
+    with_pre_push_hook(&s);
+    // An agent the destination lets in promotes to it through the hook, though [push] agent leaves it out.
+    let out = s.run_env(&["promote", "mirror", "--json"], &[("CLAUDE_CODE_SESSION_ID", "s-1")]);
+    assert_eq!((code(&out), json(&out)["code"].as_str()), (0, Some("PROMOTED")), "{}", text(&out));
+    assert_eq!(remote_git(&public, &["rev-parse", "main"]), s.git(&["rev-parse", "origin/main"]));
+    // By hand, only the head 05 judged goes there.
+    s.git(&["checkout", "-q", "-b", "other"]);
+    s.write("product/src/hand.rs", "pub fn hand() {}\n");
+    s.commit_all("By hand");
+    s.git(&["checkout", "-q", "main"]);
+    let held = hand_push(&s, &["public", "other:main"]);
+    assert!(!held.status.success(), "{}", text(&held));
+    assert!(text(&held).contains("PROMOTE_NOT_EVALUATED_MOVE") && text(&held).contains("use05 promote mirror"), "{}", text(&held));
+    assert_eq!(remote_git(&public, &["rev-parse", "main"]), s.git(&["rev-parse", "origin/main"]), "it did not move");
+}
+
+#[test]
+fn a_destination_named_like_an_environment_is_refused() {
+    let (s, _origin, public) = destination_fixture("");
+    let twice = format!("[[environment]]\nname = \"dev\"\nbranch = \"main\"\n\n{}", EXPORT.replace("\"public\"", "\"dev\"").replace("{REMOTE}", &public.path().display().to_string()));
+    s.write(".05/policy.toml", &twice);
+    s.commit_all("Two targets named dev");
+    s.git(&["push", "-q", "origin", "main"]);
+    let out = s.run(&["promote", "dev", "--check", "--json"]);
+    assert_eq!((code(&out), json(&out)["code"].as_str()), (6, Some("DUPLICATE_TARGET")), "{}", text(&out));
+}
+
+#[test]
+fn approving_a_hotfix_says_it_lands_straight_on_its_environment() {
+    let (s, _remote) = promotion_fixture("");
+    hotfix_ready(&s);
+    s.approver();
+    let approved = s.run_with_stdin(&["approve", "--outcome", "--tree", "HEAD", "--passphrase-stdin"], "correct horse\n");
+    assert_eq!(code(&approved), 0, "{}", text(&approved));
+    let said = text(&approved).split_whitespace().collect::<Vec<_>>().join(" ");
+    assert!(said.contains("This approval lands the hotfix straight on prod"), "the prompt says it: {said}");
+    let j = json(&s.run_with_stdin(&["approve", "--outcome", "--tree", "HEAD", "--passphrase-stdin", "--json"], "correct horse\n"));
+    assert!(j["message"].as_str().unwrap().contains("a hotfix this approval lands straight on prod"), "the headline says it: {j:#}");
 }

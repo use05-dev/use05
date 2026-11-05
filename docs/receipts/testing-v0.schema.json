@@ -1,0 +1,38 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://use05.dev/receipts/testing-v0.schema.json",
+  "title": "05 testing sign-off, https://use05.dev/testing/v0",
+  "description": "An in-toto Statement v1 carrying a person's word that they tried one exact tree themselves, or that they skipped it and why. Never an approval. Fields are only ever added, as optional ones.",
+  "type": "object",
+  "required": ["_type", "subject", "predicateType", "predicate"],
+  "additionalProperties": true,
+  "properties": {
+    "_type": { "const": "https://in-toto.io/Statement/v1" },
+    "subject": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "required": ["name", "digest"],
+        "properties": { "name": { "type": "string" }, "digest": { "type": "object", "additionalProperties": { "type": "string" } } }
+      },
+      "contains": {
+        "type": "object",
+        "properties": { "name": { "const": "tree" }, "digest": { "type": "object", "required": ["gitTree", "sha256"] } }
+      }
+    },
+    "predicateType": { "const": "https://use05.dev/testing/v0" },
+    "predicate": {
+      "type": "object",
+      "required": ["outcome", "task", "note", "tester", "created"],
+      "additionalProperties": true,
+      "properties": {
+        "outcome": { "enum": ["tested", "skipped"] },
+        "task": { "type": "string" },
+        "note": { "type": "string", "description": "What they tried, or why they skipped, in their words." },
+        "tester": { "type": "string" },
+        "created": { "type": "string" }
+      }
+    }
+  }
+}

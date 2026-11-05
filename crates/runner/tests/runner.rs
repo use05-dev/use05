@@ -49,6 +49,9 @@ fn options(dir: &Path, tree: &str, argv: &[&str], secs: u64) -> ProveOptions {
         timeout: Duration::from_secs(secs),
         pass_env: Vec::new(),
         check: None,
+        check_user: None,
+        dir: None,
+        lfs: false,
     }
 }
 
@@ -423,4 +426,269 @@ fn the_remembered_blob_digests_never_change_the_answer_and_a_damaged_cache_is_ig
     assert_ne!(after, exported);
     let reference = prove(&options(dir.path(), "HEAD", &["true"], 20)).unwrap();
     assert_eq!(reference.tree_subject().unwrap().1, after);
+}
+
+fn whoami() -> String {
+    String::from_utf8(Command::new("id").arg("-un").output().unwrap().stdout).unwrap().trim().to_string()
+}
+
+#[test]
+fn check_user_missing_is_an_error_not_a_fallback() {
+    let r = repo();
+    write(r.path(), "a", "x");
+    git(r.path(), &["add", "-A"]);
+    let marker = tempfile::tempdir().unwrap();
+    let ran = marker.path().join("ran");
+    let mut o = options(r.path(), "index", &["sh", "-c", &format!("touch '{}'", ran.display())], 5);
+
+    // An ordinary run records no check user at all.
+    let plain = prove(&o).unwrap();
+    assert_eq!(plain.predicate.runner.check_user, None);
+    assert!(!serde_json::to_string(&plain).unwrap().contains("check_user"), "the field is left out, so older receipts read the same");
+    fs::remove_file(&ran).unwrap();
+
+    // A user that does not exist, root, the user 05 runs as, and a name that is not one: none
+    // keeps the key out of reach, and the command never runs as the key holder instead.
+    for user in ["use05-no-such-user", "root", &whoami(), "-u"] {
+        o.check_user = Some(user.to_string());
+        let err = prove(&o).expect_err(user);
+        assert_eq!(err.code(), "CHECK_USER_UNAVAILABLE", "{user}: {err}");
+        assert!(err.to_string().contains(user), "it names the user: {err}");
+        assert!(!ran.exists(), "{user}: the command ran anyway");
+    }
+}
+
+const LFS_ATTRIBUTES: &str = "*.bin filter=lfs diff=lfs merge=lfs -text\n";
+
+fn lfs_pointer_text(content: &str) -> String {
+    format!("version https://git-lfs.github.com/spec/v1\noid sha256:{}\nsize {}\n", sha(content.as_bytes()), content.len())
+}
+
+/// Whether `git lfs` is installed here. The tests that need it say so and pass when it is not.
+fn git_lfs_here() -> bool {
+    let ok = Command::new("git").args(["lfs", "version"]).stdin(Stdio::null()).output().is_ok_and(|o| o.status.success());
+    if !ok {
+        eprintln!("skipped: git-lfs is not installed here");
+    }
+    ok
+}
+
+/// A repository whose `big.bin` is committed as an LFS pointer, written by hand so that no
+/// git-lfs is needed to make it. The object it names is nowhere.
+fn repo_with_a_pointer(content: &str) -> TempDir {
+    let r = repo();
+    write(r.path(), ".gitattributes", LFS_ATTRIBUTES);
+    write(r.path(), "big.bin", &lfs_pointer_text(content));
+    write(r.path(), "plain.txt", "not lfs\n");
+    git(r.path(), &["add", "-A"]);
+    git(r.path(), &["commit", "-q", "-m", "pointer"]);
+    r
+}
+
+#[test]
+fn lfs_pointers_are_checked_as_committed_unless_asked_and_the_tree_digest_never_moves() {
+    let r = repo_with_a_pointer("the real bytes\n");
+    let pointer = lfs_pointer_text("the real bytes\n");
+
+    let off = prove(&options(r.path(), "HEAD", &["sh", "-c", &format!("test \"$(cat big.bin)\" = '{}'", pointer.trim_end())], 30)).unwrap();
+    assert_eq!(off.predicate.result.status, Status::Passed, "with lfs off the check sees the pointer exactly as committed");
+    assert!(off.predicate.lfs.is_empty());
+    assert!(!serde_json::to_string(&off).unwrap().contains("\"lfs\""), "the field is left out when there is nothing to list");
+    assert_eq!(off.tree_subject().unwrap().1, identify(r.path(), "HEAD").unwrap().sha256);
+
+    // A tree with no pointers needs no git-lfs even when it is asked for.
+    let plain = repo();
+    write(plain.path(), "a.txt", "x\n");
+    git(plain.path(), &["add", "-A"]);
+    let mut o = options(plain.path(), "index", &["true"], 5);
+    o.lfs = true;
+    assert!(prove(&o).unwrap().predicate.lfs.is_empty());
+    // Pointer-looking files that no .gitattributes sends through LFS stay as they are.
+    let stray = repo();
+    write(stray.path(), "big.bin", &pointer);
+    git(stray.path(), &["add", "-A"]);
+    let mut o = options(stray.path(), "index", &["true"], 5);
+    o.lfs = true;
+    assert!(prove(&o).unwrap().predicate.lfs.is_empty(), "no .gitattributes uses LFS, so nothing is fetched");
+}
+
+#[test]
+fn lfs_on_resolves_pointers_and_lists_them() {
+    if !git_lfs_here() {
+        return;
+    }
+    let r = repo();
+    git(r.path(), &["lfs", "install", "--local"]);
+    write(r.path(), ".gitattributes", LFS_ATTRIBUTES);
+    write(r.path(), "assets/big.bin", "the real bytes\n");
+    write(r.path(), "plain.txt", "not lfs\n");
+    git(r.path(), &["add", "-A"]);
+    git(r.path(), &["commit", "-q", "-m", "lfs"]);
+    let committed = git(r.path(), &["cat-file", "-p", "HEAD:assets/big.bin"]);
+    assert!(committed.starts_with("version https://git-lfs.github.com/spec/v1"), "committed as a pointer: {committed}");
+
+    let script = r#"test "$(cat assets/big.bin)" = "the real bytes" && test "$(cat plain.txt)" = "not lfs""#;
+    let mut o = options(r.path(), "HEAD", &["sh", "-c", script], 30);
+    o.lfs = true;
+    let on = prove(&o).unwrap();
+    assert_eq!(on.predicate.result.status, Status::Passed, "the check saw the real file");
+    let files = &on.predicate.lfs;
+    assert_eq!(files.len(), 1, "{files:?}");
+    assert_eq!((files[0].path.as_str(), files[0].oid.as_str(), files[0].size), ("assets/big.bin", sha(b"the real bytes\n").as_str(), 15));
+    let json = serde_json::to_value(&on).unwrap();
+    assert_eq!(json["predicate"]["lfs"][0]["path"], "assets/big.bin");
+
+    // The tree is the committed one: the same identity, with or without the real files.
+    o.lfs = false;
+    o.argv = vec!["sh".into(), "-c".into(), "head -1 assets/big.bin | grep -q git-lfs".into()];
+    let off = prove(&o).unwrap();
+    assert_eq!(off.predicate.result.status, Status::Passed, "with lfs off it is the pointer");
+    assert_eq!(on.tree_subject(), off.tree_subject());
+    assert_eq!(on.tree_subject().unwrap().1, identify(r.path(), "HEAD").unwrap().sha256);
+}
+
+#[test]
+fn an_lfs_file_that_cannot_be_fetched_stops_the_proof() {
+    if !git_lfs_here() {
+        return;
+    }
+    // The pointer names an object that is nowhere: not here, and there is no server to ask.
+    let r = repo_with_a_pointer("bytes nobody has\n");
+    git(r.path(), &["lfs", "install", "--local"]);
+    let marker = tempfile::tempdir().unwrap();
+    let ran = marker.path().join("ran");
+    let mut o = options(r.path(), "HEAD", &["sh", "-c", &format!("touch '{}'", ran.display())], 30);
+    o.lfs = true;
+    let err = prove(&o).unwrap_err();
+    assert_eq!(err.code(), "LFS_FAILED", "{err}");
+    assert!(err.to_string().contains("big.bin"), "it names the file: {err}");
+    assert!(!ran.exists(), "the check never ran on a pointer it was told would be the real file");
+}
+
+/// Needs Linux, passwordless sudo and the check user (`sudo useradd --create-home use05-check`),
+/// as on a GitHub runner; run with USE05_TEST_SUDO=1.
+#[cfg(target_os = "linux")]
+#[test]
+fn checks_run_as_the_check_user_and_cannot_read_the_key() {
+    if std::env::var("USE05_TEST_SUDO").as_deref() != Ok("1") {
+        eprintln!("skipped: set USE05_TEST_SUDO=1 where sudo needs no password and the user use05-check exists");
+        return;
+    }
+    let user = std::env::var("USE05_TEST_CHECK_USER").unwrap_or_else(|_| "use05-check".into());
+    let r = repo();
+    write(r.path(), "a", "x");
+    git(r.path(), &["add", "-A"]);
+    let secret = tempfile::tempdir().unwrap();
+    let key = secret.path().join("runner.key");
+    fs::write(&key, "use05-ed25519-secret:s3cret").unwrap();
+    fs::set_permissions(&key, fs::Permissions::from_mode(0o600)).unwrap();
+    // It reports who it is, tries the key holder's environment and key file, writes where a check
+    // writes, and leaves something running.
+    let script = "id -un; cat /proc/$HOLDER/environ >/dev/null 2>&1 && echo ENV_READ; cat \"$KEY\" 2>/dev/null; touch here \"$HOME/home\" \"$TMPDIR/tmp\" && echo WROTE; sleep 30 & true";
+    let mut o = options(r.path(), "index", &["sh", "-c", script], 20);
+    o.pass_env = vec![("HOLDER".into(), std::process::id().to_string()), ("KEY".into(), key.display().to_string())];
+    o.check_user = Some(user.clone());
+    let started = Instant::now();
+    let proof = use05_runner::prove_with_output(&o).unwrap();
+    let out = String::from_utf8_lossy(&proof.stdout_tail).to_string();
+    assert_eq!(out.lines().next(), Some(user.as_str()), "{out}");
+    assert!(!out.contains("ENV_READ") && !out.contains("s3cret"), "the check read the key holder's secrets:\n{out}");
+    assert!(out.contains("WROTE"), "the check can write its tree, home and temp:\n{out}");
+    assert_eq!(proof.statement.predicate.result.status, Status::Passed);
+    assert_eq!(proof.statement.predicate.runner.check_user.as_deref(), Some(user.as_str()));
+    assert!(started.elapsed() < Duration::from_secs(15), "what the check left running was stopped");
+
+    // A command the check user cannot reach (in the key holder's own folder) or cannot find is
+    // not started, as without a check user, rather than a signed failure.
+    let private = tempfile::tempdir().unwrap();
+    let tool = private.path().join("tool");
+    fs::write(&tool, "#!/bin/sh\nexit 0\n").unwrap();
+    fs::set_permissions(&tool, fs::Permissions::from_mode(0o755)).unwrap();
+    // Closed to others, as a runner's home is.
+    fs::set_permissions(private.path(), fs::Permissions::from_mode(0o700)).unwrap();
+    for program in [tool.to_str().unwrap(), "use05-no-such-tool"] {
+        let mut o = options(r.path(), "index", &[program], 20);
+        o.check_user = Some(user.clone());
+        let err = prove(&o).expect_err(program);
+        assert_eq!(err.code(), "COMMAND_NOT_STARTED", "{program}: {err}");
+        assert!(err.to_string().contains(&user), "it names the check user: {err}");
+    }
+}
+
+// ---------------------------------------------------------------- the folder a check runs in (D97)
+
+fn in_dir(dir: &Path, folder: &str, script: &str) -> Result<use05_receipt::Statement<use05_receipt::Evidence>, use05_runner::RunnerError> {
+    let mut o = options(dir, "index", &["sh", "-c", script], 30);
+    o.dir = Some(folder.to_string());
+    prove(&o)
+}
+
+#[test]
+fn a_check_runs_in_its_folder_of_the_exact_tree_and_the_receipt_says_which() {
+    let r = repo();
+    write(r.path(), "root.txt", "at the root\n");
+    write(r.path(), "pkg/sub/here.txt", "in the folder\n");
+    git(r.path(), &["add", "-A"]);
+    let proved = in_dir(r.path(), "pkg/sub", "test -f here.txt && test ! -f root.txt").expect("proves");
+    assert_eq!(proved.predicate.result.status, Status::Passed, "the command ran in pkg/sub");
+    assert_eq!(proved.predicate.command.dir.as_deref(), Some("pkg/sub"));
+    assert_eq!(proved.predicate.command.cwd, ".");
+    // At the root it sees the other file, and records no folder.
+    let at_root = prove(&options(r.path(), "index", &["sh", "-c", "test -f root.txt && test ! -f here.txt"], 30)).unwrap();
+    assert_eq!((at_root.predicate.result.status, at_root.predicate.command.dir.clone()), (Status::Passed, None));
+    let json = serde_json::to_string(&at_root.predicate.command).unwrap();
+    assert!(!json.contains("dir"), "a command run at the root is written as it always was: {json}");
+}
+
+#[test]
+fn a_folder_outside_the_tree_or_not_in_it_fails_the_check_and_runs_nothing() {
+    let r = repo();
+    write(r.path(), "pkg/a.txt", "a\n");
+    write(r.path(), "file.txt", "not a folder\n");
+    symlink("../..", r.path().join("pkg/up")).unwrap(); // leads out of the tree
+    symlink("..", r.path().join("pkg/back")).unwrap(); // leads to the tree's own root: not out
+    git(r.path(), &["add", "-A"]);
+    assert!(in_dir(r.path(), "pkg/back", "test -f file.txt").is_ok_and(|s| s.predicate.result.status == Status::Passed), "a link that stays inside the tree is fine");
+    // The command is not run, and the check fails by itself with the reason; nothing aborts.
+    for (folder, reason) in [("..", "not inside the tree"), ("pkg/../..", "not inside the tree"), ("/tmp", "not inside the tree"), ("", "not inside the tree"), ("pkg/up", "not inside the tree"), ("nope", "not in this tree"), ("file.txt", "not in this tree")] {
+        let proof = use05_runner::prove_with_output(&{
+            let mut o = options(r.path(), "index", &["sh", "-c", "touch ran"], 30);
+            o.dir = Some(folder.to_string());
+            o
+        })
+        .unwrap_or_else(|e| panic!("{folder:?}: {e}"));
+        assert_eq!(proof.statement.predicate.result.status, Status::Failed, "{folder:?}");
+        assert_eq!((proof.statement.predicate.result.exit_code, proof.statement.predicate.command.dir.as_deref()), (None, Some(folder)));
+        let said = proof.not_run.unwrap_or_default();
+        assert!(said.contains(reason) && said.contains("not run"), "{folder:?}: {said}");
+        assert!(String::from_utf8_lossy(&proof.stderr_tail).contains(reason));
+    }
+}
+
+#[test]
+fn an_export_runs_commands_again_and_again_in_the_exact_tree() {
+    use use05_runner::Export;
+    let r = repo();
+    write(r.path(), "VERSION", "c0ffee1\n");
+    write(r.path(), "ops/where.sh", "#!/bin/sh\npwd\n");
+    git(r.path(), &["add", "-A"]);
+    git(r.path(), &["commit", "-q", "-m", "one"]);
+    write(r.path(), "VERSION", "changed in the working tree\n");
+    let export = Export::new(r.path(), "HEAD", false).expect("exports");
+    let argv = |s: &str| vec!["sh".to_string(), "-c".to_string(), s.to_string()];
+    let secs = Duration::from_secs(10);
+    for _ in 0..2 {
+        let ran = export.run(&argv("cat VERSION; echo \"[$SECRET][$PASSED]\""), None, secs, &[("PASSED".into(), "yes".into())], None).expect("runs");
+        assert_eq!(ran.status, Status::Passed);
+        assert_eq!(String::from_utf8_lossy(&ran.stdout_tail), "c0ffee1\n[][yes]\n", "the committed file, and only the named variables");
+        assert_eq!(ran.stdout_sha256, sha(b"c0ffee1\n[][yes]\n"));
+    }
+    assert_eq!(export.run(&argv("exit 3"), None, secs, &[], None).expect("a failure is a result").status, Status::Failed);
+    assert_eq!(export.run(&argv("sleep 5"), None, Duration::from_millis(200), &[], None).expect("a timeout is a result").status, Status::TimedOut);
+    let inside = export.run(&argv("pwd"), Some("ops"), secs, &[], None).expect("runs in the folder");
+    assert!(String::from_utf8_lossy(&inside.stdout_tail).trim_end().ends_with("/ops"));
+    assert_eq!(export.run(&["no-such-program-05".to_string()], None, secs, &[], None).unwrap_err().code(), "COMMAND_NOT_STARTED");
+    assert_eq!(export.run(&argv("true"), Some("../up"), secs, &[], None).unwrap_err().code(), "CHECK_DIR_OUTSIDE");
+    assert_eq!(export.run(&argv("true"), Some("gone"), secs, &[], None).unwrap_err().code(), "CHECK_DIR_MISSING");
+    assert_eq!(export.run(&argv("true"), None, secs, &[("1BAD".into(), "x".into())], None).unwrap_err().code(), "BAD_ENV");
 }

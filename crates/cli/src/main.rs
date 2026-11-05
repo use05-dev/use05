@@ -8,6 +8,7 @@
 mod cmd;
 mod ctx;
 mod extend;
+mod host;
 mod pending;
 mod pick;
 mod policy_edit;
@@ -64,6 +65,9 @@ enum Cmd {
     Gate(GateCli),
     /// Move a task's work into its target branch when the gate allows it, then clean up
     Land(LandCli),
+    /// Promote what the environment below has into this one when its rules allow; --check changes nothing
+    #[command(after_help = "Examples:\n  use05 promote prod --check     evaluate every rule for promoting into prod; change nothing\n  use05 brief --promote prod     the one page: what moves, each rule, who must sign\n  use05 promote prod             make the move, push it, file the signed record, confirm the deploy\n  use05 promote prod --confirm   ask prod's probes which commit it runs (CI can run this)\n  use05 promote prod --rollback  go back to where the newest promotion found prod, with a new commit\n  use05 promote uat --back       after a hotfix on prod: merge prod back into uat, one rung at a time\n  use05 promote public           a [[destination]]: push a branch to another remote, or export a folder\n  use05 approve --promote prod --note \"<what you checked>\"   sign off on it\n  use05 bypass --promote prod --rule soak --reason \"<why>\"    break glass for one rule\n\nThe rules are read from the target environment's own branch; a destination's from the policy\nat the head it sends. Locally this is advisory; the CI gate on the environment's branch is the\nstrong control.")]
+    Promote(PromoteCli),
     /// Throw a task's abandoned work away: its worktree and branch, here and on origin
     Discard(DiscardCli),
     #[command(hide = true)]
@@ -146,6 +150,9 @@ struct StartCli {
     /// Read the intent card from a TOML file instead
     #[arg(long, value_name = "FILE")]
     card: Option<PathBuf>,
+    /// A hotfix: start from this environment's branch on origin, and land there (a person approves it)
+    #[arg(long, value_name = "ENV")]
+    hotfix: Option<String>,
     #[arg(long, hide = true)]
     session: Option<String>,
     #[command(flatten)]
@@ -193,6 +200,13 @@ struct BriefCli {
     /// A task id (default: the current task)
     #[arg(long)]
     task: Option<String>,
+    /// Someone else's work: an exact commit that is not a task here, such as origin/<branch>,
+    /// measured and judged as approve --rev signs it
+    #[arg(long, value_name = "REVISION", conflicts_with_all = ["tree", "task"])]
+    rev: Option<String>,
+    /// A promotion into this environment instead: what moves, each rule's result, who must sign
+    #[arg(long, value_name = "ENV", conflicts_with_all = ["tree", "task", "rev", "fetch"])]
+    promote: Option<String>,
     /// Fetch everyone's receipts from origin first
     #[arg(long)]
     fetch: bool,
@@ -201,6 +215,7 @@ struct BriefCli {
 }
 
 #[derive(Args)]
+#[command(group = clap::ArgGroup::new("note_for").args(["tested", "promote"]).multiple(false))]
 struct ApproveCli {
     /// Approve the declared intent, before work (default: the outcome)
     #[arg(long, conflicts_with = "outcome")]
@@ -220,6 +235,10 @@ struct ApproveCli {
     /// The tree to approve: "index", "worktree", or a commit (default: what the brief shows)
     #[arg(long, value_name = "REV")]
     tree: Option<String>,
+    /// Approve the outcome of an exact commit that is not a task here, such as someone else's
+    /// branch fetched from origin (origin/<branch>), judged as a push of it would be
+    #[arg(long, value_name = "REVISION", conflicts_with_all = ["intent", "task", "tree", "tested", "skip_testing", "land"])]
+    rev: Option<String>,
     /// Read the passphrase from the first line of stdin instead of the terminal
     #[arg(long)]
     passphrase_stdin: bool,
@@ -227,16 +246,33 @@ struct ApproveCli {
     #[arg(long, conflicts_with = "passphrase_stdin")]
     unsigned: bool,
     /// File an approval signed elsewhere, if a trusted approver key signed it
-    #[arg(long, value_name = "FILE", conflicts_with_all = ["intent", "outcome", "reject", "reason", "task", "tree", "passphrase_stdin", "unsigned", "tested", "skip_testing", "note"])]
+    #[arg(long, value_name = "FILE", conflicts_with_all = ["intent", "outcome", "reject", "reason", "task", "tree", "rev", "passphrase_stdin", "unsigned", "tested", "skip_testing", "note", "promote"])]
     signed: Option<PathBuf>,
+    /// Sign off on promoting into this environment: your words (--note), answers and confirmations
+    #[arg(long, value_name = "ENV", conflicts_with_all = ["intent", "outcome", "task", "tree", "tested", "skip_testing", "land"])]
+    promote: Option<String>,
+    /// With --promote: an answer to the environment's sign-off questions, in order (repeatable)
+    #[arg(long = "answer", value_name = "TEXT", requires = "promote")]
+    answers: Vec<String>,
+    /// With --promote: a statement the environment asks you to confirm, word for word (repeatable)
+    #[arg(long = "confirm", value_name = "TEXT", requires = "promote")]
+    confirms: Vec<String>,
+    /// With --promote: sign off on merging the environment above back down into this one (with
+    /// --rev: on a merge resolved by hand)
+    #[arg(long, requires = "promote", conflicts_with = "hotfix")]
+    back: bool,
+    /// With --promote: sign off on landing this hotfix on the environment, answering its questions
+    /// and confirming its statements
+    #[arg(long, requires = "promote")]
+    hotfix: bool,
     /// Sign off that you tried this change in your own environment (with --note)
     #[arg(long, conflicts_with_all = ["intent", "outcome", "reject", "skip_testing"])]
     tested: bool,
     /// Skip testing, where the policy allows it (with --reason)
     #[arg(long, conflicts_with_all = ["intent", "outcome", "reject", "tested"])]
     skip_testing: bool,
-    /// What you tried, for --tested
-    #[arg(long, value_name = "TEXT", requires = "tested")]
+    /// What you tried, for --tested; what you checked, in your own words, for --promote
+    #[arg(long, value_name = "TEXT", requires = "note_for")]
     note: Option<String>,
     /// With --unsigned: the person the statement is for (default: git's user.name here). For CI,
     /// which prepares a statement for someone else to sign.
@@ -345,10 +381,19 @@ struct BypassCli {
     #[arg(long, default_value_t = 4, value_name = "HOURS")]
     hours: u32,
     /// The tree to let through: "index", "worktree", or a commit (default: what the brief shows)
-    #[arg(long, value_name = "REV")]
+    #[arg(long, value_name = "REV", conflicts_with = "promote")]
     tree: Option<String>,
+    /// Bypass one rule of promoting into this environment instead (with --rule), for its exact commit
+    #[arg(long, value_name = "ENV", requires = "rule")]
+    promote: Option<String>,
+    /// With --promote: the rule to bypass, by its name in the policy (soak, untasked, ...)
+    #[arg(long, value_name = "NAME", requires = "promote")]
+    rule: Option<String>,
+    /// With --promote: a rule of merging the environment above back down into this one
+    #[arg(long, requires = "promote")]
+    back: bool,
     /// Read the passphrase from the first line of stdin instead of the terminal
-    #[arg(long)]
+    #[arg(long, conflicts_with = "promote")]
     passphrase_stdin: bool,
     /// Push the receipts branch to origin afterwards
     #[arg(long)]
@@ -439,6 +484,29 @@ struct LandCli {
 }
 
 #[derive(Args)]
+struct PromoteCli {
+    /// The environment or destination to promote into, by its name in the policy: uat, prod, public
+    env: String,
+    /// Evaluate every rule and change nothing
+    #[arg(long, conflicts_with_all = ["confirm", "rollback", "no_wait"])]
+    check: bool,
+    /// Push, and leave confirming the deploy to `use05 promote <env> --confirm`
+    #[arg(long, conflicts_with = "confirm")]
+    no_wait: bool,
+    /// Confirm what the environment runs now with its probes and smoke checks (CI can run this)
+    #[arg(long, conflicts_with = "rollback")]
+    confirm: bool,
+    /// Roll the environment back to where its newest promotion found it, with a new commit
+    #[arg(long)]
+    rollback: bool,
+    /// Merge the environment above this one back into it, as a merge commit (after a hotfix)
+    #[arg(long, conflicts_with_all = ["confirm", "rollback", "no_wait"])]
+    back: bool,
+    #[command(flatten)]
+    common: Common,
+}
+
+#[derive(Args)]
 struct DiscardCli {
     /// The task's id, or the start of it
     task: Option<String>,
@@ -491,6 +559,7 @@ fn main() -> ExitCode {
                 check: a.check,
                 no_new_deps: a.no_new_deps,
                 card: a.card,
+                hotfix: a.hotfix,
                 session: a.session,
                 repo: a.common.repo,
             }),
@@ -513,9 +582,35 @@ fn main() -> ExitCode {
             }),
             a.common.json,
         ),
-        Cmd::Brief(a) => cmd::brief::run(&a.common.repo, a.task.as_deref(), a.tree.as_deref(), a.fetch, a.common.json),
+        Cmd::Brief(a) if a.promote.is_some() => cmd::brief::run_promote(&a.common.repo, a.promote.as_deref().unwrap_or_default(), a.common.json),
+        Cmd::Brief(a) => cmd::brief::run(&a.common.repo, a.task.as_deref(), a.tree.as_deref(), a.rev.as_deref(), a.fetch, a.common.json),
         Cmd::Approve(a) => emit(
-            &cmd::approve::run_approve(cmd::approve::ApproveArgs { intent: a.intent, outcome: a.outcome, interactive: terminal() && !a.common.json && !a.passphrase_stdin, reject: a.reject, reason: a.reason, task: a.task, tree: a.tree, passphrase_stdin: a.passphrase_stdin, push: a.push, land: a.land, unsigned: a.unsigned, signed: a.signed, tested: a.tested, skip_testing: a.skip_testing, note: a.note, approver: a.approver, repo: a.common.repo }),
+            &cmd::approve::run_approve(cmd::approve::ApproveArgs {
+                intent: a.intent,
+                outcome: a.outcome,
+                interactive: terminal() && !a.common.json && !a.passphrase_stdin,
+                reject: a.reject,
+                reason: a.reason,
+                task: a.task,
+                tree: a.tree,
+                base: None,
+                rev: a.rev,
+                passphrase_stdin: a.passphrase_stdin,
+                push: a.push,
+                land: a.land,
+                unsigned: a.unsigned,
+                signed: a.signed,
+                tested: a.tested,
+                skip_testing: a.skip_testing,
+                note: a.note,
+                approver: a.approver,
+                promote: a.promote,
+                answers: a.answers,
+                confirms: a.confirms,
+                back: a.back,
+                hotfix: a.hotfix,
+                repo: a.common.repo,
+            }),
             a.common.json,
         ),
         Cmd::Verify(a) => emit(&cmd::verify::run(cmd::verify::Args { receipt: a.receipt, key: a.key, tree: a.tree, repo: a.common.repo }), a.common.json),
@@ -535,12 +630,32 @@ fn main() -> ExitCode {
         },
         Cmd::Doctor(a) => cmd::doctor::run(&a.common.repo, a.common.json),
         Cmd::Bypass(a) => emit(
-            &cmd::approve::run_bypass(cmd::approve::BypassArgs { reason: a.reason, hours: a.hours, tree: a.tree, passphrase_stdin: a.passphrase_stdin, push: a.push, repo: a.common.repo }),
+            &cmd::approve::run_bypass(cmd::approve::BypassArgs { reason: a.reason, hours: a.hours, tree: a.tree, passphrase_stdin: a.passphrase_stdin, promote: a.promote, rule: a.rule, back: a.back, interactive: terminal() && !a.common.json, push: a.push, repo: a.common.repo }),
             a.common.json,
         ),
         Cmd::Hook(a) => cmd::hook::run(&a.agent, &a.event),
-        Cmd::Gate(a) => cmd::gate::run(cmd::gate::Args { git_hook: a.git_hook, ci: a.ci, tree: a.tree, push: a.push, repo: a.common.repo, json: a.common.json }),
+        Cmd::Gate(a) => cmd::gate::run(cmd::gate::Args { git_hook: a.git_hook, ci: a.ci, tree: a.tree, push: a.push, remote: a.rest, repo: a.common.repo, json: a.common.json }),
         Cmd::Land(a) => emit(&cmd::land::run(&a.common.repo, a.task.as_deref(), a.push, terminal() && !a.common.json), a.common.json),
+        Cmd::Promote(a) => {
+            let interactive = terminal() && !a.common.json;
+            // A destination (D93): promoted with the same command, and with no deploy, rollback or back-merge.
+            let destination = cmd::destination::named(&a.common.repo, &a.env).is_some();
+            let report = match (a.check, a.confirm, a.rollback) {
+                _ if destination && (a.back || a.confirm || a.rollback || a.no_wait) => {
+                    let flag = [(a.back, "--back"), (a.confirm, "--confirm"), (a.rollback, "--rollback"), (a.no_wait, "--no-wait")].into_iter().find(|(on, _)| *on).map_or("", |(_, f)| f);
+                    cmd::destination::not_for_a_destination(&a.env, flag)
+                }
+                (true, _, _) if destination => cmd::destination::run_check(&a.common.repo, &a.env),
+                _ if destination => cmd::destination::run(&a.common.repo, &a.env, interactive),
+                (true, _, _) if a.back => cmd::hotfix::run_back_check(&a.common.repo, &a.env),
+                _ if a.back => cmd::hotfix::run_back(&a.common.repo, &a.env, interactive),
+                (true, _, _) => cmd::promote::run_check(&a.common.repo, &a.env),
+                (_, true, _) => cmd::deploy::run_confirm(&a.common.repo, &a.env, interactive),
+                (_, _, true) => cmd::deploy::run_rollback(&a.common.repo, &a.env, !a.no_wait, interactive),
+                _ => cmd::promote::run(&a.common.repo, &a.env, !a.no_wait, interactive),
+            };
+            emit(&report, a.common.json)
+        }
         Cmd::Discard(a) => emit(&cmd::discard::run(&a.common.repo, a.task.as_deref(), a.unsigned, a.signed.as_deref()), a.common.json),
         Cmd::Finish(a) => emit(&cmd::start::finish(&a.common.repo, a.task.as_deref(), a.outcome.as_deref()), a.common.json),
         Cmd::Key { action } => match action {

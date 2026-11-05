@@ -1,0 +1,18 @@
+✓ main → public: allowed
+  moves             1 commit · 2 files · +2 −0 · export <TREE12> (origin/main) creating it
+  source_checks     pass (deny): test passed on <TREE12>
+  source_confirmed  skipped (warn): main is a branch, not an environment: nothing deploys it
+  soak              skipped (warn): a destination has no soak
+  migrations        pass (approval): no migrations move
+  untasked          fail (warn): 1 of 1 commit belongs to no task: <TREE12>
+  sign_off          skipped (allow): not asked for
+  rules             from main's policy (origin/main)
+  warn UNTASKED_COMMITS: 1 commit that would move belongs to no 05 task: <TREE12>
+  info PROMOTE_CREATES_BRANCH: main on public does not exist yet: promoting creates it
+  Checked only: nothing was moved or pushed. Here this is advisory: only this command and the
+  pre-push hook judge what reaches public, and nothing stops a push to it by hand; protect its
+  branch where it is hosted. Deployment, finish and promotion records this machine signs count, so
+  source_confirmed, soak and untasked rest on its own word; with [evidence] accept = ["runner"]
+  only CI's records count.
+
+Next: use05 promote public

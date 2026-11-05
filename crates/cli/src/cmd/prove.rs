@@ -28,13 +28,25 @@ pub struct Args {
     pub task: Option<String>,
 }
 
+/// The OS user checks run as instead of the one holding the key (`USE05_CHECK_USER`; D94).
+pub(crate) fn check_user() -> Option<String> {
+    std::env::var("USE05_CHECK_USER").ok().filter(|u| !u.is_empty())
+}
+
 fn runner_error(e: RunnerError) -> Report {
     let code = e.code();
     let exit = if matches!(code, "GIT_MISSING" | "IO_ERROR") { 4 } else { 6 };
     let next = match code {
         "TREE_NOT_FOUND" => Some("check the revision, or leave --tree out to use the staged files".to_string()),
+        "COMMAND_NOT_STARTED" if check_user().is_some() => Some(format!(
+            "the checks run as {}, which cannot read this user's home: install the tool system-wide in a step before the gate (the setup-* actions install under /opt/hostedtoolcache)",
+            check_user().unwrap_or_default()
+        )),
         "COMMAND_NOT_STARTED" => Some("check that the command exists and is on your PATH".to_string()),
         "UNSAFE_PATH" => Some("this tree cannot be proven safely; inspect it with git ls-tree -r".to_string()),
+        "LFS_UNAVAILABLE" => Some("install git-lfs (https://git-lfs.com), or turn off [evidence] lfs in the policy to check the pointers instead".to_string()),
+        "LFS_FAILED" => Some("run git lfs fetch for this commit, or check that you can reach the LFS server; turn off [evidence] lfs in the policy to check the pointers instead".to_string()),
+        "CHECK_USER_UNAVAILABLE" => Some("make that user first (in CI: sudo useradd --create-home --shell /bin/bash use05-check), or unset USE05_CHECK_USER".to_string()),
         _ => None,
     };
     Report::error("prove", code, e.to_string(), next, exit)
@@ -132,6 +144,7 @@ pub fn run(args: Args) -> Report {
     let mut excerpt = Vec::new();
     let mut tree_oid = String::new();
     let mut notes = Vec::new();
+    let mut lfs_files = 0usize;
     let mut stored_branch = None;
     let total = runs.len();
 
@@ -155,11 +168,16 @@ pub fn run(args: Args) -> Report {
             timeout: Duration::from_secs(timeout),
             pass_env,
             check: run.check.as_ref().map(|c| c.name.clone()),
+            dir: run.check.as_ref().and_then(|c| c.dir.clone()),
+            // In CI the checks run as another OS user, which cannot read the runner key (D94).
+            check_user: check_user(),
+            lfs: ctx.policy.evidence.lfs,
         }) {
             Ok(p) => p,
             Err(e) => return runner_error(e),
         };
         let statement = proof.statement;
+        let not_run = proof.not_run;
         let (oid, content) = statement.tree_subject().map(|(a, b)| (a.to_string(), b.to_string())).expect("runner writes a tree subject");
         tree_oid = oid.clone();
         let envelope = seal(&statement, &secret).to_json_bytes();
@@ -198,14 +216,24 @@ pub fn run(args: Args) -> Report {
                 excerpt = excerpt_lines(tail, 12);
             }
         }
-        details.push(json!({
+        lfs_files = lfs_files.max(statement.predicate.lfs.len());
+        let mut detail = json!({
             "check": run.check.as_ref().map(|c| c.name.clone()),
             "command": run.argv,
             "status": result.status,
             "exit_code": result.exit_code,
             "duration_ms": result.duration_ms,
             "tree": { "oid": oid, "sha256": content },
-        }));
+        });
+        if !statement.predicate.lfs.is_empty() {
+            detail["lfs"] = json!(statement.predicate.lfs);
+        }
+        if let Some(reason) = &not_run {
+            // The check failed without running: say why, in words and in the data.
+            detail["reason"] = json!(reason);
+            notes.push(format!("{label}: {reason}"));
+        }
+        details.push(detail);
         if let Some(task) = &ctx.task {
             let _ = use05_core::log::append(&ctx.store.state_dir(), &task.id, json!({ "event": "prove", "check": label, "status": result.status }));
         }
@@ -230,6 +258,11 @@ pub fn run(args: Args) -> Report {
             _ => format!("{} ({key_source}, not in your trusted keys)", &signer_id[..12]),
         },
     ));
+    match lfs_files {
+        0 => {}
+        1 => notes.push("1 LFS file was fetched, so the check ran on the real file; the receipt lists it.".to_string()),
+        n => notes.push(format!("{n} LFS files were fetched, so the checks ran on the real files; the receipt lists them.")),
+    }
     if let Some(branch) = &stored_branch {
         notes.extend(super::push_note(ctx.top(), branch, args.push));
     }

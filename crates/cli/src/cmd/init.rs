@@ -14,6 +14,7 @@ use use05_core::keys;
 use use05_core::policy::{CheckDef, POLICY_PATH, detect_checks};
 use use05_core::{git, task::Store};
 
+use crate::host;
 use crate::report::{Report, Tone};
 
 pub const HOOK_MARK: &str = "# 05 pre-push hook";
@@ -100,6 +101,93 @@ fn hooks_dir(top: &Path) -> PathBuf {
     if p.is_absolute() { p } else { top.join(p) }
 }
 
+/// What Git LFS's own pre-push hook runs, and so what 05's must run before its own check (D96):
+/// LFS uploads the large files a push refers to, and a push without it leaves bare pointers.
+const LFS_CALL: &str = "git lfs pre-push";
+
+/// A `.gitattributes` line that sends files through the LFS filter and is not a comment.
+const LFS_FILTER_LINE: &str = "^[[:space:]]*[^#[:space:]].*filter=lfs";
+/// An `lfs.*` setting in the repository's own config that says it uses Git LFS: any but
+/// `lfs.repositoryformatversion`, which Git LFS writes into every repository it runs in.
+const LFS_CONFIG: &str = "^lfs\\.([^r]|r[^e]|re[^p])";
+
+/// 05's pre-push hook. git hands it the pushed refs on stdin once, and both Git LFS and 05 need
+/// them, so they are kept in a file. Git LFS goes first, and a failure there fails the push.
+fn pre_push_script() -> String {
+    format!(
+        "#!/bin/sh\n\
+         {HOOK_MARK} (installed by `use05 init`; remove with `use05 uninstall`)\n\
+         # A project-level npm install is found too; one on PATH comes first.\n\
+         export {LOCAL_BIN_PATH}\n\
+         input=$(mktemp \"${{TMPDIR:-/tmp}}/05-pre-push.XXXXXX\") || exit 1\n\
+         trap 'rm -f \"$input\"' EXIT\n\
+         trap 'exit 1' HUP INT TERM\n\
+         cat > \"$input\"\n\
+         # Git LFS first, when this repository uses it: its objects must be uploaded before the pointers.\n\
+         # Without git-lfs the push stops, as Git LFS's own hook stops it: pointers must not go out alone.\n\
+         # Used: lfs settings in this repository's own config, or a line in a tracked .gitattributes that is not a comment.\n\
+         if git config --local --get-regexp '{LFS_CONFIG}' >/dev/null 2>&1 || git grep -q -E '{LFS_FILTER_LINE}' -- '*.gitattributes' >/dev/null 2>&1; then\n\
+         \x20 command -v git-lfs >/dev/null 2>&1 || {{ echo \"05: this repository uses Git LFS, but git-lfs was not found on PATH, so this push was stopped before its large files could be uploaded. Install git-lfs (https://git-lfs.com) or put it on PATH, then push again.\" >&2; exit 2; }}\n\
+         \x20 {LFS_CALL} \"$@\" < \"$input\" || exit $?\n\
+         fi\n\
+         command -v use05 >/dev/null 2>&1 || {{ echo \"05: use05 is not on PATH; this push was not checked\" >&2; exit 0; }}\n\
+         use05 gate --git-hook pre-push \"$@\" < \"$input\"\n"
+    )
+}
+
+/// The hook `git lfs install` writes, and only that: a check that git-lfs is installed, with a
+/// message and `exit 2`, then `git lfs pre-push "$@"` (older versions had only the second line).
+/// Whitespace may differ. A hook that adds anything of its own is another tool's, and kept.
+fn is_standard_lfs_hook(text: &str) -> bool {
+    let body: Vec<String> = text.lines().map(|l| l.split_whitespace().collect::<Vec<_>>().join(" ")).filter(|l| !l.is_empty() && !l.starts_with('#')).collect();
+    let call = |l: &String| l == "git lfs pre-push \"$@\"";
+    // `command -v git-lfs ... || { echo >&2 "<message>"; exit 2; }` (or `printf >&2 "<fmt>" "<message>"`):
+    // outside its quotes it is only the printing command, and nothing in the quotes runs anything.
+    let check = |l: &String| {
+        let inner = l.strip_prefix("command -v git-lfs >/dev/null 2>&1 || { ").and_then(|r| r.strip_suffix("; exit 2; }"));
+        let Some(inner) = inner else { return false };
+        let (mut outside, mut quoted, mut open) = (String::new(), String::new(), false);
+        for c in inner.chars() {
+            match (c, open) {
+                ('"', _) => open = !open,
+                (c, true) => quoted.push(c),
+                (c, false) => outside.push(c),
+            }
+        }
+        let outside = outside.split_whitespace().collect::<Vec<_>>().join(" ");
+        !open && (outside == "echo >&2" || outside == "printf >&2") && quoted.contains("configured for Git LFS") && !quoted.contains(['$', '`'])
+    };
+    match body.as_slice() {
+        [only] => call(only),
+        [first, second] => check(first) && call(second),
+        _ => false,
+    }
+}
+
+/// Whether this repository uses Git LFS: lfs settings in its git config, or a `.gitattributes`
+/// that sends files through the LFS filter.
+pub fn repo_uses_lfs(top: &Path) -> bool {
+    git::text(top, &["config", "--local", "--get-regexp", LFS_CONFIG]).is_ok_and(|t| !t.is_empty()) || git::run(top, &["grep", "-q", "-E", LFS_FILTER_LINE, "--", "*.gitattributes"]).is_ok()
+}
+
+/// A warning when Git LFS is used here and the installed pre-push hook does not run its upload
+/// step: pointers would be pushed without their files. `true` for a problem (05's own hook, which
+/// should have it), `false` for a note (another tool's hook, which may reach LFS another way: a
+/// hook manager, or a `core.hooksPath` wrapper).
+pub fn lfs_hook_problem(top: &Path, hook: &Hook) -> Option<(bool, String)> {
+    if *hook == Hook::Missing || !repo_uses_lfs(top) {
+        return None;
+    }
+    let text = fs::read_to_string(hooks_dir(top).join("pre-push")).unwrap_or_default();
+    if text.contains(LFS_CALL) {
+        return None;
+    }
+    Some(match hook {
+        Hook::Ours => (true, "pre-push hook  this repository uses Git LFS, but the installed hook does not run Git LFS's upload step, so LFS files may not be uploaded when you push. `use05 uninstall`, then `use05 init`, installs one that does".into()),
+        _ => (false, "pre-push hook  this repository uses Git LFS, but the installed hook does not run `git lfs pre-push` itself. If it reaches Git LFS another way (a hook manager, a wrapper) that is fine; if not, LFS files may not be uploaded when you push: add `git lfs pre-push \"$@\"` to it (it needs the same standard input as the hook itself)".into()),
+    })
+}
+
 pub fn inspect(top: &Path) -> Setup {
     let pre_push = hooks_dir(top).join("pre-push");
     Setup {
@@ -111,7 +199,7 @@ pub fn inspect(top: &Path) -> Setup {
             Ok(_) => Hook::Foreign,
             Err(_) => Hook::Missing,
         },
-        ci_workflow: top.join(".github/workflows/05.yml").exists(),
+        ci_workflow: host::all().iter().any(|h| h.workflows().iter().any(|(rel, _)| top.join(rel).exists())),
         agents_block: fs::read_to_string(top.join("AGENTS.md")).is_ok_and(|t| t.contains(BLOCK_BEGIN)),
         on_path: std::env::var_os("PATH").is_some_and(|p| std::env::split_paths(&p).any(|d| d.join("use05").is_file())),
     }
@@ -137,6 +225,12 @@ pub(crate) fn policy_template(checks: &[CheckDef]) -> String {
         text.push_str("# Checks 05 runs on the exact tree. Required ones must pass before a change is allowed.\n");
         for c in checks {
             text.push_str(&format!("[[check]]\nname = \"{}\"\nrun = [{}]\n", c.name, c.run.iter().map(|a| format!("{a:?}")).collect::<Vec<_>>().join(", ")));
+            if !c.paths.is_empty() {
+                text.push_str(&format!("paths = [{}]   # required only when a change touches one of these\n", c.paths.iter().map(|a| format!("{a:?}")).collect::<Vec<_>>().join(", ")));
+            }
+            if let Some(dir) = &c.dir {
+                text.push_str(&format!("dir = {dir:?}   # the folder of the checked tree it runs in\n"));
+            }
             if !c.env.is_empty() {
                 text.push_str(&format!("env = [{}]   # passed to the check by name; values are never stored\n", c.env.iter().map(|a| format!("{a:?}")).collect::<Vec<_>>().join(", ")));
             }
@@ -198,6 +292,12 @@ pub(crate) fn policy_template(checks: &[CheckDef]) -> String {
     text
 }
 
+/// The template with `lock` as its one locked path, in place of the commented-out example.
+fn lock_in_template(template: &str, lock: &str) -> String {
+    let line = format!("locked = [\"{lock}\"]   # never changed: the CI gate, so a branch cannot change what judges it. No approval clears it, a person's bypass can");
+    template.lines().map(|l| if l.starts_with("# locked = []") { line.as_str() } else { l }).collect::<Vec<_>>().join("\n") + "\n"
+}
+
 /// Where a project-level npm install keeps its command: `node_modules/.bin` at the top of the
 /// main work tree, found through git so agents' linked worktrees reach it too. Appended to PATH,
 /// so a use05 installed for the whole machine still wins.
@@ -216,6 +316,32 @@ fn hook_runner() -> String {
 fn cloud_session_hook() -> Value {
     let version = env!("CARGO_PKG_VERSION");
     json!({ "type": "command", "command": format!("[ \"$CLAUDE_CODE_REMOTE\" = true ] || exit 0; command -v use05 >/dev/null 2>&1 || npm install -g --silent @use05/cli@{version} >/dev/null 2>&1; [ -z \"$USE05_SESSION\" ] || use05-cloud session --background; exit 0 # {AGENT_COMMAND_PREFIX}cloud-session"), "timeout": 120 })
+}
+
+/// The hook events this version installs for Claude Code, in the order it installs them. The
+/// settings below must name exactly these; a test holds them together.
+pub const CLAUDE_EVENTS: &[&str] = &["SessionStart", "UserPromptSubmit", "PreToolUse", "PostToolUse", "Stop", "SubagentStart", "SubagentStop", "SessionEnd"];
+
+/// The same for Codex.
+pub const CODEX_EVENTS: &[&str] = &["PreToolUse", "PostToolUse", "Stop", "SubagentStart", "SubagentStop"];
+
+/// Events this version installs that the hooks already in the repository lack, once any of 05's
+/// hooks is there: what an older 05 installed. Nothing when no agent hooks are installed at all.
+pub fn missing_hook_events(top: &Path) -> Vec<&'static str> {
+    let installed = |agent: &str, files: &[&str], events: &[&'static str]| -> Vec<&'static str> {
+        let texts: Vec<String> = files.iter().filter_map(|f| fs::read_to_string(top.join(f)).ok()).filter(|t| t.contains(AGENT_COMMAND_PREFIX)).collect();
+        if texts.is_empty() {
+            return Vec::new();
+        }
+        events.iter().copied().filter(|e| !texts.iter().any(|t| t.contains(&format!("{AGENT_COMMAND_PREFIX}{agent} {e}")))).collect()
+    };
+    let mut missing = installed("claude-code", &[".claude/settings.local.json", ".claude/settings.json"], CLAUDE_EVENTS);
+    for e in installed("codex", &[".codex/hooks.json"], CODEX_EVENTS) {
+        if !missing.contains(&e) {
+            missing.push(e);
+        }
+    }
+    missing
 }
 
 fn claude_hook_json() -> Value {
@@ -336,33 +462,9 @@ fn agents_block() -> String {
          - When you are done, say what you did: `use05 finish --outcome \"<what you did>\"`. 05 runs the checks itself.\n\
          - If you are on a working branch (one you, your tool or the user made), `use05 land` moves it into its target when the gate allows it, and 05 cleans up the branch and worktree afterwards. Do not create branches just for 05.\n\
          - `use05 approve` and `use05 bypass` need the person: Touch ID or the approver passphrase, which agents do not have.\n\
+         - If `use05` is missing or says it is too old, stop and ask the user to install or upgrade it. Do not install it yourself.\n\
          {BLOCK_END}\n"
     )
-}
-
-fn ci_workflow() -> &'static str {
-    "name: 05\n\
-     \n\
-     # Every pushed branch is gated, so an agent's branch is checked before it lands; landing\n\
-     # fast-forwards that same commit onto main, with or without a pull request. 05's own\n\
-     # receipts branches are not changes to gate.\n\
-     on:\n  pull_request:\n  push:\n    branches-ignore: [\"05-receipts/**\"]\n\
-     \n\
-     # write: the runner pushes its own receipts branch (05-receipts/<runner key>), so what it\n\
-     # sealed outlives the job. Nothing else is pushed.\n\
-     permissions:\n  contents: write\n\
-     \n\
-     jobs:\n  acceptance:\n    runs-on: ubuntu-latest\n    steps:\n\
-     \x20     # The token is not left in .git/config, where the code under test could read it.\n\
-     \x20     - uses: actions/checkout@v4\n        with:\n          fetch-depth: 0\n          persist-credentials: false\n\
-     \n\
-     \x20     # Installs a checksum-verified release. It fails loudly if no release can be fetched,\n\
-     \x20     # instead of passing without checking anything.\n\
-     \x20     - name: Install use05\n        run: |\n          curl -fsSL https://use05.dev/install.sh | sh\n          echo \"$HOME/.local/bin\" >> \"$GITHUB_PATH\"\n\
-     \n\
-     \x20     # Proves the policy's required checks with the runner key (a CI secret the agent cannot\n\
-     \x20     # read), then gates the change. Make this job a required check in branch protection.\n\
-     \x20     - name: Prove and gate\n        env:\n          USE05_RUNNER_KEY: ${{ secrets.USE05_RUNNER_KEY }}\n          USE05_PUSH_TOKEN: ${{ github.token }}\n        run: use05 gate --ci --push\n"
 }
 
 pub fn run(args: Args) -> Report {
@@ -376,15 +478,25 @@ pub fn run(args: Args) -> Report {
     let mut kept: Vec<String> = Vec::new();
     let mut gaps: Vec<String> = Vec::new();
 
+    let ci = match args.ci.as_deref().map(|name| (name, host::by_name(name))) {
+        Some((other, None)) => return Report::error("init", "CI_UNSUPPORTED", format!("no CI template for {other:?} yet"), Some("use --ci github, or run `use05 gate --ci` from any CI".into()), 6),
+        Some((_, Some(h))) => Some(h),
+        None => None,
+    };
+    // The folder holding the CI workflows, locked in a policy written with them (D94).
+    let lock = ci.as_ref().and_then(|h| h.workflows().first().and_then(|(rel, _)| rel.parent().map(|p| format!("{}/**", p.display()))));
+
     // Policy
     let policy_path = top.join(POLICY_PATH);
     use crate::cmd::setup::{AFTER_EDIT, Outcome, run_on};
     let stopped = || Report::error("init", "SETUP_STOPPED", "Setup stopped; nothing was changed.".into(), Some("run use05 init again when you are ready".into()), 1);
+    let no_answer = || Report::error("init", "INIT_NO_ANSWER", crate::prompt::no_answer_message(), Some("use05 init --defaults   sets up with the usual answers and asks nothing".into()), 1);
     let mut after = Vec::new();
     if policy_path.exists() {
         let wanted = if args.interactive {
-            let mut a = crate::prompt::Asker::styled(std::io::stdin().lock(), std::io::stderr(), crate::ui::Ui::stderr());
+            let mut a = crate::prompt::on_stdin(crate::ui::Ui::stderr());
             match a.yes("05 is already set up here. Change your settings?", false) {
+                None if a.timed_out() => return no_answer(),
                 None => return stopped(),
                 Some(yes) => yes,
             }
@@ -395,6 +507,7 @@ pub fn run(args: Args) -> Report {
         match if wanted { run_on(&current, &top, true, args.interactive, &args.flags) } else { Ok((Outcome::Unchanged, Vec::new())) } {
             Err(e) => return Report::error("init", "POLICY_INVALID", format!("{POLICY_PATH}: {e}"), Some("fix the file, or move it away and run use05 init again".into()), 3),
             Ok((Outcome::Stopped, _)) => return stopped(),
+            Ok((Outcome::NoAnswer, _)) => return no_answer(),
             Ok((Outcome::Written(text), notes)) => {
                 if let Err(e) = fs::write(&policy_path, &text) {
                     return Report::error("init", "IO_ERROR", format!("cannot write {POLICY_PATH}: {e}"), None, 4);
@@ -408,13 +521,37 @@ pub fn run(args: Args) -> Report {
                 kept.push(format!("{POLICY_PATH} already exists; left as it is"));
             }
         }
+        let locked = fs::read_to_string(&policy_path).ok().and_then(|t| use05_core::policy::Policy::parse(&t).ok()).map(|p| p.protect.locked);
+        if let (Some(lock), Some(locked)) = (&lock, locked) {
+            if !locked.contains(lock) {
+                gaps.push(format!("your policy does not lock the CI workflows, so a change could edit the gate that judges it: use05 policy add protect.locked \"{lock}\""));
+            }
+        }
     } else {
-        let checks = detect_checks(&top);
+        let mut checks = detect_checks(&top);
+        // A monorepo gets a check per package (D97). With questions, the setup offers them; without,
+        // they are taken, as the other defaults are.
+        if !args.interactive {
+            let scan = use05_core::setup::scan_workspaces(&top);
+            let per_package = use05_core::setup::workspace_checks(&top, &scan.workspaces);
+            if !per_package.is_empty() {
+                after.push(use05_core::setup::workspace_note(&scan.workspaces, scan.root_is_package));
+                after.push(use05_core::setup::workspace_caveat().to_string());
+            }
+            after.extend(scan.skipped.iter().map(|n| format!("Monorepo: {n}.")));
+            checks = use05_core::setup::with_workspace_checks(checks, per_package, scan.root_is_package);
+        }
         let text = policy_template(&checks);
+        // A branch must not be able to change the gate that judges it (D94).
+        let text = match &lock {
+            Some(lock) => lock_in_template(&text, lock),
+            None => text,
+        };
         let text = if args.interactive || args.flags.any() {
             match run_on(&text, &top, false, args.interactive, &args.flags) {
                 Err(e) => return Report::error("init", "SETUP_INVALID", e, None, 6),
                 Ok((Outcome::Stopped, _)) => return stopped(),
+                Ok((Outcome::NoAnswer, _)) => return no_answer(),
                 Ok((Outcome::Written(t), notes)) => {
                     after.extend(notes);
                     t
@@ -509,21 +646,40 @@ pub fn run(args: Args) -> Report {
         }
         // git pre-push
         let hook = hooks_dir(&top).join("pre-push");
-        match fs::read_to_string(&hook) {
-            Ok(t) if t.contains(HOOK_MARK) => kept.push("the git pre-push hook is already installed".into()),
-            Ok(_) => gaps.push(format!("an existing pre-push hook at {} was left alone, so pushes are not checked by 05", hook.display())),
-            Err(_) => {
-                let script = format!("#!/bin/sh\n{HOOK_MARK} (installed by `use05 init`; remove with `use05 uninstall`)\n# A project-level npm install is found too; one on PATH comes first.\nexport {LOCAL_BIN_PATH}\ncommand -v use05 >/dev/null 2>&1 || {{ echo \"05: use05 is not on PATH; this push was not checked\" >&2; exit 0; }}\nexec use05 gate --git-hook pre-push \"$@\"\n");
-                let written = fs::create_dir_all(hook.parent().expect("has parent")).and_then(|_| fs::write(&hook, &script));
-                match written {
-                    Ok(()) => {
-                        use std::os::unix::fs::PermissionsExt;
-                        let _ = fs::set_permissions(&hook, fs::Permissions::from_mode(0o755));
-                        manifest.items.push(Item::File { path: hook.strip_prefix(&top).unwrap_or(&hook).display().to_string(), sha256: sha(&script) });
-                        changed.push("installed the git pre-push hook (advisory: `git push --no-verify` skips it)".into());
-                    }
-                    Err(e) => gaps.push(format!("could not install the pre-push hook: {e}")),
+        let shown_hook = hook.strip_prefix(&top).unwrap_or(&hook).display().to_string();
+        // What to write, and what to say about it; `None` leaves the hook as it is.
+        let current = fs::read_to_string(&hook).ok();
+        let write: Option<&str> = match &current {
+            None => Some("installed the git pre-push hook (advisory: `git push --no-verify` skips it)"),
+            Some(t) if t.contains(HOOK_MARK) => {
+                // 05's own earlier hook, untouched since init, does not run Git LFS's: update it.
+                let untouched = manifest.items.iter().any(|it| matches!(it, Item::File { path, sha256 } if *path == shown_hook && *sha256 == sha(t)));
+                if untouched && !t.contains(LFS_CALL) && repo_uses_lfs(&top) {
+                    Some("updated the git pre-push hook so it runs Git LFS's upload step before 05's check")
+                } else {
+                    kept.push("the git pre-push hook is already installed".into());
+                    None
                 }
+            }
+            // Git LFS's own hook only uploads LFS files; 05's hook now does that first, then checks.
+            Some(t) if is_standard_lfs_hook(t) => Some("replaced Git LFS's own pre-push hook with 05's, which runs it first and then checks the push (`git lfs update` brings Git LFS's back after `use05 uninstall`)"),
+            Some(_) => {
+                gaps.push(format!("an existing pre-push hook at {} was left alone, so pushes are not checked by 05", hook.display()));
+                None
+            }
+        };
+        if let Some(said) = write {
+            let script = pre_push_script();
+            let written = fs::create_dir_all(hook.parent().expect("has parent")).and_then(|_| fs::write(&hook, &script));
+            match written {
+                Ok(()) => {
+                    use std::os::unix::fs::PermissionsExt;
+                    let _ = fs::set_permissions(&hook, fs::Permissions::from_mode(0o755));
+                    manifest.items.retain(|it| !matches!(it, Item::File { path, .. } if *path == shown_hook));
+                    manifest.items.push(Item::File { path: shown_hook, sha256: sha(&script) });
+                    changed.push(said.into());
+                }
+                Err(e) => gaps.push(format!("could not install the pre-push hook: {e}")),
             }
         }
     }
@@ -547,23 +703,45 @@ pub fn run(args: Args) -> Report {
     }
 
     // CI
-    match args.ci.as_deref() {
-        Some("github") => {
-            let path = top.join(".github/workflows/05.yml");
-            if path.exists() {
-                kept.push(".github/workflows/05.yml already exists; left as it is".into());
-            } else {
-                let text = ci_workflow();
-                match fs::create_dir_all(path.parent().expect("has parent")).and_then(|_| fs::write(&path, text)) {
+    match &ci {
+        Some(h) => {
+            for (i, (rel, text)) in h.workflows().into_iter().enumerate() {
+                let shown = rel.display().to_string();
+                let path = top.join(&rel);
+                let what = if i == 0 {
+                    "the gate: it alone gets the runner key, so keep USE05_RUNNER_KEY where only it can read it (docs/turn-on-the-ci-gate.md)"
+                } else {
+                    "it starts the gate for every push and pull request, and gets no secret"
+                };
+                let current = fs::read_to_string(&path).ok();
+                // A file an earlier use05 wrote and nobody changed since is brought up to date;
+                // anything else that is there is left alone.
+                let ours = current.as_ref().and_then(|c| manifest.items.iter().position(|it| matches!(it, Item::File { path, sha256 } if *path == shown && *sha256 == sha(c))));
+                if current.as_deref() == Some(text.as_str()) || (current.is_some() && ours.is_none()) {
+                    kept.push(format!("{shown} already exists; left as it is"));
+                    continue;
+                }
+                match fs::create_dir_all(path.parent().expect("has parent")).and_then(|_| fs::write(&path, &text)) {
                     Ok(()) => {
-                        manifest.items.push(Item::File { path: ".github/workflows/05.yml".into(), sha256: sha(text) });
-                        changed.push("wrote .github/workflows/05.yml (it proves and gates in CI; add USE05_RUNNER_KEY as a secret)".into());
+                        let item = Item::File { path: shown.clone(), sha256: sha(&text) };
+                        match ours {
+                            Some(at) => {
+                                manifest.items[at] = item;
+                                changed.push(format!("replaced {shown}, which an earlier use05 wrote and nobody changed since ({what})"));
+                            }
+                            None => {
+                                manifest.items.push(item);
+                                changed.push(format!("wrote {shown} ({what})"));
+                            }
+                        }
                     }
                     Err(e) => gaps.push(format!("could not write the CI workflow: {e}")),
                 }
             }
+            for f in h.key_exposed_in(&top) {
+                gaps.push(format!("{} still gives the runner key to a run the branch defines, so an agent's push can read it: delete it or remove the key from it, then rotate the key", f.display()));
+            }
         }
-        Some(other) => return Report::error("init", "CI_UNSUPPORTED", format!("no CI template for {other:?} yet"), Some("use --ci github, or run `use05 gate --ci` from any CI".into()), 6),
         None => gaps.push("no merge enforcement yet: add a CI check with `use05 init --ci github`, then make it required in branch protection".into()),
     }
 
@@ -625,8 +803,11 @@ pub fn run(args: Args) -> Report {
 
 /// What `init` wrote for everyone that is not committed yet, as `git add` arguments.
 fn uncommitted_setup(top: &Path) -> Option<String> {
-    let paths: Vec<&str> = [".05", ".codex", "AGENTS.md", ".claude/settings.json", ".github/workflows/05.yml"]
+    let workflows = host::all().into_iter().flat_map(|h| h.workflows()).map(|(rel, _)| rel.display().to_string());
+    let paths: Vec<String> = [".05", ".codex", "AGENTS.md", ".claude/settings.json"]
         .into_iter()
+        .map(str::to_string)
+        .chain(workflows)
         .filter(|p| top.join(p).exists() && git::text(top, &["status", "--porcelain", "--", p]).is_ok_and(|s| !s.trim().is_empty()))
         .collect();
     (!paths.is_empty()).then(|| paths.join(" "))
@@ -655,6 +836,9 @@ pub fn uninstall(repo: &Path) -> Report {
                     Ok(t) if sha(&t) == *sha256 => {
                         let _ = fs::remove_file(&full);
                         rows.push(("removed".into(), path.clone()));
+                        if full.file_name().is_some_and(|n| n == "pre-push") && repo_uses_lfs(&top) {
+                            rows.push(("note".into(), "this repository uses Git LFS: run `git lfs update` so pushes upload its files again".into()));
+                        }
                     }
                     Ok(_) => rows.push(("left".into(), format!("{path} (it was edited since init)"))),
                     Err(_) => rows.push(("gone".into(), format!("{path} was already removed"))),
@@ -699,5 +883,30 @@ pub fn uninstall(repo: &Path) -> Report {
         excerpt: vec![],
         details: Value::Null,
         exit: 0,
+    }
+}
+
+#[cfg(test)]
+mod event_tests {
+    use super::*;
+
+    #[test]
+    fn the_events_listed_are_the_events_installed() {
+        let names = |v: Value| v.as_object().unwrap().keys().cloned().collect::<std::collections::BTreeSet<_>>();
+        let listed = |l: &[&str]| l.iter().map(|e| e.to_string()).collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(names(claude_hook_json()), listed(CLAUDE_EVENTS));
+        assert_eq!(names(codex_hook_json()), listed(CODEX_EVENTS));
+    }
+
+    #[test]
+    fn hooks_missing_events_are_named_per_what_is_installed() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(missing_hook_events(dir.path()).is_empty(), "no hooks, nothing to compare");
+        let file = dir.path().join(".claude/settings.local.json");
+        merge_agent_hooks(&file, &claude_hook_json(), &[]).unwrap();
+        assert!(missing_hook_events(dir.path()).is_empty());
+        let old = fs::read_to_string(&file).unwrap().replace("claude-code SubagentStart", "claude-code SomethingElse");
+        fs::write(&file, old).unwrap();
+        assert_eq!(missing_hook_events(dir.path()), ["SubagentStart"]);
     }
 }

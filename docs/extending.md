@@ -97,6 +97,40 @@ Extensions can keep their own signed records on the same `05-receipts/<key>` bra
 
 If a tool's result should count, make it a check in `.05/policy.toml`. `use05 prove` runs it on a copy of the exact tree and signs the outcome, and the gate reads that receipt like any other.
 
+## 6. Hosts: where the CI gate meets a Git host
+
+The gate (`use05 gate --ci`) and `use05 init --ci <host>` never read a host's environment or write its file formats themselves. They go through one adapter in `crates/cli/src/host/`, and GitHub (`host/github.rs`) is the only one there is. A second host is added only when someone needs it; this section is what it would have to provide.
+
+An adapter implements `Host`:
+
+| Method | What the gate needs |
+|---|---|
+| `name()` | The word `init --ci` is given (`github`). |
+| `event()` | A `CiEvent`: the kind (`Push`, `PullRequest`, `MergeGroup`, `WorkflowRun` or `Other`), the commit, the branch the change is on, the branch it goes into, the kind of event that started a run that another run started (`triggered_by`), the repository's default branch when the host says, and the repository a fork's change came from. The gate holds the change to the rules of the branch it lands on, so this is the one thing it must get right. Where the host names none, the branch is empty and a policy that asks for something before a push holds the change. For a `WorkflowRun` the commit is the one the first run was for, never what this run checked out: the gate gates that commit and posts its status on it. |
+| `push_remote()` | An address, the token and the environment git authenticates with (on GitHub, an `http.extraheader` set through `GIT_CONFIG_*`), so the runner can push its own `05-receipts/<runner key>` branch without the token in any command line, and anything git says can have it taken out. `None` when the host gave no token, and the plain remote is used. The token is never printed. |
+| `status_from_app()` | Whether the status is posted with a token of the person's own (on GitHub, their 05 app's), which no workflow a branch defines holds. The gate's summary says which it was: without it, a branch can forge the status. |
+| `post_status()` | Show `Pending`, `Success` or `Failure` next to a commit, as the host's commit status does (context `05`). Under a `WorkflowRun` the gate posts one at the start and one with the verdict; a status that cannot be posted fails the run. |
+| `summary()` | Add the brief to the job's summary page, if the host has one. |
+| `workflows()` | The files `init --ci <host>` writes: each a path in the repository and its text. The first is the gate, which alone gets the runner key; `init` locks the folder it is in, in a policy it writes. |
+| `key_exposed_in()` | The workflow files in a repository that give the runner key to a run whose definition the change's own branch supplies. `doctor` and `init` name them. |
+| `key_custody()` | How the host must keep the runner key and the status token so only the gate has them, one sentence each for `doctor` to show: settings 05 cannot read from the repository, and what follows when they cannot be made (a plan without environments, no app). |
+
+The runner key must reach only a run whose definition the change cannot alter (D94). On GitHub, that is a `workflow_run` workflow, read from the default branch, with the key as a secret of an environment only the default branch may use. When the key reaches a `Push`, `PullRequest` or `MergeGroup` run, the gate warns `CI_KEY_EXPOSED`.
+
+`detect()` picks the adapter from the environment (GitHub when `GITHUB_ACTIONS=true`). `gate --ci` uses `current()`: the detected adapter, or GitHub's when none is detected, so a run reproduced by hand with GitHub's variables set behaves as it does in Actions.
+
+### Sketch: GitLab
+
+Nothing of this is built. It shows the boundary is enough.
+
+- `event()`: `CI_PIPELINE_SOURCE` says the kind (`push`, `merge_request_event`, `merge_train`; `pipeline` for a pipeline another one started). `CI_COMMIT_SHA` is the commit, `CI_COMMIT_REF_NAME` the branch (`CI_MERGE_REQUEST_SOURCE_BRANCH_NAME` in a merge request), and `CI_MERGE_REQUEST_TARGET_BRANCH_NAME` the base. `CI_DEFAULT_BRANCH` is the default branch.
+- `push_remote()`: a project or group access token kept in a protected, masked CI variable, put in `https://oauth2:<token>@<CI_SERVER_HOST>/<CI_PROJECT_PATH>.git`. Protected variables are only given to protected branches and tags, which is what keeps the code under test from reading the token.
+- `post_status()`: `POST /projects/:id/statuses/:sha` with `state` set to `pending`, `success` or `failed`, and `name` set to `05`.
+- `summary()`: GitLab has no job summary page. The brief goes to the job log, or to a report artifact.
+- `workflows()`: a `.gitlab-ci.yml` job that installs `use05` and runs `use05 gate --ci --push`.
+
+Open question: where the runner key lives. On GitHub it is a secret of an environment only the default branch may use, given to a `workflow_run` job a branch cannot change. A GitLab CI variable must be both masked and protected to be as safe, and merge request pipelines from forks run without protected variables, so the gate would run without a key there. How such a pipeline is proved (or refused) has to be decided before the adapter ships.
+
 ## What extensions cannot do
 
 They cannot change a gate decision, approve, or loosen policy. Gates are deterministic and read only 05's own records, verified against the keys your policy trusts. The one way a tool's result counts is as a check.

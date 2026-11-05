@@ -22,6 +22,7 @@ pub mod logseal;
 pub mod org;
 pub mod overlap;
 pub mod policy;
+pub mod promote;
 pub mod repos;
 pub mod risk;
 pub mod session;

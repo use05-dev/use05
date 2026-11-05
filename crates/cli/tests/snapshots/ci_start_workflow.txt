@@ -1,0 +1,20 @@
+name: "05"   # quoted: YAML reads a bare 05 as the number 5, and 05-gate.yml waits for "05"
+
+# Starts the 05 gate (05-gate.yml) for every pushed branch, pull request and merge queue.
+# This file runs from the branch's own copy, which the branch can change, so it holds no
+# secret, asks only for a read-only token and runs nothing of the change. The gate runs when
+# this finishes and posts the commit status `05`. 05's own receipts branches are not changes.
+on:
+  pull_request:
+  push:
+    branches-ignore: ["05-receipts/**"]
+  merge_group:
+
+permissions:
+  contents: read
+
+jobs:
+  start-gate:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo "05 gates $GITHUB_SHA ($GITHUB_EVENT_NAME) when this finishes; see the 05 status"

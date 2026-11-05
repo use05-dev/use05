@@ -1,4 +1,4 @@
-Doctor  <REPO>                                                                      use05 0.0.13
+Doctor  <REPO>                                                                      use05 0.0.14
 ────────────────────────────────────────────────────────────────────────────────────────────────────
 Setup      ✓ git <VERSION>
            ✓ repository <DIR>
@@ -18,7 +18,7 @@ Controls   ! Claude Code hooks off. Agent sessions are not guarded or recorded. 
            ✓ evidence policy accepts local and runner receipts. Local ones are advisory
            ✓ AGENTS.md tells agents how 05 works in this repository
 
-Record     ✓ receipts none stored yet
+Record     ✓ receipts 0 on 0 branches, 0 B. Never pruned; branches never force-pushed
            ✓ record 0 tasks, 0 active. Logs are intact. This is a forensic aid, not a seal
 
 ────────────────────────────────────────────────────────────────────────────────────────────────────

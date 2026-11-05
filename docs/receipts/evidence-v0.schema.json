@@ -1,0 +1,99 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://use05.dev/receipts/evidence-v0.schema.json",
+  "title": "05 evidence receipt, https://use05.dev/evidence/v0",
+  "description": "An in-toto Statement v1 saying a command ran on one exact tree and how it ended. This is the statement inside the DSSE envelope's payload. Fields are only ever added, as optional ones.",
+  "type": "object",
+  "required": ["_type", "subject", "predicateType", "predicate"],
+  "additionalProperties": true,
+  "properties": {
+    "_type": { "const": "https://in-toto.io/Statement/v1" },
+    "subject": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "required": ["name", "digest"],
+        "properties": { "name": { "type": "string" }, "digest": { "type": "object", "additionalProperties": { "type": "string" } } }
+      },
+      "contains": {
+        "type": "object",
+        "properties": { "name": { "const": "tree" }, "digest": { "type": "object", "required": ["gitTree", "sha256"] } }
+      }
+    },
+    "predicateType": { "const": "https://use05.dev/evidence/v0" },
+    "predicate": {
+      "type": "object",
+      "required": ["command", "environment", "result", "runner", "created"],
+      "additionalProperties": true,
+      "properties": {
+        "command": {
+          "type": "object",
+          "required": ["argv", "cwd"],
+          "properties": {
+            "argv": { "type": "array", "items": { "type": "string" } },
+            "cwd": { "type": "string", "description": "Always relative to the exported tree: its root. The folder the command ran in is dir." },
+            "dir": { "type": "string", "description": "The folder of the exported tree the command ran in, when the check named one. Absent when it ran at the root." }
+          }
+        },
+        "environment": {
+          "type": "object",
+          "required": ["fingerprint", "names"],
+          "properties": {
+            "fingerprint": { "type": "string", "description": "Hash of the scrubbed environment. Values are never recorded." },
+            "names": { "type": "array", "items": { "type": "string" } }
+          }
+        },
+        "result": {
+          "type": "object",
+          "required": ["status", "duration_ms", "stdout", "stderr"],
+          "properties": {
+            "status": { "enum": ["passed", "failed", "timed_out"] },
+            "exit_code": { "type": ["integer", "null"] },
+            "signal": { "type": ["integer", "null"] },
+            "duration_ms": { "type": "integer", "minimum": 0 },
+            "stdout": { "$ref": "#/$defs/stream" },
+            "stderr": { "$ref": "#/$defs/stream" }
+          }
+        },
+        "runner": {
+          "type": "object",
+          "required": ["name", "version", "platform"],
+          "properties": {
+            "name": { "type": "string" },
+            "version": { "type": "string" },
+            "platform": { "type": "string" },
+            "check_user": { "type": "string", "description": "The OS user the command ran as, when not the one holding the signing key (CI's use05-check)." }
+          }
+        },
+        "created": { "type": "string", "description": "RFC 3339, UTC. The signer's clock; not trusted." },
+        "check": { "type": "string", "description": "The policy check this ran, when it was run by name." },
+        "lfs": {
+          "type": "array",
+          "description": "The Git LFS files fetched into the exported tree in place of their pointers (policy [evidence] lfs = true). Left out when there were none. The tree digest still covers the committed pointers.",
+          "items": {
+            "type": "object",
+            "required": ["path", "oid", "size"],
+            "properties": {
+              "path": { "type": "string", "description": "Relative to the tree's root." },
+              "oid": { "type": "string", "description": "SHA-256 of the file's real bytes (hex), as its pointer names it." },
+              "size": { "type": "integer", "minimum": 0, "description": "The file's real size in bytes." }
+            }
+          }
+        }
+      }
+    }
+  },
+  "$defs": {
+    "stream": {
+      "type": "object",
+      "required": ["total_bytes", "retained_bytes", "truncated", "sha256"],
+      "properties": {
+        "total_bytes": { "type": "integer", "minimum": 0 },
+        "retained_bytes": { "type": "integer", "minimum": 0 },
+        "truncated": { "type": "boolean" },
+        "sha256": { "type": "string", "description": "Of the stream; its text is never recorded." }
+      }
+    }
+  }
+}

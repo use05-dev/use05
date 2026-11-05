@@ -56,13 +56,20 @@ pub fn run(repo: &Path, task: Option<&str>, push: bool, interactive: bool) -> Re
     report
 }
 
-/// Would this task land now? The branch, its target and the commit, when the gate allows it;
-/// nothing is changed and nobody is told.
-pub fn ready(ctx: &Ctx, task: &Task) -> Option<(String, String)> {
+/// Would this task land now? The branch, its target and what the gate found, when the gate
+/// allows it; nothing is changed and nobody is told.
+pub fn ready(ctx: &Ctx, task: &Task) -> Option<(String, String, use05_core::gate::GateResult)> {
     let top = ctx.top();
     let branch = task.branch.clone()?;
-    if branches::is_kept(&ctx.policy, &branch) {
+    if branches::is_kept(&ctx.policy, &branch) || branches::checked_out_at(top, &branch).is_some_and(|dir| !branches::is_committed(&dir)) {
         return None;
+    }
+    // A hotfix is judged as its push will be: on its environment's branch, by that branch's rules.
+    if let Some(env) = task.hotfix.as_deref() {
+        let rules = crate::cmd::promote::rules_for(top, env).ok()?;
+        let head = use05_core::git::resolve_commit(top, &format!("refs/heads/{branch}"))?;
+        let landing = crate::cmd::hotfix::judge_landing(&rules, task, &head).ok()?;
+        return (landing.gate.decision == Decision::Allow).then_some((branch, rules.env.branch.clone(), landing.gate));
     }
     let target = branches::target_for(&ctx.policy, task.intent.as_ref(), top);
     if target == branch || branches::checked_out_at(top, &branch).is_some_and(|dir| !branches::is_committed(&dir)) {
@@ -71,7 +78,7 @@ pub fn ready(ctx: &Ctx, task: &Task) -> Option<(String, String)> {
     let head = use05_core::git::resolve_commit(top, &format!("refs/heads/{branch}"))?;
     let base = use05_core::git::merge_base(top, &format!("refs/heads/{target}"), &head);
     let gate = ctx.target_from(&head, base.as_deref()).and_then(|t| ctx.gate_for(&t, Some(&target))).ok()?;
-    (gate.decision == Decision::Allow).then_some((branch, target))
+    (gate.decision == Decision::Allow).then_some((branch, target, gate))
 }
 
 /// After a landing: push the landing branch when `then` says so (D91). The receipts this
@@ -94,6 +101,14 @@ pub fn push_after(ctx: &Ctx, report: &mut Report, then: Then, quiet: bool) {
             report.rows.push(("pushed".into(), format!("{target} → {remote}")));
             report.next = None;
             report.details["pushed"] = json!(true);
+            // A hotfix's record is filed only now that its push went through (D93).
+            if let Some(task) = report.details["hotfix_pending"].as_str().map(str::to_string) {
+                let (rows, notes) = crate::cmd::hotfix::file_pending(ctx, &task);
+                report.notes.retain(|n| !n.contains(crate::cmd::hotfix::NOT_FILED_YET));
+                report.rows.extend(rows);
+                report.notes.extend(notes);
+                report.details["hotfix_pending"] = serde_json::Value::Null;
+            }
         }
         Err(e) => {
             report.notes.push(format!("Landed, but the push did not go through: {e}"));
@@ -129,6 +144,10 @@ fn push_branch(top: &Path, remote: &str, target: &str, quiet: bool) -> Result<()
 
 /// Land `task` and tidy up. Also used by the Stop hook when the policy says `land = "auto"`.
 pub fn land_task(ctx: &Ctx, mut task: Task) -> Report {
+    // A hotfix lands on its environment's branch, under that branch's rules (D93).
+    if task.hotfix.is_some() {
+        return crate::cmd::hotfix::land(ctx, task);
+    }
     let top = ctx.top();
     let policy = &ctx.policy;
     let Some(branch) = task.branch.clone() else {

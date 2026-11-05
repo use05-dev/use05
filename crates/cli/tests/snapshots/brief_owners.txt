@@ -1,0 +1,32 @@
+Brief  Untracked change                                                                      no task
+────────────────────────────────────────────────────────────────────────────────────────────────────
+Story      asked: not recorded
+           agent says: nothing yet
+           05 saw: 1 file changed in billing/ · +1 −0
+           05 saw: in a risk area: money
+           checked: none required; behaviour not verified
+           not known: behaviour beyond these checks
+
+Intent     inferred from the task; no card was written
+           risk high
+           money: billing/pay.rs
+
+Outcome    1 file changed on <TREE12> (origin/alex/billing at commit <TREE12>) · +1 −0
+           billing/ · 1 file · +1 −0
+
+Evidence   policy requires no checks
+
+Drift      ✓ nothing differs from the intent
+
+Approvals  ✓ dana approved the outcome: "billing looks right"
+
+Owners     ✓ billing/** owned by eng-managers (Dana, Lee): 1 of 1, approved by Dana
+
+Unknowns   · 05 shows what was checked. It does not judge whether the change is correct.
+           · policy requires no checks, so nothing was verified by running anything
+
+Undo       git revert --no-commit <BASE>..<HEAD>
+
+────────────────────────────────────────────────────────────────────────────────────────────────────
+✓ ALLOW  nothing to read
+  Checks: none required; behaviour not verified

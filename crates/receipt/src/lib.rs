@@ -7,6 +7,7 @@
 
 mod dsse;
 mod keys;
+mod lfs;
 mod passkey;
 mod statement;
 
@@ -14,12 +15,15 @@ pub use dsse::{Envelope, EnvelopeSignature, Fault, PAYLOAD_TYPE, WebAuthnSig, co
 pub use keys::{
     KeyError, PublicKey, key_id, parse_any_public_key, parse_public_key, parse_secret_key, public_key_text, secret_key_text,
 };
+pub use lfs::{MAX_LFS_POINTER_BYTES, attributes_use_lfs, lfs_pointer, looks_like_lfs_pointer};
 pub use passkey::{LocalAssertion, PasskeyKey, TOUCH_ID_SITE, local_assertion, passkey_challenge, passkey_entry, passkey_public_text};
 pub use statement::{
-    APPROVAL_TYPE, AgentRef, AnyStatement, Approval, ApprovalScope, BYPASS_TYPE, Bypass, Command, Completion,
-    DISCARD_TYPE, Decision, Declaration, Discard, Environment, Evidence, INTENT_TYPE, LOG_TYPE, LogSeal, ORG_TYPE,
-    OUTCOME_TYPE, OrgLayer, Outcome, OwnerRef, PREDICATE_TYPE, Predicate, Runner,
-    STATEMENT_TYPE, Statement, Status, Stream, Subject, TESTING_TYPE, Tested, Testing, intent_subject, log_subject, tree_subject, work_subject,
+    APPROVAL_TYPE, AgentRef, AnyStatement, Approval, ApprovalScope, BYPASS_TYPE, Bypass, Command, Completion, DEPLOYMENT_TYPE,
+    DISCARD_TYPE, Decision, Declaration, DeployAction, Deployment, Direction, Discard, Environment, Evidence, INTENT_TYPE, LOG_TYPE,
+    LfsFile, LogSeal, ORG_TYPE, OUTCOME_TYPE, OrgLayer, Outcome, OwnerRef, PREDICATE_TYPE, PROMOTION_TYPE, Predicate, ProbeResult,
+    Promotion, RECORD_TYPES, RuleOutcome, RuleResult, RuleSeverity, Runner, SIGNOFF_TYPE, STATEMENT_TYPE, SignOff, SmokeResult,
+    Statement, Status, Stream, Subject, TESTING_TYPE, Tested, Testing, commit_subject, intent_subject, log_subject, tree_subject,
+    work_subject,
 };
 
 pub use ed25519_dalek::{SigningKey, VerifyingKey};

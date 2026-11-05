@@ -162,3 +162,100 @@ impl Drop for BlobReader {
         let _ = self.child.wait();
     }
 }
+
+/// Whether `git lfs` can be run here. Says why not when it cannot.
+pub(crate) fn lfs_available(repo: &Path) -> Result<(), String> {
+    match git(repo).args(["lfs", "version"]).stdin(Stdio::null()).output() {
+        Ok(out) if out.status.success() => Ok(()),
+        Ok(out) => Err(String::from_utf8_lossy(&out.stderr).trim().to_string()),
+        Err(e) => Err(e.to_string()),
+    }
+}
+
+/// Run `git lfs smudge` on a pointer and write the real file to `target`, returning the byte count
+/// and SHA-256 (hex) of what was written. The caller checks them against the pointer.
+///
+/// It gives up after `limit`: the policy check's own timeout starts only once the check runs, so
+/// nothing else bounds a server that never answers.
+pub(crate) fn lfs_smudge(repo: &Path, pointer: &[u8], target: &Path, limit: std::time::Duration) -> Result<(u64, String), String> {
+    use sha2::{Digest, Sha256};
+    use std::io::{Read, Write};
+    use std::os::unix::process::CommandExt;
+
+    let mut command = git(repo);
+    command
+        .args(["lfs", "smudge"])
+        // Nothing may leave the pointer alone, and nothing may wait for a person to answer.
+        .env_remove("GIT_LFS_SKIP_SMUDGE")
+        .env("GIT_TERMINAL_PROMPT", "0");
+    // An ssh LFS endpoint must not stop at a password or host-key question; one the person set up
+    // themselves (in the environment or in git's config) is left as it is.
+    let ssh_chosen = ["GIT_SSH_COMMAND", "GIT_SSH"].iter().any(|v| std::env::var_os(v).is_some()) || text(repo, &["config", "core.sshCommand"], "reading git's config").is_ok_and(|t| !t.is_empty());
+    if !ssh_chosen {
+        command.env("GIT_SSH_COMMAND", "ssh -o BatchMode=yes");
+    }
+    let mut child = command
+        // Its own process group, so a timeout reaches whatever it started too.
+        .process_group(0)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("git lfs could not be started ({e})"))?;
+    let mut stdin = child.stdin.take().expect("piped");
+    let mut stdout = child.stdout.take().expect("piped");
+    let mut stderr = child.stderr.take().expect("piped");
+    let errors = std::thread::spawn(move || {
+        let mut text = String::new();
+        let _ = stderr.read_to_string(&mut text);
+        text
+    });
+    let pointer = pointer.to_vec();
+    let writer = std::thread::spawn(move || {
+        let _ = stdin.write_all(&pointer);
+    });
+
+    let mut file = std::fs::File::create(target).map_err(|e| format!("could not write the file ({e})"))?;
+    let (sent, received) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let (mut hash, mut total) = (Sha256::new(), 0u64);
+        let mut buffer = vec![0u8; 64 * 1024];
+        let copied = loop {
+            match stdout.read(&mut buffer) {
+                Ok(0) => break Ok((total, hex::encode(hash.finalize()))),
+                Ok(n) => {
+                    hash.update(&buffer[..n]);
+                    total += n as u64;
+                    if let Err(e) = file.write_all(&buffer[..n]) {
+                        break Err(format!("could not write the file ({e})"));
+                    }
+                }
+                Err(e) => break Err(format!("could not read git lfs's output ({e})")),
+            }
+        };
+        let _ = sent.send(copied);
+    });
+    let copied = match received.recv_timeout(limit) {
+        Ok(copied) => copied,
+        Err(_) => {
+            // Not joined: whatever still holds the pipe open would hold the join too.
+            crate::exec::kill_group(child.id());
+            let _ = child.wait();
+            return Err(format!("the LFS server did not answer within {} seconds", limit.as_secs()));
+        }
+    };
+    if copied.is_err() {
+        crate::exec::kill_group(child.id());
+    }
+    let status = child.wait();
+    let _ = writer.join();
+    let said = errors.join().unwrap_or_default();
+    let (total, sha) = copied?;
+    match status {
+        Ok(s) if s.success() => Ok((total, sha)),
+        _ => {
+            let said = said.trim();
+            Err(if said.is_empty() { "git lfs smudge failed".to_string() } else { said.to_string() })
+        }
+    }
+}

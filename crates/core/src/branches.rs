@@ -37,6 +37,15 @@ pub fn target_for(policy: &Policy, card: Option<&IntentCard>, top: &Path) -> Str
     card.and_then(|c| c.target.clone()).unwrap_or_else(|| landing_for(policy, None, top))
 }
 
+/// Where this task's work lands: a hotfix's on its environment's branch (D93), any other task's
+/// where [`target_for`] says.
+pub fn task_target(policy: &Policy, task: &crate::task::Task, top: &Path) -> String {
+    match task.hotfix.as_deref().and_then(|env| policy.environment_named(env)) {
+        Some(env) => env.branch.clone(),
+        None => target_for(policy, task.intent.as_ref(), top),
+    }
+}
+
 /// Where the policy's work lands, whatever an agent declared: the policy's target, else the host's
 /// default branch (when CI knows it), else the remote's, else `main`.
 pub fn landing_for(policy: &Policy, host_default: Option<&str>, top: &Path) -> String {
@@ -188,7 +197,7 @@ pub fn tidy(store: &Store, policy: &Policy, here: &Path, including_here: bool) -
         if task.base_commit.as_deref() == Some(head.as_str()) {
             continue;
         }
-        if !landed(top, &branch, &target_for(policy, task.intent.as_ref(), top)) {
+        if !landed(top, &branch, &task_target(policy, task, top)) {
             continue;
         }
         let all = worktrees(top);

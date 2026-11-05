@@ -1,0 +1,31 @@
+Promote  uat → prod                                                              uat at <TREE12>
+────────────────────────────────────────────────────────────────────────────────────────────────────
+Moves      1 commit · 1 file · +1 −0
+           <TREE12> (origin/uat) onto prod at <TREE12> (origin/prod), by fast-forward
+           (root) · 1 file · +1 −0
+           feature.rs · +1 −0
+           <TREE12> Add the feature
+
+Rules      from prod's policy (origin/prod)
+           ✓ source_checks: test passed on <TREE12> (deny)
+           ! source_confirmed: nothing confirms uat runs <TREE12> (warn)
+           · soak: no soak time is set (warn)
+           ✓ migrations: no migrations move (approval)
+           ! untasked: 1 of 1 commit belongs to no task: <TREE12> (warn)
+           ! sign_off: nobody has signed off (approval)
+
+Sign-off   needed from a person with an approver key
+           · Dana signed off: "looks fine" (does not count: its words are shorter than the 20
+             characters the policy asks)
+
+Rollback   back to <TREE12> if the deploy fails
+
+Checked only: nothing was moved or pushed. Here this is advisory; the CI gate on prod's branch is
+the strong control. Deployment, finish and promotion records this machine signs count, so
+source_confirmed, soak and untasked rest on its own word; with [evidence] accept = ["runner"] only
+CI's records count.
+────────────────────────────────────────────────────────────────────────────────────────────────────
+! NEEDS A PERSON'S SIGN-OFF
+  1. promoting into prod needs a sign-off from a person with an approver key; Dana's does not
+     count: its words are shorter than the 20 characters the policy asks
+     → ask a person with an approver key to sign off: use05 approve --promote prod --note "<what you checked>"

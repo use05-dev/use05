@@ -1,0 +1,60 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://use05.dev/receipts/deployment-v0.schema.json",
+  "title": "05 deployment, https://use05.dev/deployment/v0",
+  "description": "An in-toto Statement v1 recording what an environment was seen running: each probe and smoke check, and whether together they confirm the commit. Subject: the deployed commit (gitCommit). Signed by the CI runner key, or by the key of the machine that ran the probes. Fields are only ever added, as optional ones.",
+  "type": "object",
+  "required": ["_type", "subject", "predicateType", "predicate"],
+  "additionalProperties": true,
+  "$defs": {
+    "probe": {
+      "type": "object",
+      "required": ["name", "matched", "output_sha256", "attempts", "seconds"],
+      "additionalProperties": true,
+      "properties": {
+        "name": { "type": "string" },
+        "matched": { "type": "boolean", "description": "The probe's output named the commit." },
+        "output_sha256": { "type": "string", "description": "The SHA-256 of what the probe printed last, never the text." },
+        "attempts": { "type": "integer", "minimum": 0 },
+        "seconds": { "type": "integer", "minimum": 0 }
+      }
+    },
+    "smoke": {
+      "type": "object",
+      "required": ["name", "passed"],
+      "additionalProperties": true,
+      "properties": { "name": { "type": "string" }, "passed": { "type": "boolean" } }
+    }
+  },
+  "properties": {
+    "_type": { "const": "https://in-toto.io/Statement/v1" },
+    "subject": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "required": ["name", "digest"],
+        "properties": { "name": { "type": "string" }, "digest": { "type": "object", "additionalProperties": { "type": "string" } } }
+      },
+      "contains": {
+        "type": "object",
+        "properties": { "name": { "const": "commit" }, "digest": { "type": "object", "required": ["gitCommit"] } }
+      }
+    },
+    "predicateType": { "const": "https://use05.dev/deployment/v0" },
+    "predicate": {
+      "type": "object",
+      "required": ["env", "commit", "probes", "smoke", "confirmed", "created", "action"],
+      "additionalProperties": true,
+      "properties": {
+        "env": { "type": "string" },
+        "commit": { "type": "string" },
+        "probes": { "type": "array", "items": { "$ref": "#/$defs/probe" } },
+        "smoke": { "type": "array", "items": { "$ref": "#/$defs/smoke" } },
+        "confirmed": { "type": "boolean", "description": "Every probe showed the commit and every smoke check passed. Never true without a probe." },
+        "created": { "type": "string" },
+        "action": { "type": "string", "description": "What 05 did about a deploy it could not confirm: none, reverted or rollback-command; a newer 05 may add values, which readers treat as unknown." }
+      }
+    }
+  }
+}

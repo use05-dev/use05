@@ -1,0 +1,44 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://use05.dev/receipts/bypass-v0.schema.json",
+  "title": "05 bypass receipt, https://use05.dev/bypass/v0",
+  "description": "An in-toto Statement v1 saying a person overrode a block for one exact tree, for a stated reason (break glass); or, with env, from and rule, one rule of promoting one exact commit into an environment, whose subject is then that commit. Fields are only ever added, as optional ones.",
+  "type": "object",
+  "required": ["_type", "subject", "predicateType", "predicate"],
+  "additionalProperties": true,
+  "properties": {
+    "_type": { "const": "https://in-toto.io/Statement/v1" },
+    "subject": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "required": ["name", "digest"],
+        "properties": { "name": { "type": "string" }, "digest": { "type": "object", "additionalProperties": { "type": "string" } } }
+      },
+      "contains": {
+        "anyOf": [
+          { "type": "object", "required": ["name"], "properties": { "name": { "const": "tree" }, "digest": { "type": "object", "required": ["gitTree", "sha256"] } } },
+          { "type": "object", "required": ["name"], "properties": { "name": { "const": "commit" }, "digest": { "type": "object", "required": ["gitCommit"] } } }
+        ]
+      }
+    },
+    "predicateType": { "const": "https://use05.dev/bypass/v0" },
+    "predicate": {
+      "type": "object",
+      "required": ["reason", "by", "findings", "created", "expires"],
+      "additionalProperties": true,
+      "properties": {
+        "reason": { "type": "string" },
+        "by": { "type": "string" },
+        "findings": { "type": "array", "items": { "type": "string" }, "description": "What was bypassed, in words, so the audit trail is readable." },
+        "created": { "type": "string" },
+        "expires": { "type": "string" },
+        "env": { "type": "string", "description": "For a promotion's bypass: the environment promoted into." },
+        "from": { "type": "string", "description": "For a promotion's bypass: the environment promoted from." },
+        "rule": { "type": "string", "description": "For a promotion's bypass: the promotion rule it clears (source_checks, source_confirmed, soak, migrations, untasked or sign_off)." },
+        "policy_sha256": { "type": "string", "description": "For a promotion's bypass: the policy it was given under; a policy change voids it." }
+      }
+    }
+  }
+}

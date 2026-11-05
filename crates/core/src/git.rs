@@ -399,6 +399,36 @@ pub fn blob_at(top: &Path, rev: &str, path: &str) -> Option<Vec<u8>> {
     run(top, &["cat-file", "blob", &format!("{rev}:{path}")]).ok()
 }
 
+/// How many files of `tree` are Git LFS pointers: files a `.gitattributes` in the tree sends
+/// through the LFS filter, committed as the small pointer text, not the file (D96). Nothing is
+/// fetched. Best effort: a tree that cannot be read has none.
+pub fn lfs_pointer_count(top: &Path, tree: &str) -> usize {
+    if check_rev(tree).is_err() {
+        return 0;
+    }
+    let Ok(raw) = run(top, &["ls-tree", "-r", "-l", "-z", "--full-tree", tree]) else { return 0 };
+    let (mut attributes, mut small) = (Vec::new(), Vec::new());
+    for record in raw.split(|b| *b == 0).filter(|r| !r.is_empty()) {
+        let Some(tab) = record.iter().position(|b| *b == b'\t') else { continue };
+        let meta = String::from_utf8_lossy(&record[..tab]);
+        let mut parts = meta.split_whitespace();
+        let (Some(mode), Some("blob"), Some(oid), Some(size)) = (parts.next(), parts.next(), parts.next(), parts.next()) else { continue };
+        if record[tab + 1..].rsplit(|b| *b == b'/').next() == Some(b".gitattributes") {
+            attributes.push(oid.to_string());
+        } else if matches!(mode, "100644" | "100755") && size.parse::<usize>().is_ok_and(|n| n <= use05_receipt::MAX_LFS_POINTER_BYTES) {
+            small.push(oid.to_string());
+        }
+    }
+    if small.is_empty() || attributes.is_empty() {
+        return 0;
+    }
+    let uses = blobs_with(top, &attributes, |b| use05_receipt::attributes_use_lfs(b)).unwrap_or_default();
+    if !uses.into_iter().flatten().any(|u| u) {
+        return 0;
+    }
+    blobs_with(top, &small, |b| use05_receipt::lfs_pointer("", b).is_some()).unwrap_or_default().into_iter().flatten().filter(|p| *p).count()
+}
+
 pub fn list_refs(top: &Path, patterns: &[&str]) -> Vec<String> {
     let mut args = vec!["for-each-ref", "--format=%(refname)"];
     args.extend_from_slice(patterns);

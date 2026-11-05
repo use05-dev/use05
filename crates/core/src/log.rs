@@ -67,6 +67,24 @@ pub fn edited(state_dir: &Path, task_id: &str) -> Vec<(u64, String)> {
     out
 }
 
+/// How long agents went quiet: the seconds between one edit of a task and the next, for every
+/// task on this machine, counting only edits at or after `since_secs`. Gaps across tasks do not
+/// count, and edits in the same second are one. Event times only: no paths, no contents.
+pub fn quiet_gaps(state_dir: &Path, since_secs: u64) -> Vec<u64> {
+    let Ok(entries) = fs::read_dir(state_dir.join("log")) else { return Vec::new() };
+    let mut gaps = Vec::new();
+    for entry in entries.flatten() {
+        let name = entry.file_name().to_string_lossy().to_string();
+        let Some(task) = name.strip_suffix(".jsonl") else { continue };
+        let mut times: Vec<u64> = edited(state_dir, task).into_iter().map(|(at, _)| at).filter(|at| *at >= since_secs).collect();
+        times.sort_unstable();
+        times.dedup();
+        gaps.extend(times.windows(2).map(|w| w[1] - w[0]));
+    }
+    gaps.sort_unstable();
+    gaps
+}
+
 fn append_line(state_dir: &Path, task_id: &str, event: Value, t: String) -> Result<()> {
     let path = path_for(state_dir, task_id);
     fs::create_dir_all(path.parent().expect("has parent")).map_err(|e| Error::io("creating the log directory", e))?;
@@ -165,6 +183,25 @@ mod tests {
             .collect();
         threads.into_iter().for_each(|t| t.join().unwrap());
         assert_eq!(verify(dir.path(), "t1"), Chain::Intact(160));
+    }
+
+    #[test]
+    fn quiet_gaps_are_the_time_between_edits_of_one_task() {
+        let dir = tempfile::tempdir().unwrap();
+        let edit = |task: &str, at: u64| append_at(dir.path(), task, json!({ "event": "tool_done", "tool": "Edit", "paths": ["a.rs", "b.rs"] }), at).unwrap();
+        for at in [1_000, 1_060, 1_660] {
+            edit("t1", at);
+        }
+        // Another task started right after the first ended: that is no gap of either.
+        edit("t2", 1_700);
+        edit("t2", 1_760);
+        // Reading and refused edits are not edits; edits before the window do not count.
+        append_at(dir.path(), "t1", json!({ "event": "tool", "tool": "Read", "paths": ["a.rs"], "decision": "deny" }), 5_000).unwrap();
+        edit("t3", 10);
+        edit("t3", 900);
+        assert_eq!(quiet_gaps(dir.path(), 1_000), vec![60, 60, 600]);
+        assert_eq!(quiet_gaps(dir.path(), 0), vec![60, 60, 600, 890]);
+        assert!(quiet_gaps(&dir.path().join("nowhere"), 0).is_empty());
     }
 
     #[test]

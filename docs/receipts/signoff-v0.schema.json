@@ -1,0 +1,44 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://use05.dev/receipts/signoff-v0.schema.json",
+  "title": "05 sign-off, https://use05.dev/signoff/v0",
+  "description": "An in-toto Statement v1 carrying a person's sign-off on promoting one exact commit into an environment, or their rejection of it: their own words, their answers to the policy's questions and the statements they confirm, bound to the environment, the source commit and the policy. Subject: the source commit (gitCommit). Signed by their approver key or passkey. Fields are only ever added, as optional ones.",
+  "type": "object",
+  "required": ["_type", "subject", "predicateType", "predicate"],
+  "additionalProperties": true,
+  "properties": {
+    "_type": { "const": "https://in-toto.io/Statement/v1" },
+    "subject": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "required": ["name", "digest"],
+        "properties": { "name": { "type": "string" }, "digest": { "type": "object", "additionalProperties": { "type": "string" } } }
+      },
+      "contains": {
+        "type": "object",
+        "properties": { "name": { "const": "commit" }, "digest": { "type": "object", "required": ["gitCommit"] } }
+      }
+    },
+    "predicateType": { "const": "https://use05.dev/signoff/v0" },
+    "predicate": {
+      "type": "object",
+      "required": ["env", "from", "source_commit", "decision", "signer_person", "text", "answers", "confirmations", "policy_sha256", "created", "expires"],
+      "additionalProperties": true,
+      "properties": {
+        "env": { "type": "string", "description": "The environment promoted into." },
+        "from": { "type": "string", "description": "The environment promoted from." },
+        "source_commit": { "type": "string" },
+        "decision": { "enum": ["approve", "reject"] },
+        "signer_person": { "type": "string", "description": "The person, as the policy names them on their key." },
+        "text": { "type": "string", "description": "What they say, in their words." },
+        "answers": { "type": "array", "items": { "type": "string" }, "description": "Their answers to the policy's questions, in order." },
+        "confirmations": { "type": "array", "items": { "type": "string" }, "description": "The policy's confirm statements they confirm, word for word." },
+        "policy_sha256": { "type": "string" },
+        "created": { "type": "string" },
+        "expires": { "type": "string" }
+      }
+    }
+  }
+}

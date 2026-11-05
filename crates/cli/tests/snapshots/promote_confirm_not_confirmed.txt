@@ -1,0 +1,11 @@
+✗ prod was not confirmed running <TREE12>
+  commit         <TREE12> (origin/prod)
+  deploy         not confirmed: prod did not show it runs <TREE12>
+  probe version  did not show <TREE12> (1 try)
+  record         on 05-receipts/<ID>
+  Nothing was rolled back: the policy says to report a deploy that is not confirmed (on_failure =
+  "report"). To roll it back: use05 promote prod --rollback
+  Here this is advisory: a deployment record this machine signs is its own word. With [evidence]
+  accept = ["runner"] only CI's count; CI can run use05 promote prod --confirm.
+
+Next: use05 promote prod --rollback

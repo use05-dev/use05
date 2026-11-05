@@ -1,0 +1,62 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://use05.dev/receipts/promotion-v0.schema.json",
+  "title": "05 promotion, https://use05.dev/promotion/v0",
+  "description": "An in-toto Statement v1 recording that one exact commit moved into an environment: from where, how, the rollback point, each promotion rule's result, and the bypasses and sign-offs it went with. Subject: the source commit (gitCommit). Signed by the CI runner key, or by the key of the machine that promoted. Fields are only ever added, as optional ones.",
+  "type": "object",
+  "required": ["_type", "subject", "predicateType", "predicate"],
+  "additionalProperties": true,
+  "$defs": {
+    "rule": {
+      "type": "object",
+      "required": ["rule", "severity", "outcome", "detail"],
+      "additionalProperties": true,
+      "properties": {
+        "rule": { "type": "string", "description": "source_checks, source_confirmed, soak, migrations, untasked or sign_off." },
+        "severity": { "type": "string", "description": "allow, warn, approval or deny; a newer 05 may add values, which readers treat as unknown." },
+        "outcome": { "type": "string", "description": "pass, fail, bypassed or skipped; a newer 05 may add values, which readers treat as unknown." },
+        "detail": { "type": "string" }
+      }
+    }
+  },
+  "properties": {
+    "_type": { "const": "https://in-toto.io/Statement/v1" },
+    "subject": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "required": ["name", "digest"],
+        "properties": { "name": { "type": "string" }, "digest": { "type": "object", "additionalProperties": { "type": "string" } } }
+      },
+      "contains": {
+        "type": "object",
+        "properties": { "name": { "const": "commit" }, "digest": { "type": "object", "required": ["gitCommit"] } }
+      }
+    },
+    "predicateType": { "const": "https://use05.dev/promotion/v0" },
+    "predicate": {
+      "type": "object",
+      "required": ["env", "from", "direction", "source_commit", "result_commit", "how", "rules", "bypasses", "signoffs", "policy_sha256", "created", "by"],
+      "additionalProperties": true,
+      "properties": {
+        "env": { "type": "string", "description": "The environment or destination promoted into." },
+        "from": { "type": "string", "description": "The environment promoted from. For a hotfix, the environment itself: the work started from its branch and landed back on it. For a destination, the environment its source branch is, else that branch." },
+        "direction": { "type": "string", "description": "up, back or hotfix; a newer 05 may add values, which readers treat as unknown." },
+        "source_commit": { "type": "string", "description": "The exact commit that was evaluated and moved." },
+        "target_before": { "type": ["string", "null"], "description": "The target branch's head before; absent when the promotion created the branch." },
+        "result_commit": { "type": "string", "description": "The target branch's head after." },
+        "how": { "type": "string", "description": "fast-forward, merge, or revert for a revert 05 made; push or export for a destination. For an export, result_commit is the commit made in the destination repository, and target_before its branch head there." },
+        "rollback_point": { "type": ["string", "null"], "description": "The commit to go back to if the deploy fails; absent when there was none." },
+        "rules": { "type": "array", "items": { "$ref": "#/$defs/rule" } },
+        "bypasses": { "type": "array", "items": { "type": "string" }, "description": "The receipts of the bypasses it went with, by path." },
+        "signoffs": { "type": "array", "items": { "type": "string" }, "description": "The receipts of the sign-offs it went with, by path." },
+        "policy_sha256": { "type": "string" },
+        "created": { "type": "string" },
+        "by": { "type": "string", "description": "Who promoted: a person, or the agent or CI that did." },
+        "reverts": { "type": "string", "description": "Only on a revert 05 made, because a deploy was not confirmed or a person ran use05 promote <env> --rollback: the commit it reverts, which was the branch's head. The revert commit is then source_commit and result_commit, and how is revert." },
+        "task": { "type": "string", "description": "Only on a hotfix (direction hotfix): the 05 task whose work landed straight on the environment's branch." }
+      }
+    }
+  }
+}

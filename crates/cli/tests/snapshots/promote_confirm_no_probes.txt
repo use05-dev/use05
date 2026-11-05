@@ -1,0 +1,10 @@
+! no probes: 05 cannot tell what uat runs, so <TREE12> is not confirmed
+  commit  <TREE12> (origin/uat)
+  deploy  no probes: 05 cannot tell what uat runs
+  record  on 05-receipts/<ID>
+  Not confirmed: give uat a probe ([[environment.probe]] in .05/policy.toml), a command that
+  prints the commit uat runs; then run use05 promote uat --confirm.
+  Here this is advisory: a deployment record this machine signs is its own word. With [evidence]
+  accept = ["runner"] only CI's count; CI can run use05 promote uat --confirm.
+
+Next: give uat a probe ([[environment.probe]] in .05/policy.toml)

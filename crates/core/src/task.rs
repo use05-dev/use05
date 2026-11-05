@@ -68,6 +68,10 @@ pub struct Task {
     /// How far behind origin the work started, when the policy asks (fresh base).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fresh: Option<crate::fresh::Fresh>,
+    /// A hotfix (D93): the environment whose branch the work started from and lands on, instead
+    /// of where work usually lands. Its outcome always needs a person's approval.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hotfix: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
@@ -168,6 +172,7 @@ impl Store {
             owner: None,
             sandbox: None,
             fresh: None,
+            hotfix: None,
         };
         self.save(&task)?;
         self.set_current(&task.id)?;
@@ -203,6 +208,7 @@ impl Store {
             owner: None,
             sandbox: None,
             fresh: None,
+            hotfix: None,
         }
     }
 

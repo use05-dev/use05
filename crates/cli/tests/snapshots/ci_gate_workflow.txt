@@ -1,0 +1,76 @@
+name: 05 gate
+
+# GitHub runs this from the default branch's copy of this file when the 05 workflow finishes,
+# so a branch cannot change what runs here. It alone gets the runner key, from the `use05`
+# environment, which only the default branch may use. It checks out the exact commit the 05
+# workflow ran for, runs the change's checks as another user that cannot read the key, and
+# posts the verdict as the commit status `05` on that commit. Require `05` in branch protection.
+on:
+  workflow_run:
+    workflows: ["05"]
+    types: [completed]
+
+# contents: the runner pushes its own receipts branch (05-receipts/<runner key>), so what it
+# sealed outlives the job; nothing else is pushed. statuses: the `05` verdict.
+permissions:
+  contents: write
+  statuses: write
+
+jobs:
+  gate:
+    runs-on: ubuntu-latest
+    environment: use05
+    # Everything up to the checkout runs as the key holder, with sudo, before anything of the
+    # change is on disk. Keep it that way: nothing of the change may run before the gate.
+    steps:
+      # The change's checks run as this user: it cannot read the runner key or 05's process,
+      # and it may not leave a job behind for later.
+      - name: Make the check user
+        run: |
+          sudo useradd --create-home --shell /bin/bash use05-check
+          echo use05-check | sudo tee -a /etc/cron.deny /etc/at.deny >/dev/null
+
+      # PLACEHOLDER: install the toolchains your checks need here, system-wide, with versions
+      # pinned in this file, never read from the change's files. They run as use05-check,
+      # which cannot read this runner's home (~/.cargo, for one); the setup-* actions install
+      # under /opt/hostedtoolcache, which it can. The change's own dependencies (npm ci, pip
+      # install -r ...) belong inside the check command, which runs as use05-check.
+      - name: Install the toolchains (system-wide, pinned here)
+        run: echo "Nothing to install yet; see the comment above this step in 05-gate.yml."
+
+      # Installs a checksum-verified release. It fails loudly if no release can be fetched,
+      # instead of passing without checking anything.
+      - name: Install use05
+        run: |
+          curl -fsSL https://use05.dev/install.sh | sh
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+      # The exact commit. The token is not left in .git/config, where the code under test
+      # could read it.
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.workflow_run.head_sha }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      # Recommended: post the `05` status as your own GitHub App, so no branch can forge it
+      # (any workflow's own token can post a status). Set the repository variable
+      # USE05_APP_CLIENT_ID and, in the use05 environment, the secret USE05_APP_PRIVATE_KEY.
+      - name: Status token from your 05 app
+        id: app
+        if: vars.USE05_APP_CLIENT_ID != ''
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
+        with:
+          client-id: ${{ vars.USE05_APP_CLIENT_ID }}
+          private-key: ${{ secrets.USE05_APP_PRIVATE_KEY }}
+          permission-statuses: write
+
+      # Proves the policy's required checks with the runner key, gates the change and posts
+      # the `05` status.
+      - name: Prove and gate
+        env:
+          USE05_RUNNER_KEY: ${{ secrets.USE05_RUNNER_KEY }}
+          USE05_PUSH_TOKEN: ${{ github.token }}
+          USE05_STATUS_TOKEN: ${{ steps.app.outputs.token }}
+          USE05_CHECK_USER: use05-check
+        run: use05 gate --ci --push

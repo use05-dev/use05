@@ -1,0 +1,45 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://use05.dev/receipts/approval-v0.schema.json",
+  "title": "05 approval receipt, https://use05.dev/approval/v0",
+  "description": "An in-toto Statement v1 saying a person approved or rejected an intent (subject: the intent card digest) or an outcome (subject: the exact tree). Fields are only ever added, as optional ones.",
+  "type": "object",
+  "required": ["_type", "subject", "predicateType", "predicate"],
+  "additionalProperties": true,
+  "properties": {
+    "_type": { "const": "https://in-toto.io/Statement/v1" },
+    "subject": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "required": ["name", "digest"],
+        "properties": { "name": { "type": "string" }, "digest": { "type": "object", "additionalProperties": { "type": "string" } } }
+      },
+      "contains": {
+        "anyOf": [
+          { "type": "object", "properties": { "name": { "const": "tree" }, "digest": { "type": "object", "required": ["gitTree", "sha256"] } } },
+          { "type": "object", "properties": { "name": { "const": "intent" }, "digest": { "type": "object", "required": ["sha256"] } } }
+        ]
+      }
+    },
+    "predicateType": { "const": "https://use05.dev/approval/v0" },
+    "predicate": {
+      "type": "object",
+      "required": ["decision", "scope", "task", "policy_sha256", "rationale", "approver", "created", "expires"],
+      "additionalProperties": true,
+      "properties": {
+        "decision": { "enum": ["approve", "reject"] },
+        "scope": { "enum": ["intent", "outcome"], "description": "An intent approval is bound to the intent card; an outcome approval to the exact tree." },
+        "task": { "type": "string" },
+        "intent_sha256": { "type": "string", "description": "Digest of the intent card the decision was made against (always present for intent approvals)." },
+        "hotfix": { "type": "string", "description": "Only on an approval of a hotfix's outcome: the environment it lands on. Only such an approval, for that environment and task, counts for landing the hotfix." },
+        "policy_sha256": { "type": "string", "description": "Digest of the effective policy at the time. A policy change makes the approval stale." },
+        "rationale": { "type": "string" },
+        "approver": { "type": "string" },
+        "created": { "type": "string" },
+        "expires": { "type": "string" }
+      }
+    }
+  }
+}

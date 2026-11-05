@@ -109,12 +109,12 @@ pub fn run(args: Args) -> Report {
     }
 
     // The signature is good, but 05 counts a passkey's signature on approvals only.
-    if by_passkey && !matches!(verified.statement, AnyStatement::Approval(_)) {
+    if by_passkey && !matches!(verified.statement, AnyStatement::Approval(_) | AnyStatement::SignOff(_)) {
         let mut report = Report::error(
             "verify",
             "PASSKEY_APPROVALS_ONLY",
-            "Signed by a passkey, which 05 counts for approvals only: this record does not count".to_string(),
-            Some("do not rely on this receipt; only a person's approval may be signed with a passkey".to_string()),
+            "Signed by a passkey, which 05 counts only for a person's approval or sign-off: this record does not count".to_string(),
+            Some("do not rely on this receipt; only a person's approval or a promotion's sign-off may be signed with a passkey".to_string()),
             2,
         );
         report.outcome = "invalid";
@@ -176,17 +176,22 @@ pub fn run(args: Args) -> Report {
         }
         AnyStatement::Bypass(s) => {
             let p = &s.predicate;
+            let mut rows = vec![("signed".into(), signer), ("by".into(), p.by.clone()), ("reason".into(), p.reason.clone()), ("expires".into(), p.expires.clone())];
+            // A promotion's bypass: which rule of promoting what into where.
+            if let (Some(env), Some(from), Some(rule)) = (&p.env, &p.from, &p.rule) {
+                rows.push(("clears".into(), format!("{rule}, promoting {} from {from} into {env}", s.commit_subject().map_or("?", |c| &c[..12.min(c.len())]))));
+            }
             return Report {
                 command: "verify",
                 outcome: "valid",
                 code: "VALID",
                 tone: Tone::Warn,
                 headline: "Valid: a break-glass bypass".to_string(),
-                rows: vec![("signed".into(), signer), ("by".into(), p.by.clone()), ("reason".into(), p.reason.clone()), ("expires".into(), p.expires.clone())],
+                rows,
                 notes,
                 next: None,
                 excerpt: vec![],
-                details: json!({ "kind": "bypass", "by": p.by, "reason": p.reason, "expires": p.expires }),
+                details: json!({ "kind": "bypass", "by": p.by, "reason": p.reason, "expires": p.expires, "env": p.env, "from": p.from, "rule": p.rule }),
                 exit: 0,
             };
         }
@@ -236,6 +241,56 @@ pub fn run(args: Args) -> Report {
                 next: None,
                 excerpt: vec![],
                 details: json!({ "kind": "outcome", "task": p.task, "outcome": p.outcome, "finished": p.finished }),
+                exit: 0,
+            };
+        }
+        AnyStatement::Promotion(s) => {
+            let p = &s.predicate;
+            let short = |c: &str| c.chars().take(12).collect::<String>();
+            return Report {
+                command: "verify",
+                outcome: "valid",
+                code: "VALID",
+                tone: Tone::Good,
+                headline: format!("Valid: a promotion of {} from {} to {}", short(&p.source_commit), p.from, p.env),
+                rows: vec![("signed".into(), signer), ("moved".into(), format!("{} ({}), now {}", short(&p.source_commit), p.how, short(&p.result_commit))), ("by".into(), p.by.clone()), ("created".into(), p.created.clone())],
+                notes,
+                next: None,
+                excerpt: vec![],
+                details: json!({ "kind": "promotion", "env": p.env, "from": p.from, "direction": p.direction, "source_commit": p.source_commit, "result_commit": p.result_commit, "how": p.how, "rollback_point": p.rollback_point, "rules": p.rules, "by": p.by, "created": p.created }),
+                exit: 0,
+            };
+        }
+        AnyStatement::Deployment(s) => {
+            let p = &s.predicate;
+            return Report {
+                command: "verify",
+                outcome: "valid",
+                code: "VALID",
+                tone: if p.confirmed { Tone::Good } else { Tone::Warn },
+                headline: format!("Valid: {} was {} running {}", p.env, if p.confirmed { "confirmed" } else { "not confirmed" }, p.commit.chars().take(12).collect::<String>()),
+                rows: vec![("signed".into(), signer), ("probes".into(), format!("{} of {} showed the commit", p.probes.iter().filter(|r| r.matched).count(), p.probes.len())), ("created".into(), p.created.clone())],
+                notes,
+                next: None,
+                excerpt: vec![],
+                details: json!({ "kind": "deployment", "env": p.env, "commit": p.commit, "confirmed": p.confirmed, "probes": p.probes, "smoke": p.smoke, "action": p.action, "created": p.created }),
+                exit: 0,
+            };
+        }
+        AnyStatement::SignOff(s) => {
+            let p = &s.predicate;
+            let what = if p.decision == use05_receipt::Decision::Approve { "signed off" } else { "rejected" };
+            return Report {
+                command: "verify",
+                outcome: "valid",
+                code: "VALID",
+                tone: Tone::Good,
+                headline: format!("Valid: {} {what} promoting {} from {} to {}", p.signer_person, p.source_commit.chars().take(12).collect::<String>(), p.from, p.env),
+                rows: vec![("signed".into(), signer), ("said".into(), p.text.clone()), ("expires".into(), p.expires.clone())],
+                notes,
+                next: None,
+                excerpt: vec![],
+                details: json!({ "kind": "signoff", "env": p.env, "from": p.from, "source_commit": p.source_commit, "decision": p.decision, "signer_person": p.signer_person, "text": p.text, "confirmations": p.confirmations, "expires": p.expires }),
                 exit: 0,
             };
         }

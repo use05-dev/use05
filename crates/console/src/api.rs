@@ -109,9 +109,10 @@ async fn records(State(app): State<Shared>, _m: Member, Query(q): Query<RecordsQ
 /// Newest first, after `since`; a `since` that is not a time gives everything, never nothing.
 const RECORDS_SINCE: &str = "select kind, repo_ref as repo, ref_key as ref, machine_id as machine, at, sealed, sig from records where (?1 is null or at > coalesce(strftime('%Y-%m-%dT%H:%M:%fZ', ?1), '')) order by at desc limit 5000";
 
-async fn repo(State(app): State<Shared>, _m: Member, Path(id): Path<String>) -> Res {
+async fn repo(State(app): State<Shared>, me: Member, Path(id): Path<String>) -> Res {
     let edits: Value = sqlx::query("select id, status, reason, machine_id, prepared, created_at, updated_at from policy_edits where repo_id = ?1 order by created_at desc limit 10").bind(&id).fetch_all(&app.db).await.map(|r| crate::db::rows_json(&r))?;
-    let machines: Value = sqlx::query(&format!("select m.id, m.name, m.last_seen, {ONLINE} as online from repo_machines rm join machines m on m.id = rm.machine_id where rm.repo_id = ?1 and not m.revoked order by m.last_seen desc")).bind(&id).fetch_all(&app.db).await.map(|r| crate::db::rows_json(&r))?;
+    // `mine`: one of the viewer's own machines, which can prepare a sign-off for them (D93).
+    let machines: Value = sqlx::query(&format!("select m.id, m.name, m.last_seen, {ONLINE} as online, (m.member_id = ?2 and m.kind = 'machine' and rm.allowed) as mine from repo_machines rm join machines m on m.id = rm.machine_id where rm.repo_id = ?1 and not m.revoked order by m.last_seen desc")).bind(&id).bind(me.id).fetch_all(&app.db).await.map(|r| crate::db::rows_json(&r))?;
     Ok(Json(json!({ "edits": edits, "machines": machines, "editable": cloud::guard::EDITABLE })))
 }
 

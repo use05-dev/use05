@@ -1,6 +1,6 @@
 import { openResult, sealTo, useView, view } from "../records";
 import { Fragment, useEffect, useState } from "react";
-import { get, post } from "../api";
+import { checksLine, get, post, storyRows } from "../api";
 import { friendly, signStatement } from "../passkey";
 import { Crumbs, Link, Loading, Paths, Seal, Verdict, When, go } from "../ui";
 
@@ -20,6 +20,8 @@ export function Task({ repo, id }: { repo: string; id: string }) {
   const gate = d.gate ?? {};
   const findings: any[] = gate.findings ?? [];
   const request = data.approvals.find((a: any) => a.status !== "dismissed");
+  const checks = checksLine(d);
+  const story = storyRows(d);
 
   return (
     <div className="stack-lg">
@@ -33,6 +35,22 @@ export function Task({ repo, id }: { repo: string; id: string }) {
         </div>
         <Verdict decision={t.decision} />
       </div>
+
+      {checks && <p className="small muted">{checks}</p>}
+
+      {story.length > 0 && (
+        <section className="panel stack">
+          <h2>What we know</h2>
+          <dl className="story">
+            {story.map((r, i) => (
+              <Fragment key={i}>
+                <dt className="small">{r.label}</dt>
+                <dd className={r.attention ? "attention-text" : ""}>{r.text}</dd>
+              </Fragment>
+            ))}
+          </dl>
+        </section>
+      )}
 
       {t.abandoned && <p className="small muted">Looks abandoned: nothing has happened here for over a week.</p>}
 

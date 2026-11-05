@@ -223,6 +223,7 @@ mod tests {
                 approver: "owner".into(),
                 created: "2026-11-01T10:00:00Z".into(),
                 expires: "2026-11-08T10:00:00Z".into(),
+                hotfix: None,
             },
         );
         serde_json::to_vec(&statement).unwrap()

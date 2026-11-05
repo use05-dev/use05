@@ -3,6 +3,7 @@ import { ago } from "../api";
 import { Crumbs, Link, Loading, Online, Verdict, When } from "../ui";
 import { EDIT_WORDS } from "./Home";
 import { settingName } from "./Edit";
+import { Environments } from "./Environments";
 
 export function Repos() {
   const { data, error } = useView<any>("/overview", 15000);
@@ -55,6 +56,8 @@ export function Repo({ id }: { id: string }) {
       <div className="row">
         {data.machines.map((m: any) => <span key={m.id} className="row small"><Online on={m.online} /> {m.name}</span>)}
       </div>
+
+      <Environments repo={id} envs={r.environments ?? []} machines={data.machines} />
 
       {data.edits.length > 0 && (
         <div>

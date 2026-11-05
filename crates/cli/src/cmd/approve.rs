@@ -33,9 +33,25 @@ pub struct ApproveArgs {
     pub reason: Option<String>,
     pub task: Option<String>,
     pub tree: Option<String>,
+    /// With `tree`: the commit the change is measured from. A push approved at its own prompt
+    /// passes what the remote already has, so the person sees what the push holds, as the gate does.
+    pub base: Option<String>,
+    /// The outcome of an exact revision that is not a task here, such as someone else's branch
+    /// fetched from origin (D92): measured and judged as a push of it would be.
+    pub rev: Option<String>,
     pub passphrase_stdin: bool,
     /// A person at a terminal, who may be asked which task: never under an agent, CI or a pipe.
     pub interactive: bool,
+    /// A sign-off on promoting into this environment (D93), with `note`, `answers`, `confirms`.
+    pub promote: Option<String>,
+    /// Answers to the environment's sign-off questions, in order.
+    pub answers: Vec<String>,
+    /// The environment's `confirm` statements the person confirms, word for word.
+    pub confirms: Vec<String>,
+    /// With `promote`: a sign-off on merging the environment above back down into it.
+    pub back: bool,
+    /// With `promote`: a sign-off on landing the current hotfix task on it.
+    pub hotfix: bool,
     pub repo: PathBuf,
 }
 
@@ -45,7 +61,27 @@ pub struct BypassArgs {
     pub hours: u32,
     pub tree: Option<String>,
     pub passphrase_stdin: bool,
+    /// One rule of promoting into this environment (D93), with `rule`.
+    pub promote: Option<String>,
+    pub rule: Option<String>,
+    /// With `promote`: a rule of merging the environment above back down into it.
+    pub back: bool,
+    /// A person at a terminal: never under an agent, CI, a pipe or `--json`.
+    pub interactive: bool,
     pub repo: PathBuf,
+}
+
+/// Positive proof that a person is here, for what only a person may do (D93): a terminal (stdin,
+/// stderr and the controlling terminal) and no agent session. Without a terminal (CI, a pipe,
+/// `--json`) it fails closed: an agent's session variable being absent proves nothing by itself.
+pub(crate) fn person_here(command: &'static str, interactive: bool, what: &str) -> Result<(), Report> {
+    if let Some((kind, _)) = use05_core::inbox::agent_session() {
+        return Err(Report::error(command, "NEEDS_A_PERSON", format!("{what} is for a person, and this runs under an agent ({kind})"), Some("ask the person to run it in their own terminal".into()), 3));
+    }
+    if !interactive || !tty::has_tty() {
+        return Err(Report::error(command, "NEEDS_A_PERSON", format!("{what} needs a person at a terminal, and there is none here (CI, a pipe, or --json)"), Some("run it yourself in a terminal".into()), 3));
+    }
+    Ok(())
 }
 
 /// The passphrase must come from a person: the terminal, or (for scripts that already know it)
@@ -67,12 +103,12 @@ fn passphrase(prompt: &str, from_stdin: bool, command: &'static str) -> Result<S
     })
 }
 
-fn approver_name(top: &std::path::Path) -> String {
+pub(crate) fn approver_name(top: &std::path::Path) -> String {
     git::text(top, &["config", "user.name"]).ok().filter(|n| !n.is_empty()).unwrap_or_else(|| "approver".to_string())
 }
 
 /// Open the approver key, asking for the passphrase only if the key has one.
-fn open_approver(from_stdin: bool, command: &'static str) -> Result<use05_receipt::SigningKey, Report> {
+pub(crate) fn open_approver(from_stdin: bool, command: &'static str) -> Result<use05_receipt::SigningKey, Report> {
     if !keys::passphrase_approver_exists() {
         if keys::touch_id_public().is_some() {
             return Err(Report::error(command, "NEEDS_PASSPHRASE_KEY", "this needs the passphrase approver key; your Touch ID key cannot sign it".into(), Some("make one as well: use05 key new --approver --passphrase".into()), 6));
@@ -107,7 +143,18 @@ pub(crate) fn sign_as_person<P: use05_receipt::Predicate>(statement: &Statement<
     Ok((seal(statement, &key), key_id(&key.verifying_key())))
 }
 
-fn expiry(days: u32, hours: u32) -> String {
+/// The id of the key [`sign_as_person`] will sign with: the Touch ID key where this Mac has one,
+/// else the passphrase key. `None` when there is neither.
+pub(crate) fn person_key_id() -> Option<String> {
+    if crate::touchid::supported() {
+        if let Some(key) = keys::touch_id_public() {
+            return Some(use05_receipt::PublicKey::Passkey(key).id());
+        }
+    }
+    keys::approver_public().filter(|_| keys::passphrase_approver_exists()).map(|k| key_id(&k))
+}
+
+pub(crate) fn expiry(days: u32, hours: u32) -> String {
     rfc3339(now_secs() + days as u64 * 86_400 + hours as u64 * 3_600)
 }
 
@@ -194,16 +241,30 @@ pub fn run_approve(mut args: ApproveArgs) -> Report {
         }
         return report;
     }
-    if args.task.is_none() && args.tree.is_none() && !args.tested && !args.skip_testing {
-        if let Err(r) = choose_task(&mut args) {
-            return r;
-        }
-    } else if args.tree.is_none() {
-        locate_task(&mut args);
+    // A sign-off on a promotion (D93): a statement of its own, bound to the environment, the
+    // source commit and the policy.
+    if let Some(env) = args.promote.clone() {
+        return crate::cmd::signoff::run(args, &env);
     }
-    let ctx = match Ctx::open_judging(&args.repo, args.task.as_deref()) {
-        Ok(c) => c,
-        Err(e) => return Report::from_core("approve", e),
+    // Someone else's work, named by its revision: no task here is chosen or touched.
+    let (ctx, of_rev) = match &args.rev {
+        Some(rev) => match Ctx::open_rev(&args.repo, rev) {
+            Ok((ctx, target)) => (ctx, Some(target)),
+            Err(e) => return Report::from_core("approve", e),
+        },
+        None => {
+            if args.task.is_none() && args.tree.is_none() && !args.tested && !args.skip_testing {
+                if let Err(r) = choose_task(&mut args) {
+                    return r;
+                }
+            } else if args.tree.is_none() {
+                locate_task(&mut args);
+            }
+            match Ctx::open_judging(&args.repo, args.task.as_deref()) {
+                Ok(c) => (c, None),
+                Err(e) => return Report::from_core("approve", e),
+            }
+        }
     };
     if args.tested || args.skip_testing {
         return run_testing(&ctx, args);
@@ -217,7 +278,12 @@ pub fn run_approve(mut args: ApproveArgs) -> Report {
         return Report::error("approve", "NOT_SUPPORTED", "an intent is approved or left unapproved; reject the outcome instead".into(), None, 6);
     }
 
-    let target = match ctx.target(args.tree.as_deref()) {
+    let target = match (of_rev, &args.tree, &args.base) {
+        (Some(t), _, _) => Ok(t),
+        (None, Some(tree), Some(base)) => ctx.target_from(tree, Some(base)),
+        _ => ctx.target(args.tree.as_deref()),
+    };
+    let target = match target {
         Ok(t) => t,
         Err(e) => return Report::from_core("approve", e),
     };
@@ -233,12 +299,39 @@ pub fn run_approve(mut args: ApproveArgs) -> Report {
         }
         ApprovalScope::Outcome => (tree_subject(&target.oid, &target.digest), target.oid.clone(), format!("the outcome on {} ({})", &target.oid[..12], target.label)),
     };
+    // A hotfix's outcome is approved for landing on its environment, and for nothing else; the
+    // approval is what lands it there, past every rung below (D93).
+    let hotfix = ctx.task.as_ref().and_then(|t| t.hotfix.clone()).filter(|_| scope == ApprovalScope::Outcome && args.rev.is_none());
+    let what = match (&hotfix, vote) {
+        (Some(env), Decision::Approve) => format!("{what}, a hotfix this approval lands straight on {env}"),
+        _ => what,
+    };
 
     // Show exactly what is being signed before asking for the secret.
     let gate = ctx.gate(&target).ok();
     eprintln!("You are about to {} {what}.", if vote == Decision::Approve { "approve" } else { "reject" });
+    if let Some(env) = hotfix.as_deref().filter(|_| vote == Decision::Approve) {
+        let branch = ctx.policy.environment_named(env).map_or(env, |e| e.branch.as_str());
+        // The environment's sign-off asks for words of a person's own: said before anything is
+        // signed, never as an approval that silently does not count.
+        if let Some(e) = ctx.policy.environment_named(env) {
+            let words = args.reason.as_deref().unwrap_or_default();
+            if let Some(why) = use05_core::promote::words_void(words, e) {
+                let min = e.sign_off.as_ref().map_or(0, |s| s.min_length);
+                return Report::error("approve", "HOTFIX_WORDS_TOO_SHORT", format!("this approval lands a hotfix straight on {env}, whose sign-off asks for at least {min} characters of your own words of what you checked: {why}; nothing was signed"), Some(format!("use05 approve --outcome --reason \"<what you checked, at least {min} characters>\"")), 6);
+            }
+        }
+        eprintln!("  This approval lands the hotfix straight on {env} (the {branch} branch), past the environments below it.");
+    }
+    // Someone else's work: the exact commit this binds, so it is the one the brief showed.
+    if let Some(commit) = target.head_commit.as_deref().filter(|_| args.rev.is_some()) {
+        eprintln!("  Commit {commit}.");
+    }
     if let Some(g) = &gate {
         eprintln!("  {} file(s) changed, risk {}.", g.changed.len(), g.risk.word());
+        for o in &g.owners {
+            eprintln!("  Owned by {} ({}): {}.", o.named(), o.paths.join(", "), o.changed.join(", "));
+        }
         for f in g.findings.iter().filter(|f| f.effect >= Effect::Warn).take(6) {
             eprintln!("  - {}: {}", f.code, f.message);
         }
@@ -258,6 +351,7 @@ pub fn run_approve(mut args: ApproveArgs) -> Report {
             approver: approver.clone(),
             created: now_rfc3339(),
             expires: expiry(ctx.policy.approvals.expire_days, 0),
+            hotfix: hotfix.clone(),
         },
     );
     if args.unsigned {
@@ -273,7 +367,8 @@ pub fn run_approve(mut args: ApproveArgs) -> Report {
         Ok(b) => b,
         Err(e) => return Report::from_core("approve", e),
     };
-    if let Some(task) = &ctx.task {
+    // Someone else's task is logged where it ran, not here.
+    if let Some(task) = ctx.task.as_ref().filter(|_| args.rev.is_none()) {
         let _ = use05_core::log::append(&ctx.store.state_dir(), &task.id, json!({ "event": "approval", "vote": vote, "scope": scope, "by": approver }));
     }
     // Which rules asked for this person, so a rule that is always approved can be pointed out (D91).
@@ -300,12 +395,35 @@ pub fn run_approve(mut args: ApproveArgs) -> Report {
         details: json!({ "scope": scope, "vote": vote, "key_id": signer_id, "branch": branch, "counts": counts }),
         exit: 0,
     };
-    if vote == Decision::Approve && scope == ApprovalScope::Outcome && counts {
+    if vote == Decision::Approve && scope == ApprovalScope::Outcome && counts && args.rev.is_none() {
         if let Some(task) = ctx.task.as_ref().map(|t| t.id.clone()) {
             land_after(&asked_from, &task, &mut report, args.land, args.interactive);
         }
     }
+    if args.rev.is_some() && vote == Decision::Approve {
+        owner_notes(&ctx, &target, &mut report);
+    }
     report
+}
+
+/// After an approval by revision: which owned paths it now counts for (D92), read back from the
+/// gate with the approval filed.
+fn owner_notes(ctx: &Ctx, target: &crate::ctx::Target, report: &mut Report) {
+    let Ok(gate) = ctx.gate(target) else { return };
+    if gate.owners.is_empty() {
+        return;
+    }
+    let key = report.details["key_id"].as_str().unwrap_or_default().to_string();
+    let me = ctx.trust.person_of(&key);
+    let mine: Vec<&use05_core::gate::OwnerStatus> = gate.owners.iter().filter(|o| me.as_deref().is_some_and(|m| o.approved_by.iter().any(|p| use05_core::policy::same_person(p, m)))).collect();
+    let owned: Vec<String> = mine.iter().map(|o| o.paths.join(", ")).collect();
+    if owned.is_empty() {
+        let commit = target.head_commit.as_deref().map_or(target.oid.as_str(), |c| &c[..12.min(c.len())]);
+        report.notes.push(format!("It does not count as an owner's approval for any path this change touches; use05 brief --rev {commit} says why."));
+    } else {
+        report.notes.push(format!("It counts as an owner's approval for {}.", owned.join("; ")));
+    }
+    report.details["owner_of"] = json!(owned);
 }
 
 /// Approving is the last thing a person does (D91): once the gate allows the task's work, it
@@ -317,7 +435,7 @@ fn land_after(repo: &std::path::Path, task: &str, report: &mut Report, flag: boo
     // Opened again, so the approval just filed is part of what the gate reads.
     let Ok(ctx) = Ctx::open_judging(repo, Some(task)) else { return };
     let Some(current) = ctx.task.clone().filter(|t| t.id == task) else { return };
-    let Some((_, target)) = land::ready(&ctx, &current) else { return };
+    let Some((_, target, _)) = land::ready(&ctx, &current) else { return };
     let then = Then::choose(ctx.policy.branches.land == LandMode::Auto, flag, interactive);
     if !then.settle(&format!("Land \"{}\" on {target} now?", current.title)) {
         report.next = Some(format!("use05 land --task {task}   it is allowed now"));
@@ -506,6 +624,11 @@ fn run_signed(file: &std::path::Path, push: bool, repo: &std::path::Path) -> Rep
             }
             return r;
         }
+        // A promotion's sign-off signed elsewhere (a passkey on the console): filed under its
+        // source commit (D93).
+        if let Some(s) = found.signoffs.pop() {
+            return crate::cmd::signoff::filed_signed(&ctx, s, &bytes, push);
+        }
     }
     let Some(signed) = found.approvals.into_iter().next() else {
         // Whoever signed it, a statement of another kind is not an approval; say that first.
@@ -566,10 +689,14 @@ fn run_signed(file: &std::path::Path, push: bool, repo: &std::path::Path) -> Rep
 }
 
 pub fn run_bypass(args: BypassArgs) -> Report {
+    // One rule of one promotion (D93).
+    if args.promote.is_some() {
+        return crate::cmd::signoff::run_bypass(args);
+    }
     if args.reason.trim().is_empty() {
         return Report::error("bypass", "REASON_REQUIRED", "say why you are overriding the block".into(), None, 6);
     }
-    if args.hours == 0 || args.hours > 72 {
+    if args.hours == 0 || args.hours > use05_core::promote::BYPASS_MAX_HOURS {
         return Report::error("bypass", "HOURS_INVALID", "a bypass lasts between 1 and 72 hours".into(), None, 6);
     }
     let ctx = match Ctx::open_judging(&args.repo, None) {
@@ -600,7 +727,7 @@ pub fn run_bypass(args: BypassArgs) -> Report {
     let by = approver_name(ctx.top());
     let statement = Statement::new(
         vec![tree_subject(&target.oid, &target.digest)],
-        Bypass { reason: args.reason.trim().to_string(), by: by.clone(), findings: blocking.clone(), created: now_rfc3339(), expires: expiry(0, args.hours) },
+        Bypass { env: None, from: None, rule: None, policy_sha256: None, reason: args.reason.trim().to_string(), by: by.clone(), findings: blocking.clone(), created: now_rfc3339(), expires: expiry(0, args.hours) },
     );
     let branch = match store::put(ctx.top(), &target.oid, &seal(&statement, &key).to_json_bytes(), &signer_id) {
         Ok(b) => b,

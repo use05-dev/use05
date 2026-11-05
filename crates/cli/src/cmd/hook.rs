@@ -10,7 +10,7 @@ use std::process::ExitCode;
 use serde_json::{Value, json};
 use use05_core::intent::is_protected;
 use use05_core::policy::{Middle, OnError, Severity};
-use use05_core::{log, task::Task};
+use use05_core::{git, log, task::Task};
 
 use crate::ctx::Ctx;
 
@@ -138,16 +138,141 @@ fn words(command: &str) -> Vec<Vec<String>> {
     commands
 }
 
+/// Every way a shell command runs `use05`, as the words after the program: `use05 …` by name or
+/// by a path ending in `/use05`, after variable assignments (`FOO=1 use05`), through `command`,
+/// `exec`, `env` or `npx`, and inside `sh -c '…'` or `bash -c "…"`. Word-based and conservative,
+/// like the rest of this file: the hook catches mistakes. The real backstop is `use05` itself,
+/// which refuses what only a person may do under an agent or without a terminal, and the
+/// person's key, which an agent does not have.
+fn use05_runs(command: &str) -> Vec<Vec<String>> {
+    runs_of(command, "use05")
+}
+
+/// Every way a shell command runs `program`, found as [`use05_runs`] finds `use05`.
+fn runs_of(command: &str, program_name: &str) -> Vec<Vec<String>> {
+    fn walk(command: &str, name: &str, depth: usize, out: &mut Vec<Vec<String>>) {
+        for w in words(command) {
+            let mut rest: &[String] = &w;
+            // After a wrapper, its own flags (`npx --yes`, `env -i`) come before the program.
+            let mut wrapped = false;
+            loop {
+                let Some(first) = rest.first().map(String::as_str) else { break };
+                let assignment = first.split_once('=').is_some_and(|(name, _)| !name.is_empty() && name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_'));
+                let wrapper = ["command", "exec", "env", "npx", "sudo"].contains(&first);
+                if assignment || wrapper || (wrapped && first.starts_with('-')) {
+                    wrapped |= wrapper;
+                    rest = &rest[1..];
+                } else {
+                    break;
+                }
+            }
+            let Some(program) = rest.first().map(String::as_str) else { continue };
+            let shell = ["sh", "bash", "zsh", "dash"].contains(&program.rsplit('/').next().unwrap_or(program));
+            if shell && depth < 3 {
+                if let Some(at) = rest.iter().position(|a| a == "-c" || (a.starts_with('-') && !a.starts_with("--") && a.contains('c'))) {
+                    if let Some(script) = rest.get(at + 1) {
+                        walk(script, name, depth + 1, out);
+                    }
+                }
+                continue;
+            }
+            if program == name || program.ends_with(&format!("/{name}")) {
+                out.push(rest[1..].to_vec());
+            }
+        }
+    }
+    let mut out = Vec::new();
+    walk(command, program_name, 0, &mut out);
+    out
+}
+
+/// Every `git push` a shell command runs, as the words after `push`. git's own options come before
+/// its subcommand: `git -C dir push`, `git -c k=v push`.
+fn git_pushes(command: &str) -> Vec<Vec<String>> {
+    let mut out = Vec::new();
+    for args in runs_of(command, "git") {
+        let mut i = 0;
+        while i < args.len() && args[i].starts_with('-') {
+            i += if ["-C", "-c"].contains(&args[i].as_str()) { 2 } else { 1 };
+        }
+        if args.get(i).map(String::as_str) == Some("push") {
+            out.push(args[i + 1..].to_vec());
+        }
+    }
+    out
+}
+
+/// The remote a `git push` names, from the words after `push`: its first word that is neither an
+/// option nor an option's value, or `--repo`. `None`: it names none, so git pushes to the
+/// branch's own remote.
+fn push_remote(rest: &[String]) -> Option<String> {
+    let mut skip = false;
+    for a in rest {
+        if std::mem::take(&mut skip) {
+            continue;
+        }
+        match a.as_str() {
+            "--repo" | "-o" | "--push-option" | "--receive-pack" | "--exec" => skip = true,
+            a if a.starts_with("--repo=") => return Some(a["--repo=".len()..].to_string()),
+            a if a.starts_with('-') => {}
+            a => return Some(a.to_string()),
+        }
+    }
+    None
+}
+
+/// The remote `git push` with none named goes to, as git chooses it: the branch's push remote,
+/// the repository's, the branch's own, else origin.
+fn default_push_remote(top: &Path) -> String {
+    let branch = git::current_branch(top);
+    let get = |key: String| git::text(top, &["config", &key]).ok().filter(|v| !v.is_empty());
+    branch.as_ref().and_then(|b| get(format!("branch.{b}.pushRemote"))).or_else(|| get("remote.pushDefault".into())).or_else(|| branch.as_ref().and_then(|b| get(format!("branch.{b}.remote")))).unwrap_or_else(|| "origin".to_string())
+}
+
+/// `git push` by an agent to a remote `[push] agent` leaves out (D93): for a person. A remote is
+/// matched by its name, or by its URL when the command gives one. `allowed` says whether an
+/// agent may push to a remote (by name and URL); its `Err` lists those it may.
+fn push_to_unlisted(command: &str, default: impl Fn() -> String, url_of: impl Fn(&str) -> String, allowed: impl Fn(&str, &str) -> Result<(), Vec<String>>) -> Option<String> {
+    for rest in git_pushes(command) {
+        let remote = push_remote(&rest).unwrap_or_else(&default);
+        if let Err(listed) = allowed(&remote, &url_of(&remote)) {
+            let f = crate::cmd::gate::remote_held(&remote, &listed);
+            return Some(format!("{} ({}): {}. Locally this is advisory: the pre-push hook holds it too, and `git push --no-verify` skips that.", f.message, f.code, f.next.unwrap_or_default()));
+        }
+    }
+    None
+}
+
+/// `git push` that deletes an environment's branch or one the policy keeps (`git push origin
+/// :prod`, `git push origin --delete prod`, `-d`): that is for a person. The pre-push hook holds
+/// it too, unless a person pushes at a terminal. `kept` says whether a branch is kept, by every
+/// policy that may name it (see `gate::kept_anywhere`).
+fn deletes_kept_branch(kept: impl Fn(&str) -> bool, command: &str) -> Option<String> {
+    for rest in git_pushes(command) {
+        let rest = &rest[..];
+        let deleting = rest.iter().any(|a| a == "--delete" || a == "-d");
+        let positional: Vec<&str> = rest.iter().map(String::as_str).filter(|a| !a.starts_with('-')).collect();
+        let named: Vec<&str> = positional.iter().skip(1).filter_map(|r| if deleting { Some(*r) } else { r.strip_prefix(':') }).collect();
+        if let Some(branch) = named.iter().map(|r| r.trim_start_matches("refs/heads/")).find(|b| kept(b)) {
+            return Some(format!("deleting {branch} is for a person: it is an environment's branch or one the policy keeps. Ask the user."));
+        }
+    }
+    None
+}
+
 /// Commands an agent should not run unobserved, with the reason and a safer alternative.
 fn risky(command: &str) -> Option<String> {
+    for args in use05_runs(command) {
+        let sub = args.first().map(String::as_str).unwrap_or("");
+        if ["approve", "bypass", "uninstall"].contains(&sub) || (sub == "key" && args.iter().any(|a| a == "--approver")) {
+            return Some(format!("`use05 {sub}` is for a person: it needs the approver passphrase. Ask the user to run it."));
+        }
+    }
     for words in words(command) {
         let w: Vec<&str> = words.iter().map(String::as_str).collect();
         let program = w.first().copied().unwrap_or("");
         let has = |s: &str| w.iter().any(|x| *x == s);
         let sub = w.get(1).copied().unwrap_or("");
-        if program == "use05" && ["approve", "bypass", "uninstall"].contains(&sub) || (program == "use05" && sub == "key" && has("--approver")) {
-            return Some(format!("`use05 {sub}` is for a person: it needs the approver passphrase. Ask the user to run it."));
-        }
         if program == "git" {
             let has_force = w.iter().any(|x| x.starts_with("--force") || *x == "-f" || x.starts_with('+'));
             if sub == "push" && has_force {
@@ -170,6 +295,55 @@ fn risky(command: &str) -> Option<String> {
         let writes = ["rm", "mv", "cp", "tee", "sed", "truncate", "chmod", "ln"].contains(&program) || command.contains('>');
         if writes && w.iter().any(|x| x.contains(".05/") || x.contains(".git/hooks") || x.contains("/.05")) {
             return Some("05's rules and git hooks are protected; changing them needs a person's approval".into());
+        }
+    }
+    None
+}
+
+/// `use05 promote <env>` that would move an environment the policy keeps for people
+/// (`agent = false`, by default the last rung). Checking it (`--check`) is anyone's.
+fn promote_for_people(policy: &use05_core::policy::Policy, command: &str) -> Option<String> {
+    for args in use05_runs(command) {
+        if args.first().map(String::as_str) != Some("promote") {
+            continue;
+        }
+        let rest = &args[1..];
+        // Checking and confirming move nothing a person keeps: anyone's. (Under an agent, a
+        // confirmation that fails reverts nothing where people promote.)
+        if rest.iter().any(|a| ["--check", "--confirm", "--help", "-h"].contains(&a.as_str())) {
+            continue;
+        }
+        let rolling_back = rest.iter().any(|a| a == "--rollback");
+        let back = rest.iter().any(|a| a == "--back");
+        // The environment: the first word that is neither a flag nor a flag's value.
+        let mut name = None;
+        let mut skip = false;
+        for a in rest {
+            if std::mem::take(&mut skip) {
+                continue;
+            }
+            match a.as_str() {
+                "--repo" => skip = true,
+                a if a.starts_with('-') => {}
+                a => {
+                    name = Some(a);
+                    break;
+                }
+            }
+        }
+        // A destination kept for people (`agent` unset or false): only a person promotes to it.
+        if let Some(d) = name.and_then(|n| policy.destination_named(n)).filter(|d| !policy.agent_may_promote(*d)) {
+            return Some(format!("promoting to the destination {} is for a person here (the policy keeps it for people). Check it with `use05 promote {} --check`, then ask the user to run `use05 promote {}`.", d.name, d.name, d.name));
+        }
+        let Some(env) = name.and_then(|n| policy.environment_named(n)) else { continue };
+        if !policy.agent_may_promote(env) && back {
+            return Some(format!("merging back into {} is for a person here (the policy keeps it for people). Check it with `use05 promote {} --back --check`, then ask the user to run `use05 promote {} --back`.", env.name, env.name, env.name));
+        }
+        if !policy.agent_may_promote(env) && rolling_back {
+            return Some(format!("rolling back {} is for a person here (the policy keeps it for people). Ask the user to run `use05 promote {} --rollback`.", env.name, env.name));
+        }
+        if !policy.agent_may_promote(env) {
+            return Some(format!("promoting into {} is for a person here (the policy keeps it for people). Check it with `use05 promote {} --check`, then ask the user to run `use05 promote {}`.", env.name, env.name, env.name));
         }
     }
     None
@@ -238,6 +412,23 @@ fn pre_tool_use(ctx: &Ctx, task: &Task, cwd: &Path, tool: &str, input: &Value) -
         if let Some(reason) = risky(command) {
             log["decision"] = json!("deny");
             log["why"] = json!("risky command");
+            return Decision { output: Some(deny(&format!("05: {reason}"))), log };
+        }
+        // Kept by this checkout's policy, the branch's own or origin's default branch's (read from
+        // git, no network); when none can be read, held.
+        let kept = |b: &str| crate::cmd::gate::kept_anywhere(ctx.top(), b, Some(&ctx.policy), None).unwrap_or(true);
+        if let Some(reason) = promote_for_people(&ctx.policy, command).or_else(|| deletes_kept_branch(kept, command)) {
+            log["decision"] = json!("deny");
+            log["why"] = json!("promotion for people");
+            return Decision { output: Some(deny(&format!("05: {reason}"))), log };
+        }
+        // Where an agent may push (`[push] agent`, D93): by this checkout's policy and origin's
+        // default branch's, read from git with no network.
+        let url_of = |r: &str| crate::cmd::destination::urls_of(top, r).into_iter().next().unwrap_or_else(|| r.to_string());
+        let allowed = |name: &str, url: &str| crate::cmd::gate::agent_may_push(top, Some(&ctx.policy), name, url);
+        if let Some(reason) = push_to_unlisted(command, || default_push_remote(top), url_of, allowed) {
+            log["decision"] = json!("deny");
+            log["why"] = json!("remote not allowed");
             return Decision { output: Some(deny(&format!("05: {reason}"))), log };
         }
         if let Some(reason) = path_rule_in_command(ctx, cwd, command) {
@@ -469,8 +660,12 @@ fn seal_pending(ctx: &Ctx, task: &mut Task, agent: &str, session: &str) -> Vec<S
     for (path, pending) in use05_core::inbox::for_session(ctx.top(), session) {
         let state = ctx.store.state_dir();
         match pending.entry {
-            use05_core::inbox::Entry::Start { title, card } => {
+            use05_core::inbox::Entry::Start { title, card, hotfix } => {
                 task.sandbox = pending.sandbox.clone();
+                // A hotfix starts from its environment's branch, which `start --hotfix` checked out.
+                if let Some(env) = hotfix.as_deref().and_then(|h| ctx.policy.environment_named(h)) {
+                    crate::cmd::hotfix::begin_here(ctx.top(), task, env);
+                }
                 if let Some(c) = card.as_ref().filter(|c| c.has_scope()) {
                     let res = use05_core::overlap::reservations(&ctx.store, &task.id, ctx.policy.drift.reservation_idle_hours as u64 * 3600, use05_core::time::now_secs());
                     if let Some((r, area)) = use05_core::overlap::conflicts(&res, &c.scope.include).first() {
@@ -529,7 +724,7 @@ fn prove_at_stop(ctx: &Ctx, task: &Task) -> Vec<String> {
     let found = use05_core::evidence::classify(&ctx.trust, &use05_core::store::find_all(ctx.top()));
     let (mut chosen, mut left, mut spent) = (Vec::new(), Vec::new(), 0u64);
     for c in wanted {
-        match use05_core::evidence::last_duration_ms(&found, &c.run) {
+        match use05_core::evidence::last_duration_ms(&found, &c.run, c.dir.as_deref()) {
             Some(ms) if spent + ms <= budget_ms => {
                 spent += ms;
                 chosen.push(c.name.clone());
@@ -575,15 +770,28 @@ fn tidy(ctx: &Ctx, including_here: bool) {
 
 /// The line a person reads when the agent stops (D91): what 05 decided about the work, and the
 /// one command to run, if any. Nothing when the agent changed nothing.
-fn verdict_line(ctx: &Ctx, task: &use05_core::task::Task, landed: Option<&crate::report::Report>) -> Option<String> {
+/// `landed` is the landing's report and what the gate found for the work it landed (D101).
+fn verdict_line(ctx: &Ctx, task: &use05_core::task::Task, landed: Option<(&crate::report::Report, &use05_core::gate::GateResult)>) -> Option<String> {
     use use05_core::gate::{CheckState, Decision, Effect};
     let plural = |n: usize, word: &str| format!("{n} {word}{}", if n == 1 { "" } else { "s" });
-    if let Some(r) = landed.filter(|r| r.code == "LANDED") {
+    if let Some((r, landed_gate)) = landed.filter(|(r, _)| r.code == "LANDED") {
         let target = r.details["target"].as_str().unwrap_or("its target");
-        return Some(if r.details["pushed"] == true {
-            format!("05: \"{}\" passed its checks, landed on {target} and was pushed. Nothing needs you.", task.title)
+        let title = &task.title;
+        let a = use05_core::brief::assurance(landed_gate, false);
+        // "Passed its checks" only when every required check passed: never for work that ran
+        // none, nor for work a bypass let through with a check failed or missing.
+        let why = if a.checks_required > 0 && a.passed == a.checks_required {
+            None
+        } else if landed_gate.bypass.is_some() {
+            Some("allowed by a bypass")
         } else {
-            format!("05: \"{}\" passed its checks and landed on {target}. Push when you are ready: git push origin {target}", task.title)
+            Some(a.qualifier().unwrap_or("not every check passed"))
+        };
+        return Some(match (r.details["pushed"] == true, why) {
+            (true, None) => format!("05: \"{title}\" passed its checks, landed on {target} and was pushed. Nothing needs you."),
+            (true, Some(why)) => format!("05: \"{title}\" landed on {target} and was pushed ({why}). Nothing needs you."),
+            (false, None) => format!("05: \"{title}\" passed its checks and landed on {target}. Push when you are ready: git push origin {target}"),
+            (false, Some(why)) => format!("05: \"{title}\" landed on {target} ({why}). Push when you are ready: git push origin {target}"),
         });
     }
     let target = ctx.target(None).ok()?;
@@ -592,8 +800,15 @@ fn verdict_line(ctx: &Ctx, task: &use05_core::task::Task, landed: Option<&crate:
         return None;
     }
     let files = plural(gate.changed.len(), "file");
-    let passed = !gate.checks.is_empty() && gate.checks.iter().filter(|c| c.required).all(|c| matches!(c.state, CheckState::Passed { .. }));
-    let checks = if passed { ", checks passed" } else { "" };
+    // Checks not required for this change (D97) are left out: they say nothing either way. When no
+    // check was required, that is said instead (D101).
+    let assurance = use05_core::brief::assurance(&gate, false);
+    let passed = assurance.checks_required > 0 && assurance.passed == assurance.checks_required;
+    let checks = match assurance.qualifier() {
+        Some(q) => format!("; {q}"),
+        None if passed => ", checks passed".to_string(),
+        None => String::new(),
+    };
     let first = gate.findings.iter().find(|f| f.effect >= Effect::Wait);
     let landing = task.branch.as_deref().is_some_and(|b| !use05_core::branches::is_kept(&ctx.policy, b));
     Some(match gate.decision {
@@ -794,12 +1009,13 @@ fn run_inner(agent: &str, event: &str) -> Result<Option<Value>, String> {
             let mut landed = None;
             if failed.is_empty() && missing.is_empty() && ctx.policy.branches.land == use05_core::policy::LandMode::Auto {
                 if let Ok(current) = ctx.store.load(&task.id) {
-                    if crate::cmd::land::ready(&ctx, &current).is_some() {
+                    if let Some((_, _, gate)) = crate::cmd::land::ready(&ctx, &current) {
                         let mut report = crate::cmd::land::land_task(&ctx, current);
                         let push = crate::cmd::land::Then::choose(ctx.policy.branches.push == use05_core::policy::LandMode::Auto, false, false);
                         crate::cmd::land::push_after(&ctx, &mut report, push, true);
                         note(json!({ "event": "auto_land", "code": report.code, "message": report.headline }));
-                        landed = Some(report);
+                        // What the landed work rested on, for the line the person reads (D101).
+                        landed = Some((report, gate));
                     }
                 }
             }
@@ -825,7 +1041,7 @@ fn run_inner(agent: &str, event: &str) -> Result<Option<Value>, String> {
                 // work stands and the one thing to do, if any (D91). Said again only when it changes.
                 // Codex is left out until its hooks show such a line.
                 _ if agent == "codex" => Ok(None),
-                _ => Ok(verdict_line(&ctx, &task, landed.as_ref()).filter(|line| said_new(&ctx, &task.id, line)).map(|line| json!({ "systemMessage": line }))),
+                _ => Ok(verdict_line(&ctx, &task, landed.as_ref().map(|(r, a)| (r, a))).filter(|line| said_new(&ctx, &task.id, line)).map(|line| json!({ "systemMessage": line }))),
             }
         }
         "SessionEnd" => {
@@ -917,6 +1133,8 @@ mod tests {
             "git push --force origin main", "git push origin +main", "git push -f", "git reset --hard HEAD~3", "git clean -fd", "git commit --no-verify -m x",
             "git config core.hooksPath /dev/null", "use05 approve --outcome", "use05 bypass --reason x", "echo hi && git push --force", "rm .05/policy.toml",
             "sed -i s/a/b/ .git/hooks/pre-push", "echo x > .05/policy.toml", "use05 key new --approver",
+            // However use05 is reached: a package runner, a variable, a wrapper, a path, a shell.
+            "npx use05 approve", "USE05_X=1 use05 bypass --reason x", "command use05 approve", "/opt/bin/use05 approve --promote prod", "sh -c 'use05 approve'", "bash -c \"use05 bypass --promote prod --rule soak --reason x\"",
         ] {
             assert!(risky(bad).is_some(), "should be caught: {bad}");
         }
@@ -925,6 +1143,43 @@ mod tests {
             "echo \"git push --force\"", "grep -r hooksPath docs",
         ] {
             assert!(risky(ok).is_none(), "should be allowed: {ok} -> {:?}", risky(ok));
+        }
+    }
+
+    #[test]
+    fn promoting_where_the_policy_keeps_it_for_people_is_held_and_checking_is_not() {
+        let ladder = "[[environment]]\nname = \"dev\"\nbranch = \"main\"\n\n[[environment]]\nname = \"uat\"\nbranch = \"uat\"\n\n[[environment]]\nname = \"prod\"\nbranch = \"prod\"\n";
+        let policy = use05_core::policy::Policy::parse(ladder).unwrap();
+        for held in [
+            "use05 promote prod", "use05 promote prod --json", "use05 promote --repo app prod", "cd app && use05 promote prod", "npx use05 promote prod", "npx --yes use05 promote prod",
+            "CI=1 use05 promote prod", "command use05 promote prod", "/usr/local/bin/use05 promote prod", "sh -c 'use05 promote prod'", "bash -c \"cd app && use05 promote prod\"", "env -i FOO=1 use05 promote prod",
+        ] {
+            assert!(promote_for_people(&policy, held).is_some_and(|r| r.contains("use05 promote prod --check")), "should be held: {held}");
+        }
+        for ok in ["use05 promote prod --check", "use05 promote prod --confirm", "use05 promote uat", "use05 promote uat --rollback", "use05 brief --promote prod", "use05 promote staging", "echo use05 promote prod"] {
+            assert!(promote_for_people(&policy, ok).is_none(), "should be allowed: {ok}");
+        }
+        for held in ["use05 promote prod --rollback", "use05 promote --rollback prod", "use05 promote prod --rollback --no-wait"] {
+            assert!(promote_for_people(&policy, held).is_some_and(|r| r.contains("rolling back prod is for a person")), "should be held: {held}");
+        }
+        // Merging back down follows the agent rule of the environment merged into.
+        let kept_uat = use05_core::policy::Policy::parse(&ladder.replace("name = \"uat\"\nbranch = \"uat\"\n", "name = \"uat\"\nbranch = \"uat\"\nagent = false\n")).unwrap();
+        for held in ["use05 promote uat --back", "use05 promote --back uat"] {
+            assert!(promote_for_people(&kept_uat, held).is_some_and(|r| r.contains("merging back into uat is for a person") && r.contains("use05 promote uat --back --check")), "should be held: {held}");
+        }
+        assert!(promote_for_people(&kept_uat, "use05 promote uat --back --check").is_none());
+        assert!(promote_for_people(&policy, "use05 promote uat --back").is_none(), "uat lets an agent by default");
+        assert!(promote_for_people(&policy, "use05 start --hotfix prod \"Fix it\"").is_none(), "an agent may start a hotfix");
+        let solo = use05_core::policy::Policy::parse(&format!("{ladder}agent = true\n")).unwrap();
+        assert!(promote_for_people(&solo, "use05 promote prod").is_none(), "agent = true lets an agent promote");
+        assert!(promote_for_people(&solo, "use05 promote prod --rollback").is_none(), "and roll back");
+
+        // Deleting an environment's branch, or one the policy keeps, is for a person.
+        for held in ["git push origin :prod", "git push origin --delete uat", "git push -d origin prod", "git push --delete origin refs/heads/prod", "git -C app push origin :main", "sh -c 'git push origin :release/1.2'"] {
+            assert!(deletes_kept_branch(|b| use05_core::branches::is_kept(&policy, b), held).is_some(), "should be held: {held}");
+        }
+        for ok in ["git push origin :agent/old-work", "git push origin --delete claude/x", "git push origin prod", "git push origin main:prod", "git status"] {
+            assert!(deletes_kept_branch(|b| use05_core::branches::is_kept(&policy, b), ok).is_none(), "should be allowed: {ok}");
         }
     }
 

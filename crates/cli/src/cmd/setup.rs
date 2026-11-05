@@ -40,10 +40,10 @@ impl Flags {
             Some(l) if Role::from_name(l).is_none() => Err(format!("{l:?} is not a level; use dev, uat, pre-prod or prod")),
             // A common name (staging, production) says its level, as 0.0.4 accepted.
             None if Role::from_name(name).is_none() => match suggest_role(name) {
-                Some(r) => Ok(Environment { name: name.to_string(), branch: branch.to_string(), level: Some(r.name().to_string()) }),
+                Some(r) => Ok(Environment::new(name, branch, Some(r.name()))),
                 None => Err(format!("{name:?} is not a level, so give one: --env {name}={branch}:dev (or uat, pre-prod, prod)")),
             },
-            _ => Ok(Environment { name: name.to_string(), branch: branch.to_string(), level: level.filter(|l| l != name) }),
+            _ => Ok(Environment::new(name, branch, level.filter(|l| l != name).as_deref())),
         }
     }
 }
@@ -59,6 +59,25 @@ fn apply_team(s: &mut Settings, team: Team) {
     s.land = p.land;
 }
 
+/// The team's start for promoting into the last rung (D93): just you, an agent may promote there
+/// too; a small team keeps it for people (the policy's default); a larger or regulated team also
+/// asks a person's sign-off there. Only for environments new to the policy: one it already has
+/// keeps its own settings.
+fn team_promotion(envs: &mut [Environment], current: &[Environment], team: Team) {
+    let rungs = use05_core::policy::ladder(envs);
+    if rungs.len() < 2 {
+        return;
+    }
+    let last: Vec<String> = rungs.last().map(|r| r.iter().map(|e| e.name.clone()).collect()).unwrap_or_default();
+    for e in envs.iter_mut().filter(|e| last.contains(&e.name) && !current.iter().any(|c| c.name == e.name)) {
+        match team {
+            Team::Solo => e.agent = Some(true),
+            Team::Small => {}
+            Team::Regulated => e.rules.sign_off = use05_core::policy::Severity::Approval,
+        }
+    }
+}
+
 /// The answers given as flags, with no questions.
 pub fn from_flags(current: &Policy, flags: &Flags) -> Settings {
     let mut s = Settings::from_policy(current);
@@ -70,6 +89,10 @@ pub fn from_flags(current: &Policy, flags: &Flags) -> Settings {
     }
     if !flags.envs.is_empty() {
         s.environments = flags.envs.clone();
+        keep_promotion(&mut s.environments, &current.environment);
+    }
+    if let Some(team) = flags.team {
+        team_promotion(&mut s.environments, &current.environment, team);
     }
     s
 }
@@ -127,6 +150,12 @@ fn parse_check(text: &str) -> Option<CheckDef> {
     Some(CheckDef { name: name.to_string(), run, ..CheckDef::default() })
 }
 
+/// A check in words: `name (command)`, and when it is required if that is not always.
+fn describe_check(c: &CheckDef) -> String {
+    let when = if c.paths.is_empty() { String::new() } else { format!(", when {} change", c.paths.join(" or ")) };
+    format!("{} ({}{when})", c.name, c.run.join(" "))
+}
+
 /// Folders in the repository that look like database migrations: a suggestion for append-only.
 fn migration_dirs(top: &Path) -> Vec<String> {
     let files = use05_core::git::text(top, &["ls-files"]).unwrap_or_default();
@@ -141,6 +170,16 @@ fn migration_dirs(top: &Path) -> Vec<String> {
     dirs.sort();
     dirs.dedup();
     dirs
+}
+
+/// An environment chosen again keeps the promotion settings it had (D93): setup asks only for its
+/// name, branch and level. It is found by name, else by branch.
+fn keep_promotion(chosen: &mut [Environment], current: &[Environment]) {
+    for e in chosen.iter_mut() {
+        if let Some(old) = current.iter().find(|o| o.name == e.name).or_else(|| current.iter().find(|o| o.branch == e.branch)) {
+            *e = Environment { name: e.name.clone(), branch: e.branch.clone(), level: e.level.clone(), ..old.clone() };
+        }
+    }
 }
 
 /// A name for a new environment that no chosen one has: `wanted`, or with `-2`, `-3` added.
@@ -158,11 +197,11 @@ fn unique_name(wanted: &str, chosen: &[Environment]) -> String {
 /// named by the person (a second dev environment, say).
 fn at_level<R: BufRead, W: Write>(a: &mut Asker<R, W>, chosen: &[Environment], branch: &str, level: &str) -> Option<Environment> {
     if !chosen.iter().any(|e| e.name == level) {
-        return Some(Environment { name: level.to_string(), branch: branch.to_string(), level: None });
+        return Some(Environment::new(level, branch, None));
     }
     let suggestion = unique_name(&format!("{level}-{}", branch.replace('/', "-")), chosen);
     let name = a.text(&format!("There is already a {level} environment. What should this one, on {branch}, be called?"), &suggestion)?;
-    Some(Environment { name: unique_name(&name, chosen), branch: branch.to_string(), level: Some(level.to_string()) })
+    Some(Environment::new(&unique_name(&name, chosen), branch, Some(level)))
 }
 
 /// An environment the person names, then places on a level.
@@ -172,7 +211,7 @@ fn named_env<R: BufRead, W: Write>(a: &mut Asker<R, W>, chosen: &[Environment], 
     let levels: Vec<&str> = Role::ALL.iter().map(|r| r.name()).collect();
     let default = Role::from_name(&name).or_else(|| suggest_role(branch)).map_or(0, |r| r as usize);
     let level = levels[a.choice(&format!("Which level is {name} on?"), &levels, default)?];
-    Some(Environment { level: (name != level).then(|| level.to_string()), name, branch: branch.to_string() })
+    Some(Environment::new(&name, branch, (name != level).then_some(level)))
 }
 
 /// The branch exists here or on `origin`.
@@ -234,7 +273,7 @@ fn summary(s: &Settings) -> Vec<(&'static str, String)> {
     vec![
         ("Changes land on", s.target.clone().unwrap_or_else(|| "the remote's default branch".into())),
         ("Environments", envs),
-        ("Checks", if s.checks.is_empty() { "none".into() } else { s.checks.iter().map(|c| format!("{} ({})", c.name, c.run.join(" "))).collect::<Vec<_>>().join(", ") }),
+        ("Checks", if s.checks.is_empty() { "none".into() } else { s.checks.iter().map(describe_check).collect::<Vec<_>>().join(", ") }),
         ("A plan is", plan.into()),
         ("Need approval", list(&s.protect_paths)),
         ("Locked", list(&s.locked)),
@@ -267,6 +306,7 @@ pub fn ask<R: BufRead, W: Write>(a: &mut Asker<R, W>, top: &Path, current: &Poli
 
     // 1. The team, and so how strict to start.
     a.step(1, STEPS, "Who works here");
+    let mut team_chosen = flags.team;
     match flags.team {
         Some(team) => apply_team(&mut s, team),
         None => {
@@ -280,6 +320,7 @@ pub fn ask<R: BufRead, W: Write>(a: &mut Asker<R, W>, top: &Path, current: &Poli
             if let Some(t) = chosen {
                 apply_team(&mut s, t);
             }
+            team_chosen = chosen;
         }
     }
 
@@ -302,6 +343,7 @@ pub fn ask<R: BufRead, W: Write>(a: &mut Asker<R, W>, top: &Path, current: &Poli
     a.step(3, STEPS, "Environments");
     if !flags.envs.is_empty() {
         s.environments = flags.envs.clone();
+        keep_promotion(&mut s.environments, &current.environment);
         a.say("Set with --env.");
     } else {
         // Ask about branches that look long-lived: a name that suggests a level, a branch the
@@ -316,7 +358,7 @@ pub fn ask<R: BufRead, W: Write>(a: &mut Asker<R, W>, top: &Path, current: &Poli
         // The environments already set come first, in the order the policy lists them.
         let mut branches: Vec<String> = current.environment.iter().map(|e| e.branch.clone()).collect();
         branches.extend(scanned.into_iter().filter(|b| !current.environment.iter().any(|e| &e.branch == b)));
-        a.say("Which branch is dev, uat, pre-prod and prod. A level can hold several environments, such as two dev environments on their own branches. 05 records them and shows them; rules for promoting between them come later.");
+        a.say("Which branch is dev, uat, pre-prod and prod. A level can hold several environments, such as two dev environments on their own branches. 05 shows them, and judges a promotion from one to the next under the rules in .05/policy.toml; an environment chosen again keeps its rules.");
         if !others.is_empty() {
             a.say(&match others.len() {
                 1 => "1 other branch is not asked about; you can add it at the end.".to_string(),
@@ -384,6 +426,7 @@ pub fn ask<R: BufRead, W: Write>(a: &mut Asker<R, W>, top: &Path, current: &Poli
             let env = named_env(a, &chosen, &b)?;
             chosen.push(env);
         }
+        keep_promotion(&mut chosen, &current.environment);
         // The same environments as before keep the policy's order; otherwise new ones take their
         // place on the ladder, after those already on their level.
         if chosen.len() == current.environment.len() && chosen.iter().all(|e| current.environment.contains(e)) {
@@ -395,12 +438,36 @@ pub fn ask<R: BufRead, W: Write>(a: &mut Asker<R, W>, top: &Path, current: &Poli
             s.environments = order.into_iter().map(|i| chosen[i].clone()).collect();
         }
     }
+    if let Some(team) = team_chosen {
+        team_promotion(&mut s.environments, &current.environment, team);
+    }
 
     // 4. Checks.
     a.step(4, STEPS, "Checks");
-    if !s.checks.is_empty() {
-        let names: Vec<String> = s.checks.iter().map(|c| format!("{} ({})", c.name, c.run.join(" "))).collect();
-        if !a.yes(&format!("These checks run on every change: {}. Keep them?", names.join(", ")), true)? {
+    // A monorepo: one check per package, each required only when a change touches it (D97).
+    let mut approved_packages = false;
+    if !editing {
+        let scan = use05_core::setup::scan_workspaces(top);
+        let per_package = use05_core::setup::workspace_checks(top, &scan.workspaces);
+        for note in &scan.skipped {
+            a.say(&format!("  {note}."));
+        }
+        if !per_package.is_empty() {
+            a.say(&use05_core::setup::workspace_note(&scan.workspaces, scan.root_is_package));
+            for c in &per_package {
+                a.say(&format!("  {}", describe_check(c)));
+            }
+            if a.yes("Use these checks?", true)? {
+                s.checks = use05_core::setup::with_workspace_checks(std::mem::take(&mut s.checks), per_package, scan.root_is_package);
+                approved_packages = true;
+                a.say(use05_core::setup::workspace_caveat());
+            }
+        }
+    }
+    if !s.checks.is_empty() && !approved_packages {
+        let names: Vec<String> = s.checks.iter().map(describe_check).collect();
+        let when = if s.checks.iter().any(|c| !c.paths.is_empty()) { "the changes they apply to" } else { "every change" };
+        if !a.yes(&format!("These checks run on {when}: {}. Keep them?", names.join(", ")), true)? {
             s.checks.clear();
         }
     }
@@ -462,6 +529,8 @@ pub enum Outcome {
     Unchanged,
     /// The input ended, or the person chose not to write: nothing changes.
     Stopped,
+    /// Nobody answered within the limit (D98): nothing changes.
+    NoAnswer,
 }
 
 /// Run the setup on a policy `text`: ask on the terminal (questions on stderr, so `--json` on
@@ -470,9 +539,10 @@ pub enum Outcome {
 pub fn run_on(text: &str, top: &Path, editing: bool, interactive: bool, flags: &Flags) -> Result<(Outcome, Vec<String>), String> {
     let current = Policy::parse(text).map_err(|e| e.message)?;
     let settings = if interactive {
-        let mut a = Asker::styled(std::io::stdin().lock(), std::io::stderr(), crate::ui::Ui::stderr());
+        let mut a = crate::prompt::on_stdin(crate::ui::Ui::stderr());
         match ask(&mut a, top, &current, editing, flags) {
             Some(s) => s,
+            None if a.timed_out() => return Ok((Outcome::NoAnswer, Vec::new())),
             None => return Ok((Outcome::Stopped, Vec::new())),
         }
     } else {
@@ -524,10 +594,47 @@ mod tests {
     use super::*;
 
     #[test]
+    fn the_team_decides_who_may_promote_into_the_last_rung() {
+        let ladder = || vec![Environment::new("dev", "main", None), Environment::new("uat", "uat", None), Environment::new("prod", "production", None)];
+        let promoting = |team: Team, current: &[Environment]| {
+            let mut envs = ladder();
+            team_promotion(&mut envs, current, team);
+            envs.iter().map(|e| (e.name.clone(), e.agent, e.rules.sign_off)).collect::<Vec<_>>()
+        };
+        use use05_core::policy::Severity;
+        // Just you: an agent may promote into prod too.
+        assert_eq!(promoting(Team::Solo, &[])[2], ("prod".into(), Some(true), Severity::Allow));
+        // A small team keeps the policy's default: prod for people, nothing to set.
+        assert_eq!(promoting(Team::Small, &[]), ladder().iter().map(|e| (e.name.clone(), e.agent, e.rules.sign_off)).collect::<Vec<_>>());
+        // A larger or regulated team also asks a person's sign-off into prod.
+        assert_eq!(promoting(Team::Regulated, &[])[2], ("prod".into(), None, Severity::Approval));
+        // Only the last rung, and never an environment the policy already has.
+        assert_eq!(promoting(Team::Solo, &[])[1].1, None);
+        assert_eq!(promoting(Team::Solo, &[Environment::new("prod", "production", None)])[2].1, None, "prod is already set up: kept as it is");
+        // One environment is the landing branch alone: nothing is promoted into it.
+        let mut one = vec![Environment::new("dev", "main", None)];
+        team_promotion(&mut one, &[], Team::Solo);
+        assert_eq!(one[0].agent, None);
+    }
+
+    #[test]
     fn a_check_with_shell_syntax_runs_through_sh() {
         assert_eq!(parse_check("test: FOO=1 npm test").unwrap().run, ["sh", "-c", "FOO=1 npm test"]);
         assert_eq!(parse_check("lint: npm run lint").unwrap().run, ["npm", "run", "lint"]);
         assert!(parse_check("no colon here").is_none() && parse_check("two words: x").is_none());
+    }
+
+    #[test]
+    fn an_environment_chosen_again_keeps_its_promotion_settings_by_name_or_branch() {
+        let mut old = Environment::new("prod", "production", None);
+        old.agent = Some(false);
+        old.soak_minutes = Some(30);
+        let current = vec![Environment::new("uat", "uat", None), old];
+        let mut chosen = vec![Environment::new("prod", "production", None), Environment::new("live", "production", Some("prod")), Environment::new("qa", "qa", Some("uat"))];
+        keep_promotion(&mut chosen, &current);
+        assert_eq!((chosen[0].agent, chosen[0].soak_minutes), (Some(false), Some(30)), "same name");
+        assert_eq!((chosen[1].name.as_str(), chosen[1].level.as_deref(), chosen[1].soak_minutes), ("live", Some("prod"), Some(30)), "renamed on the same branch: its new name and level, its old rules");
+        assert_eq!(chosen[2], Environment::new("qa", "qa", Some("uat")), "a new one has none");
     }
 }
 

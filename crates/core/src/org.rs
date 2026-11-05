@@ -33,6 +33,8 @@ pub fn verify(bytes: &[u8], key: &VerifyingKey) -> Result<(String, Floor)> {
     let layer = verified.statement.predicate;
     let floor: Floor = serde_json::from_value(layer.floor)
         .map_err(|e| Error::new("ORG_LAYER_UNAVAILABLE", format!("the organisation policy is not readable: {e}")))?;
+    // A floor signed by a 05 that did not check it: its owner rules must name only its own people.
+    floor.validate().map_err(|e| Error::new("ORG_LAYER_UNAVAILABLE", format!("the organisation policy is not usable: {}", e.message)))?;
     Ok((layer.org, floor))
 }
 

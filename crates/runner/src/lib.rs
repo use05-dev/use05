@@ -13,4 +13,4 @@ mod time;
 mod tree;
 
 pub use error::RunnerError;
-pub use prove::{Proof, ProveOptions, TreeIdentity, identify, prove, prove_with_output};
+pub use prove::{Export, Proof, ProveOptions, Ran, TreeIdentity, identify, prove, prove_with_output};

@@ -1,0 +1,40 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://use05.dev/receipts/discard-v0.schema.json",
+  "title": "05 discard, https://use05.dev/discard/v0",
+  "description": "An in-toto Statement v1 carrying a person's word to throw a task's work away. Subject: the work (task, and gitCommit, the branch's head). Acted on where the work is; never stored as a receipt. Fields are only ever added, as optional ones.",
+  "type": "object",
+  "required": ["_type", "subject", "predicateType", "predicate"],
+  "additionalProperties": true,
+  "properties": {
+    "_type": { "const": "https://in-toto.io/Statement/v1" },
+    "subject": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "required": ["name", "digest"],
+        "properties": { "name": { "type": "string" }, "digest": { "type": "object", "additionalProperties": { "type": "string" } } }
+      },
+      "contains": {
+        "type": "object",
+        "properties": { "name": { "const": "work" }, "digest": { "type": "object", "required": ["task"] } }
+      }
+    },
+    "predicateType": { "const": "https://use05.dev/discard/v0" },
+    "predicate": {
+      "type": "object",
+      "required": ["task", "unpushed", "uncommitted", "by", "created"],
+      "additionalProperties": true,
+      "properties": {
+        "task": { "type": "string" },
+        "branch": { "type": ["string", "null"], "description": "The task's own branch, when it has one 05 may delete." },
+        "head": { "type": ["string", "null"], "description": "That branch's head when the discard was prepared: if it moves, the discard does not apply." },
+        "unpushed": { "type": "integer", "minimum": 0, "description": "Commits on no remote branch and not landed." },
+        "uncommitted": { "type": "integer", "minimum": 0, "description": "Files in its worktree that were never committed." },
+        "by": { "type": "string" },
+        "created": { "type": "string" }
+      }
+    }
+  }
+}

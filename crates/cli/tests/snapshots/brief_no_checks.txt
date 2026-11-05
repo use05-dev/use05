@@ -1,0 +1,28 @@
+Brief  Untracked change                                                                      no task
+────────────────────────────────────────────────────────────────────────────────────────────────────
+Story      asked: not recorded
+           agent says: nothing yet
+           05 saw: 1 file changed in the top folder · +1 −1
+           checked: none required; behaviour not verified
+           not known: behaviour beyond these checks
+
+Intent     inferred from the task; no card was written
+           risk low
+
+Outcome    1 file changed on <TREE12> (staged files) · +1 −1
+           (root) · 1 file · +1 −1
+
+Evidence   policy requires no checks
+
+Drift      ✓ nothing differs from the intent
+
+Approvals  none
+
+Unknowns   · 05 shows what was checked. It does not judge whether the change is correct.
+           · policy requires no checks, so nothing was verified by running anything
+
+Undo       git stash push (keeps your work; nothing is deleted)
+
+────────────────────────────────────────────────────────────────────────────────────────────────────
+✓ ALLOW  nothing to read
+  Checks: none required; behaviour not verified

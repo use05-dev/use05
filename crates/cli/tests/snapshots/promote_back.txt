@@ -1,0 +1,12 @@
+✓ Merged prod back into uat: <TREE12> (merge)
+  merged    1 commit · 1 file · +1 −0 · <TREE12> (origin/prod) into uat
+  pushed    uat → origin, now at <TREE12> (a merge commit)
+  rules     source_checks skipped · source_confirmed skipped · soak skipped · migrations pass ·
+            untasked pass · sign_off skipped
+  rollback  <TREE12>
+  by        this machine
+  record    on 05-receipts/<ID>
+  Here this is advisory: it is the judgement CI makes, but nothing stops a person or an agent who
+  pushes uat's branch by hand.
+
+Next: use05 promote dev --back

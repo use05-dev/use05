@@ -1,5 +1,12 @@
 Brief  Tighten the policy                                                              task <TASK>
 ────────────────────────────────────────────────────────────────────────────────────────────────────
+Story      asked: not recorded
+           agent says: nothing yet
+           05 saw: 1 file changed in .05/ · +2 −0
+           checked: 1 passed on the machine that ran it (advisory: an agent can run as its user)
+           not known: behaviour beyond these checks; what the checks test: no file in the tree is
+           named like a test
+
 Intent     no goal written
            owner you (approver), signed
            scope .05/**
@@ -25,3 +32,5 @@ Undo       git stash push (keeps your work; nothing is deleted)
 
 ────────────────────────────────────────────────────────────────────────────────────────────────────
 ✓ ALLOW  nothing to read
+  Checks: 1 passed on the machine that ran it (advisory: an agent can run as its user)
+  Behaviour beyond these checks: not assessed

@@ -69,6 +69,334 @@ pub struct Brief {
     /// Where the change lands and the environment that branch is, when the policy names
     /// environments: `main (dev)`.
     pub lands_on: Option<String>,
+    /// How much the decision rests on (D101), worked out from `gate`. Never changes it.
+    pub assurance: Assurance,
+    /// The change as a short story, each line labelled by where it comes from (D102 part 1).
+    /// Derived from the rest of the brief; refresh it with [`story`] after changing the brief.
+    pub story: Story,
+}
+
+/// The change told in a few lines (D102, the Change Story's first part), each labelled by where it
+/// comes from: the person's words, the agent's words, what 05 saw itself, what the checks found,
+/// what holds it for a person, and what nobody established. Derived from the brief alone: it
+/// decides nothing, and an agent's words are never shown as a fact.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+pub struct Story {
+    /// What the person asked, when the agent's hooks kept it: their words, first line. Kept on
+    /// this machine.
+    pub asked: Option<String>,
+    /// What the agent says it did: its own words, first line. An assertion, not a finding.
+    pub agent_says: Option<String>,
+    /// The agent's claims, each with what the evidence on this tree says of it.
+    pub claims: Vec<StoryClaim>,
+    /// How many claims the evidence supports, has nothing to say about, and contradicts.
+    pub claim_counts: ClaimCounts,
+    /// What 05 observed itself, from the tree and the rules: files and areas, work outside the
+    /// plan, test files edited, risk areas, other sessions on the same files.
+    pub observed: Vec<String>,
+    /// What the required checks found, in the assurance's own words.
+    pub checked: String,
+    /// What holds the change for a person or refuses it, first reasons first (at most three).
+    pub needs_you: Vec<String>,
+    /// What nobody established.
+    pub not_known: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct StoryClaim {
+    /// The agent's words.
+    pub text: String,
+    /// `supported`, `unsupported` (no check of its kind ran) or `contradicted`.
+    pub status: &'static str,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
+pub struct ClaimCounts {
+    pub supported: usize,
+    pub unsupported: usize,
+    pub contradicted: usize,
+}
+
+/// The first line of a text, trimmed, at most 160 characters.
+fn first_line(text: &str) -> Option<String> {
+    let line = text.lines().map(str::trim).find(|l| !l.is_empty())?;
+    Some(if line.chars().count() > 160 { format!("{}…", line.chars().take(159).collect::<String>()) } else { line.to_string() })
+}
+
+/// The story of `b`, from what the brief holds. `outcome` is the agent's own report of what it did.
+pub fn story(b: &Brief, outcome: Option<&str>) -> Story {
+    use crate::claims::Judged;
+    use crate::gate::Effect;
+    let mut claims = Vec::new();
+    let mut counts = ClaimCounts::default();
+    for c in &b.gate.claims {
+        let status = match c.judged {
+            Judged::Supported { .. } => {
+                counts.supported += 1;
+                "supported"
+            }
+            Judged::Unsupported => {
+                counts.unsupported += 1;
+                "unsupported"
+            }
+            Judged::Contradicted { .. } => {
+                counts.contradicted += 1;
+                "contradicted"
+            }
+        };
+        claims.push(StoryClaim { text: c.text.clone(), status });
+    }
+
+    let mut observed = Vec::new();
+    let n = b.gate.changed.len();
+    if n == 0 {
+        observed.push("no files changed".to_string());
+    } else {
+        let names: Vec<&str> = b.area_summary.iter().take(3).map(|a| if a.name == "(root)" { "the top folder" } else { a.name.as_str() }).collect();
+        let more = if b.area_summary.len() > 3 { format!(" and {} more", b.area_summary.len() - 3) } else { String::new() };
+        observed.push(format!("{n} file{} changed in {}{more} · +{} −{}", if n == 1 { "" } else { "s" }, names.join(", "), b.added, b.removed));
+    }
+    if !b.outside_scope.is_empty() {
+        let k = b.outside_scope.len();
+        observed.push(format!("{k} file{} outside the plan", if k == 1 { "" } else { "s" }));
+    }
+    if b.assurance.tests_changed > 0 {
+        let t = b.assurance.tests_changed;
+        observed.push(format!("{t} test file{} edited by this change", if t == 1 { "" } else { "s" }));
+    }
+    if !b.gate.risk_reasons.is_empty() {
+        let mut cats: Vec<String> = b.gate.risk_reasons.iter().map(|r| r.category.to_string()).collect();
+        cats.dedup();
+        observed.push(format!("in a risk area: {}", cats.join(", ")));
+    }
+    if b.gate.findings.iter().any(|f| f.code == "OVERLAP") {
+        observed.push("another agent session edited some of the same files lately".to_string());
+    }
+
+    let needs_you: Vec<String> = match &b.gate.bypass {
+        Some(by) => vec![format!("let through by break-glass ({}): \"{}\"", by.by.name, by.reason)],
+        // What a person decides: an approval, or a refusal. A check still to run is not theirs to
+        // decide; the checks line says so.
+        // Testing before a push is a person's too, though the brief itself is not a push.
+        None => b.gate.findings.iter().filter(|f| f.effect >= Effect::Approval || f.code == "TESTING_NOT_SIGNED").take(3).map(|f| f.message.clone()).collect(),
+    };
+
+    let mut not_known = vec!["behaviour beyond these checks".to_string()];
+    if b.task_id.is_some() && b.card.as_ref().is_none_or(|c| !c.has_scope()) {
+        not_known.push("whether it stayed in scope: no scope was declared".to_string());
+    }
+    if counts.unsupported > 0 {
+        not_known.push(match counts.unsupported {
+            1 => "one of the agent's claims: no check of its kind ran".to_string(),
+            n => format!("{n} of the agent's claims: no check of their kind ran"),
+        });
+    }
+    // Where the tests come from (S4): never more than the names and the rules say.
+    match b.assurance.test_origin {
+        Some("protected") => observed.push("the test files are under the policy's protect rules: changing them needs a person".to_string()),
+        Some("not_protected") if b.assurance.checks_required > 0 => not_known.push("whether the tests stand apart from the change: no protect rule covers the test files, so a change could rewrite them".to_string()),
+        Some("none_found") if b.assurance.checks_required > 0 => not_known.push("what the checks test: no file in the tree is named like a test".to_string()),
+        _ => {}
+    }
+
+    Story {
+        asked: b.request.as_deref().and_then(first_line),
+        agent_says: outcome.and_then(first_line),
+        claims,
+        claim_counts: counts,
+        observed,
+        checked: b.assurance.summary.clone(),
+        needs_you,
+        not_known,
+    }
+}
+
+/// Who signed the results that speak for the required checks on this tree.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EvidenceStrength {
+    /// No required check has a result on this tree.
+    None,
+    /// Every result was signed by a key on a developer's machine, which an agent running as that
+    /// user can reach.
+    LocalAdvisory,
+    /// Every result was signed by a runner key. It says who ran the check, not that a host
+    /// requires it.
+    RunnerSigned,
+    /// Some of each.
+    Mixed,
+}
+
+/// Said beside a verdict reached with no check run (D101): the agent's window and the bare page.
+pub const NO_CHECKS_RAN: &str = "no checks ran, behaviour not verified";
+
+/// How much the gate's decision rests on (D101): counts and signers of the required checks, the
+/// test files the change edits itself, and what nobody assessed. Derived from a [`GateResult`]
+/// alone; it is not a score, and nothing reads it to decide anything.
+#[derive(Debug, Clone, Serialize)]
+pub struct Assurance {
+    /// Checks the policy or the declaration requires for this change.
+    pub checks_required: usize,
+    pub passed: usize,
+    /// Failed or timed out.
+    pub failed: usize,
+    /// No result on this tree, or asked for by the declaration but not defined in the policy.
+    pub missing: usize,
+    /// Passed on an earlier tree only.
+    pub stale: usize,
+    /// A result exists, but only from a signer the policy does not accept.
+    pub not_accepted: usize,
+    /// Checks scoped to paths this change does not touch (D97).
+    pub not_required: usize,
+    pub evidence: EvidenceStrength,
+    /// Required checks whose result was signed by a key on a developer's machine.
+    pub local_only: usize,
+    /// Test files this change adds or edits.
+    pub tests_changed: usize,
+    /// Whether anything checked behaviour beyond the checks' exit codes: `not_assessed`.
+    pub behaviour: &'static str,
+    /// `ci_gate` when this is the CI gate's own run; otherwise `unknown`. Whether a host requires
+    /// the gate before merging is never known from here.
+    pub enforcement: &'static str,
+    /// The checks line, after `Checks: `.
+    pub summary: String,
+    /// What the decision does not rest on, in plain words.
+    pub limitations: Vec<String>,
+    /// Where the tests that judge the change come from (S4, see [`test_origin`]). Set by the
+    /// brief and the CI gate, which read the tree's file names; absent where nothing read them.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub test_origin: Option<&'static str>,
+}
+
+impl Assurance {
+    /// The lines shown beside the verdict: the checks, a note when checks ran and the change edits
+    /// its own tests, and that behaviour beyond the checks is not assessed. With no check run,
+    /// that last is already in the first line, and no test graded anything.
+    pub fn lines(&self) -> Vec<String> {
+        let mut out = vec![format!("Checks: {}", self.summary)];
+        if self.tests_changed > 0 && self.checks_required > 0 {
+            out.push(format!("Note: this change also edits {} test file(s), so it partly grades itself", self.tests_changed));
+        }
+        if self.checks_required > 0 {
+            out.push("Behaviour beyond these checks: not assessed".to_string());
+        }
+        out
+    }
+
+    /// What the shortest verdicts add when no required check ran; `None` when checks ran.
+    pub fn qualifier(&self) -> Option<&'static str> {
+        (self.checks_required == 0).then_some(NO_CHECKS_RAN)
+    }
+}
+
+/// The changed test files a change edits or adds itself (a deleted one grades nothing).
+fn changed_tests(gate: &GateResult) -> Vec<&str> {
+    gate.changed.iter().filter(|c| c.status != 'D' && crate::weakening::classify(&c.path) == crate::weakening::Class::Tests).map(|c| c.path.as_str()).collect()
+}
+
+/// Where the tests that judge a change come from, as far as file names and the rules tell (S4):
+/// `edited_by_change` (it edits test files itself, so it partly grades itself), `protected` (every
+/// test file 05 recognises in the tree is under a `[protect]` rule, so changing one needs a person
+/// or is refused), `not_protected` (unchanged this time, but nothing stops a change editing them),
+/// `none_found`, or `unknown` when the tree cannot be read. It does not say the tests are good or
+/// that they check what was asked. Reads the tree's file names once; not for the hooks' hot path.
+pub fn test_origin(top: &std::path::Path, tree: &str, policy: &crate::policy::Policy, edited: usize) -> &'static str {
+    if edited > 0 {
+        return "edited_by_change";
+    }
+    let Ok(raw) = crate::git::run(top, &["ls-tree", "-r", "--name-only", "-z", "--full-tree", tree]) else { return "unknown" };
+    let tests: Vec<String> = raw.split(|b| *b == 0).filter(|p| !p.is_empty()).map(|p| String::from_utf8_lossy(p).to_string()).filter(|p| crate::weakening::classify(p) == crate::weakening::Class::Tests).collect();
+    if tests.is_empty() {
+        return "none_found";
+    }
+    let p = &policy.protect;
+    let rules: Vec<&String> = p.paths.iter().chain(&p.locked).chain(&p.absolute).chain(&p.append_only).collect();
+    if tests.iter().all(|t| rules.iter().any(|r| crate::glob::matches(r, t))) { "protected" } else { "not_protected" }
+}
+
+/// Work out [`Assurance`] from what the gate found. `ci_gate` is true in the CI gate's own run.
+pub fn assurance(gate: &GateResult, ci_gate: bool) -> Assurance {
+    use crate::gate::CheckState as S;
+    let required: Vec<&crate::gate::CheckStatus> = gate.checks.iter().filter(|c| c.required && !matches!(c.state, S::NotRequired { .. })).collect();
+    let count = |f: fn(&S) -> bool| required.iter().filter(|c| f(&c.state)).count();
+    let passed = count(|s| matches!(s, S::Passed { .. }));
+    let failed = count(|s| matches!(s, S::Failed { .. } | S::TimedOut { .. }));
+    let missing = count(|s| matches!(s, S::Missing | S::Undefined));
+    let stale = count(|s| matches!(s, S::Stale));
+    let not_accepted = count(|s| matches!(s, S::NotAuthoritative { .. }));
+    let not_required = gate.checks.iter().filter(|c| matches!(c.state, S::NotRequired { .. })).count();
+    // The receipts that speak for a check on this tree (D66): its result, passed or not.
+    let roles: Vec<Role> = required.iter().filter_map(|c| match &c.state {
+        S::Passed { by, .. } | S::Failed { by, .. } | S::TimedOut { by } => Some(by.role),
+        _ => None,
+    }).collect();
+    let runner = roles.iter().filter(|r| **r == Role::Runner).count();
+    let local_only = roles.len() - runner;
+    let evidence = match (runner, local_only) {
+        (0, 0) => EvidenceStrength::None,
+        (0, _) => EvidenceStrength::LocalAdvisory,
+        (_, 0) => EvidenceStrength::RunnerSigned,
+        _ => EvidenceStrength::Mixed,
+    };
+    let tests_changed = changed_tests(gate).len();
+    let checks_required = required.len();
+    // Said the same wherever it is read (here, in CI, on the console): never "this machine".
+    let local_where = "on the machine that ran it";
+    let unmet = failed + missing + stale + not_accepted;
+    // A check the policy defines with `required = false` is not in the gate's list at all, so
+    // "none required" is what is known, never "none configured".
+    let summary = if checks_required == 0 {
+        if not_required > 0 { "none required for the files this change touches; behaviour not verified".to_string() } else { "none required; behaviour not verified".to_string() }
+    } else if unmet > 0 {
+        let parts = [
+            (failed, "failed"),
+            (missing, "not run on this tree"),
+            (stale, "stale (passed on an earlier tree)"),
+            (not_accepted, "proved only by a key the policy does not accept"),
+            (passed, "passed"),
+        ];
+        parts.iter().filter(|(n, _)| *n > 0).map(|(n, what)| format!("{n} {what}")).collect::<Vec<_>>().join(", ")
+    } else {
+        match evidence {
+            EvidenceStrength::RunnerSigned => format!("{passed} passed, signed by CI (merge enforcement not confirmed from here)"),
+            EvidenceStrength::Mixed => format!("{passed} passed: {runner} signed by CI, {local_only} {local_where} (advisory; merge enforcement not confirmed from here)"),
+            _ => format!("{passed} passed {local_where} (advisory: an agent can run as its user)"),
+        }
+    };
+    let mut limitations = Vec::new();
+    if checks_required == 0 {
+        limitations.push("no check ran, so behaviour was not verified by running anything".to_string());
+    } else if unmet > 0 {
+        limitations.push(format!("{unmet} required check(s) have no accepted passing result on this tree"));
+    }
+    if local_only > 0 {
+        limitations.push("a result signed on a developer's machine is advisory: an agent running as that user can sign it".to_string());
+    }
+    if runner > 0 {
+        limitations.push("a CI signature says who ran the check, not that the host requires it before merging".to_string());
+    }
+    // Tests grade a change only when a check ran them.
+    if tests_changed > 0 && checks_required > 0 {
+        limitations.push(format!("this change also edits {tests_changed} test file(s), so it partly grades itself"));
+    }
+    limitations.push("behaviour beyond these checks is not assessed".to_string());
+    Assurance {
+        checks_required,
+        passed,
+        failed,
+        missing,
+        stale,
+        not_accepted,
+        not_required,
+        evidence,
+        local_only,
+        tests_changed,
+        behaviour: "not_assessed",
+        enforcement: if ci_gate { "ci_gate" } else { "unknown" },
+        summary,
+        limitations,
+        test_origin: None,
+    }
 }
 
 /// A part of the change: a directory (ending in `/`), `(root)` for files at the top, or
@@ -195,6 +523,14 @@ fn top_level(changes: &[(&str, u64, u64)]) -> Vec<(String, usize)> {
     out
 }
 
+/// The unknown for changed files that no check's `paths` name: names three, counts the rest.
+fn uncovered_files(files: &[&str]) -> String {
+    let shown = files.iter().take(3).copied().collect::<Vec<_>>().join(", ");
+    let more = if files.len() > 3 { format!(" and {} more", files.len() - 3) } else { String::new() };
+    let n = files.len();
+    format!("{n} changed file{} {} outside every check's paths, so no check was required for {}: {shown}{more}", if n == 1 { "" } else { "s" }, if n == 1 { "is" } else { "are" }, if n == 1 { "it" } else { "them" })
+}
+
 /// The unknown for a change that edits its own tests: names three, counts the rest.
 fn tests_edited(tests: &[&str]) -> String {
     let shown = tests.iter().take(3).copied().collect::<Vec<_>>().join(", ");
@@ -218,6 +554,17 @@ pub fn build(task: Option<&Task>, gate: GateResult, tree: &str, tree_label: &str
     unknowns.push("05 shows what was checked. It does not judge whether the change is correct.".to_string());
     if gate.checks.is_empty() {
         unknowns.push("policy requires no checks, so nothing was verified by running anything".to_string());
+    } else if gate.checks.iter().all(|c| matches!(c.state, crate::gate::CheckState::NotRequired { .. })) {
+        unknowns.push("no check was required for the files this change touches, so nothing was verified by running anything".to_string());
+    }
+    // Checks scoped to paths (D97) cover only their paths: files in none of them, with no check that
+    // is required for every change, were checked by nothing.
+    let scoped: Vec<&Vec<String>> = gate.checks.iter().map(|c| &c.paths).filter(|p| !p.is_empty()).collect();
+    if !scoped.is_empty() && !gate.checks.iter().any(|c| c.paths.is_empty() && c.required) {
+        let uncovered: Vec<&str> = gate.changed.iter().map(|c| c.path.as_str()).filter(|f| !scoped.iter().any(|p| crate::policy::paths_cover(p, f))).collect();
+        if !uncovered.is_empty() {
+            unknowns.push(uncovered_files(&uncovered));
+        }
     }
     let proved_by: Vec<Role> = gate.checks.iter().filter_map(|c| match &c.state {
         crate::gate::CheckState::Passed { by, .. } => Some(by.role),
@@ -229,7 +576,7 @@ pub fn build(task: Option<&Task>, gate: GateResult, tree: &str, tree_label: &str
     if card.as_ref().is_none_or(|c| !c.has_scope()) && task.is_some() {
         unknowns.push("no scope was declared, so scope drift was not checked".to_string());
     }
-    let tests: Vec<&str> = gate.changed.iter().filter(|c| c.status != 'D' && crate::weakening::classify(&c.path) == crate::weakening::Class::Tests).map(|c| c.path.as_str()).collect();
+    let tests = changed_tests(&gate);
     if !tests.is_empty() {
         unknowns.push(tests_edited(&tests));
     }
@@ -241,6 +588,11 @@ pub fn build(task: Option<&Task>, gate: GateResult, tree: &str, tree_label: &str
     }
     if gate.unverified_receipts > 0 {
         unknowns.push(format!("{} receipt(s) were ignored because no trusted key verifies them", gate.unverified_receipts));
+    }
+    match gate.lfs_pointers {
+        0 => {}
+        1 => unknowns.push("1 LFS file was checked as a pointer (set [evidence] lfs = true to check the real file)".to_string()),
+        n => unknowns.push(format!("{n} LFS files were checked as pointers (set [evidence] lfs = true to check the real files)")),
     }
     if gate.approvals.iter().any(|a| a.vote == Vote::Approve && a.void.is_some()) {
         unknowns.push("an approval exists but no longer counts (expired, or the policy changed)".to_string());
@@ -274,8 +626,10 @@ pub fn build(task: Option<&Task>, gate: GateResult, tree: &str, tree_label: &str
         _ => vec!["git stash push   (keeps your work; nothing is deleted)".to_string()],
     };
 
-    Brief {
+    let mut brief = Brief {
         label: label_of(&gate),
+        assurance: assurance(&gate, false),
+        story: Story::default(),
         title: task.map(|t| t.title.clone()).unwrap_or_else(|| "Untracked change".to_string()),
         task_id: task.map(|t| t.id.clone()),
         author: task.map(|t| t.author.clone()),
@@ -300,6 +654,25 @@ pub fn build(task: Option<&Task>, gate: GateResult, tree: &str, tree_label: &str
         undo,
         session: None,
         lands_on: None,
+    };
+    brief.refresh_story(task.and_then(|t| t.outcome.as_deref()));
+    brief
+}
+
+impl Brief {
+    /// Say where the tests come from (S4), reading the tree's file names, and tell the story again.
+    pub fn read_test_origin(&mut self, top: &std::path::Path, policy: &crate::policy::Policy) {
+        self.assurance.test_origin = Some(test_origin(top, &self.tree, policy, self.assurance.tests_changed));
+        self.refresh_story(None);
+    }
+
+    /// Work the story out again, after something it rests on changed (the assurance in CI, say).
+    pub fn refresh_story(&mut self, outcome: Option<&str>) {
+        let keep = self.story.agent_says.clone();
+        self.story = story(self, outcome);
+        if outcome.is_none() {
+            self.story.agent_says = keep;
+        }
     }
 }
 
@@ -379,6 +752,120 @@ mod tests {
         let got = areas(&view(&v), 8);
         assert!(started.elapsed() < std::time::Duration::from_millis(800), "took {:?}", started.elapsed());
         assert_eq!(got.iter().map(|a| a.files).sum::<usize>(), 50_000);
+    }
+
+    // ------------------------------------------------------------- assurance (D101)
+
+    use crate::evidence::Signer;
+    use crate::gate::{ChangeInfo, CheckState, CheckStatus, Decision};
+
+    fn signer(role: Role) -> Signer {
+        Signer { name: if role == Role::Runner { "ci".into() } else { "this machine".into() }, role, key_id: format!("{role:?}") }
+    }
+
+    fn check(name: &str, required: bool, state: CheckState) -> CheckStatus {
+        CheckStatus { name: name.into(), run: vec!["./test.sh".into()], dir: None, paths: Vec::new(), required, state }
+    }
+
+    fn gate_with(checks: Vec<CheckStatus>, changed: &[&str]) -> GateResult {
+        let mut g = GateResult::of_findings(Decision::Allow, Vec::new(), "p".into());
+        g.checks = checks;
+        g.changed = changed.iter().map(|p| ChangeInfo { status: 'M', path: (*p).into(), added: 1, removed: 0 }).collect();
+        g
+    }
+
+    fn passed(role: Role) -> CheckState {
+        CheckState::Passed { by: signer(role), ms: 10 }
+    }
+
+    #[test]
+    fn assurance_with_no_checks_says_behaviour_not_verified() {
+        let a = assurance(&gate_with(Vec::new(), &["main.rs"]), false);
+        assert_eq!((a.checks_required, a.passed, a.evidence), (0, 0, EvidenceStrength::None));
+        assert_eq!(a.lines(), ["Checks: none required; behaviour not verified"], "folded into one line");
+        assert_eq!(a.qualifier(), Some("no checks ran, behaviour not verified"));
+        assert_eq!((a.behaviour, a.enforcement), ("not_assessed", "unknown"));
+        // Checks scoped to other paths (D97) are listed, but none was required.
+        let scoped = assurance(&gate_with(vec![check("web", false, CheckState::NotRequired { reason: crate::gate::NOT_REQUIRED_REASON, result: None })], &["main.rs"]), false);
+        assert_eq!((scoped.checks_required, scoped.not_required), (0, 1));
+        assert_eq!(scoped.lines(), ["Checks: none required for the files this change touches; behaviour not verified"]);
+        assert!(scoped.qualifier().is_some());
+        for line in a.lines().iter().chain(scoped.lines().iter()) {
+            for word in ["verified correct", "proven", "score"] {
+                assert!(!line.contains(word), "{line}");
+            }
+        }
+    }
+
+    #[test]
+    fn local_only_checks_are_labelled_advisory() {
+        let a = assurance(&gate_with(vec![check("test", true, passed(Role::Local)), check("lint", true, passed(Role::Local))], &["main.rs"]), false);
+        assert_eq!((a.checks_required, a.passed, a.local_only, a.evidence), (2, 2, 2, EvidenceStrength::LocalAdvisory));
+        assert_eq!(a.lines(), ["Checks: 2 passed on the machine that ran it (advisory: an agent can run as its user)", "Behaviour beyond these checks: not assessed"]);
+        assert_eq!(a.qualifier(), None, "checks ran: the agent window keeps today's text");
+        assert!(a.limitations.iter().any(|l| l.contains("advisory")), "{:?}", a.limitations);
+    }
+
+    #[test]
+    fn runner_signed_checks_are_labelled_ci_signed_not_enforced() {
+        let a = assurance(&gate_with(vec![check("test", true, passed(Role::Runner))], &["main.rs"]), false);
+        assert_eq!((a.passed, a.local_only, a.evidence, a.enforcement), (1, 0, EvidenceStrength::RunnerSigned, "unknown"));
+        assert_eq!(a.lines()[0], "Checks: 1 passed, signed by CI (merge enforcement not confirmed from here)");
+        assert!(a.limitations.iter().any(|l| l.contains("not that the host requires it")), "{:?}", a.limitations);
+        // The CI gate's own run knows it is the CI gate, never that the host requires it.
+        let ci = assurance(&gate_with(vec![check("test", true, passed(Role::Runner))], &["main.rs"]), true);
+        assert_eq!(ci.enforcement, "ci_gate");
+        assert!(ci.lines()[0].contains("merge enforcement not confirmed"), "{:?}", ci.lines());
+        // A machine key's result read in CI: the same words as anywhere, never "this machine".
+        let ci_local = assurance(&gate_with(vec![check("test", true, passed(Role::Local))], &["main.rs"]), true);
+        assert_eq!((ci_local.evidence, ci_local.enforcement), (EvidenceStrength::LocalAdvisory, "ci_gate"));
+        assert_eq!(ci_local.lines()[0], "Checks: 1 passed on the machine that ran it (advisory: an agent can run as its user)");
+        // Both kinds: said apart.
+        let mixed = assurance(&gate_with(vec![check("test", true, passed(Role::Runner)), check("lint", true, passed(Role::Local))], &["main.rs"]), false);
+        assert_eq!((mixed.evidence, mixed.local_only), (EvidenceStrength::Mixed, 1));
+        assert_eq!(mixed.lines()[0], "Checks: 2 passed: 1 signed by CI, 1 on the machine that ran it (advisory; merge enforcement not confirmed from here)");
+    }
+
+    #[test]
+    fn stale_and_failed_checks_never_count_as_passed() {
+        let checks = vec![
+            check("test", true, CheckState::Failed { by: signer(Role::Local), exit_code: Some(1) }),
+            check("lint", true, CheckState::Stale),
+            check("e2e", true, CheckState::Missing),
+            check("fmt", true, passed(Role::Local)),
+            check("slow", true, CheckState::TimedOut { by: signer(Role::Local) }),
+            check("ci", true, CheckState::NotAuthoritative { by: signer(Role::Local) }),
+            check("docs", false, CheckState::NotRequired { reason: crate::gate::NOT_REQUIRED_REASON, result: Some(crate::gate::SeenResult { status: use05_receipt::Status::Passed, by: signer(Role::Local), ms: 1 }) }),
+        ];
+        let a = assurance(&gate_with(checks, &["main.rs"]), false);
+        assert_eq!((a.checks_required, a.passed, a.failed, a.stale, a.missing, a.not_accepted, a.not_required), (6, 1, 2, 1, 1, 1, 1));
+        assert_eq!(a.lines()[0], "Checks: 2 failed, 1 not run on this tree, 1 stale (passed on an earlier tree), 1 proved only by a key the policy does not accept, 1 passed");
+        assert_eq!(a.qualifier(), None);
+        let none_passed = assurance(&gate_with(vec![check("lint", true, CheckState::Stale)], &["main.rs"]), false);
+        assert_eq!(none_passed.lines()[0], "Checks: 1 stale (passed on an earlier tree)");
+        assert_eq!(none_passed.evidence, EvidenceStrength::None, "a stale receipt is not evidence for this tree");
+    }
+
+    #[test]
+    fn a_change_that_edits_its_tests_gets_the_caveat() {
+        let a = assurance(&gate_with(vec![check("test", true, passed(Role::Local))], &["src/lib.rs", "tests/cli.rs"]), false);
+        assert_eq!(a.tests_changed, 1);
+        assert_eq!(a.lines(), [
+            "Checks: 1 passed on the machine that ran it (advisory: an agent can run as its user)",
+            "Note: this change also edits 1 test file(s), so it partly grades itself",
+            "Behaviour beyond these checks: not assessed",
+        ]);
+        let deleted_only = {
+            let mut g = gate_with(Vec::new(), &[]);
+            g.changed = vec![ChangeInfo { status: 'D', path: "tests/old.rs".into(), added: 0, removed: 3 }];
+            assurance(&g, false)
+        };
+        assert_eq!(deleted_only.tests_changed, 0, "a deleted test grades nothing; deletion is the weakening check's to judge");
+        // With no check run, no test graded anything: counted, but no note.
+        let unchecked = assurance(&gate_with(Vec::new(), &["tests/cli.rs"]), false);
+        assert_eq!(unchecked.tests_changed, 1);
+        assert_eq!(unchecked.lines(), ["Checks: none required; behaviour not verified"]);
+        assert!(!unchecked.limitations.iter().any(|l| l.contains("grades itself")), "{:?}", unchecked.limitations);
     }
 
     #[test]

@@ -18,7 +18,13 @@ pub const INBOX_DIR: &str = ".05/inbox";
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Entry {
-    Start { title: String, card: Option<IntentCard> },
+    Start {
+        title: String,
+        card: Option<IntentCard>,
+        /// A hotfix (D93): the environment whose branch the work started from (`start --hotfix`).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        hotfix: Option<String>,
+    },
     Finish { outcome: Option<String> },
 }
 

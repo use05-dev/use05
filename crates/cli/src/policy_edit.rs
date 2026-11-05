@@ -13,6 +13,9 @@ const LEVELS_SINCE: &str = "0.0.5";
 /// The first use05 that reads `fresh_base` and `[[require]]`.
 const RULES_SINCE: &str = "0.0.6";
 
+/// The first use05 that reads a check's `paths` and `dir` (D97).
+const CHECK_SCOPE_SINCE: &str = "0.0.14";
+
 /// Everything the guided setup asks about.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Settings {
@@ -74,6 +77,12 @@ fn table<'a>(doc: &'a mut DocumentMut, name: &str) -> &'a mut Table {
     doc[name].as_table_mut().expect("a table")
 }
 
+/// The table `name`, with `key`'s commented example (if the file has one there) made the real line.
+fn slot<'a>(doc: &'a mut DocumentMut, name: &str, key: &str) -> &'a mut Table {
+    use05_policy_edit::edit::uncomment_example(doc, name, key);
+    table(doc, name)
+}
+
 /// Set `key` to `value`, keeping the comments around the old value.
 fn set(t: &mut Table, key: &str, mut value: Value) {
     if let Some(old) = t.get(key).and_then(Item::as_value) {
@@ -93,32 +102,32 @@ pub fn apply(text: &str, s: &Settings) -> Result<String, String> {
     let now = Settings::from_policy(&before);
     let mut doc: DocumentMut = text.parse().map_err(|e: toml_edit::TomlError| e.to_string())?;
     if s.intent != now.intent {
-        set(table(&mut doc, "intent"), "mode", word(&s.intent).into());
+        set(slot(&mut doc, "intent", "mode"), "mode", word(&s.intent).into());
     }
     for (key, want, have) in [("scope", s.scope, now.scope), ("dependencies", s.dependencies, now.dependencies), ("overlap", s.overlap, now.overlap), ("tests", s.tests, now.tests)] {
         if want != have {
-            set(table(&mut doc, "drift"), key, word(&want).into());
+            set(slot(&mut doc, "drift", key), key, word(&want).into());
         }
     }
     if s.approvals_min != now.approvals_min {
-        set(table(&mut doc, "approvals"), "min", i64::from(s.approvals_min).into());
+        set(slot(&mut doc, "approvals", "min"), "min", i64::from(s.approvals_min).into());
     }
     if s.target != now.target {
         match &s.target {
-            Some(t) => set(table(&mut doc, "branches"), "target", t.as_str().into()),
+            Some(t) => set(slot(&mut doc, "branches", "target"), "target", t.as_str().into()),
             None => {
                 table(&mut doc, "branches").remove("target");
             }
         }
     }
     if s.land != now.land {
-        set(table(&mut doc, "branches"), "land", word(&s.land).into());
+        set(slot(&mut doc, "branches", "land"), "land", word(&s.land).into());
     }
     if s.push != now.push {
-        set(table(&mut doc, "branches"), "push", word(&s.push).into());
+        set(slot(&mut doc, "branches", "push"), "push", word(&s.push).into());
     }
     if s.fresh_base != now.fresh_base {
-        set(table(&mut doc, "branches"), "fresh_base", word(&s.fresh_base).into());
+        set(slot(&mut doc, "branches", "fresh_base"), "fresh_base", word(&s.fresh_base).into());
     }
     for (key, want, have) in [
         ("paths", &s.protect_paths, &now.protect_paths),
@@ -128,19 +137,45 @@ pub fn apply(text: &str, s: &Settings) -> Result<String, String> {
         ("no_read", &s.no_read, &now.no_read),
     ] {
         if want != have {
-            set(table(&mut doc, "protect"), key, strings(want));
+            set(slot(&mut doc, "protect", key), key, strings(want));
         }
     }
     if s.environments != now.environments {
+        // An environment that stays keeps its own table: its promotion settings and comments
+        // (D93). Only its name, branch and level are what setup asks about.
+        let old: Vec<Table> = doc.get("environment").and_then(Item::as_array_of_tables).map(|a| a.iter().cloned().collect()).unwrap_or_default();
         doc.remove("environment");
         if !s.environments.is_empty() {
             let mut envs = ArrayOfTables::new();
             for e in &s.environments {
-                let mut t = Table::new();
-                t.insert("name", Item::Value(e.name.as_str().into()));
-                t.insert("branch", Item::Value(e.branch.as_str().into()));
-                if let Some(l) = &e.level {
-                    t.insert("level", Item::Value(l.as_str().into()));
+                let at = now.environments.iter().position(|o| o.name == e.name).or_else(|| now.environments.iter().position(|o| o.branch == e.branch));
+                let mut t = at.and_then(|i| old.get(i)).cloned().unwrap_or_default();
+                set_value(&mut t, "name", e.name.as_str().into());
+                set_value(&mut t, "branch", e.branch.as_str().into());
+                match &e.level {
+                    Some(l) => set_value(&mut t, "level", l.as_str().into()),
+                    None => {
+                        t.remove("level");
+                    }
+                }
+                // A new environment brings what the team's start gave it (who may promote into it,
+                // whether a person signs off); one that stays keeps its own table as it is.
+                if at.is_none() {
+                    if let Some(agent) = e.agent {
+                        set_value(&mut t, "agent", agent.into());
+                    }
+                    if e.rules != use05_core::policy::PromoteRules::default() {
+                        let mut rules = Table::new();
+                        let defaults = use05_core::policy::PromoteRules::default();
+                        for name in ["source_checks", "source_confirmed", "soak", "migrations", "untasked", "sign_off"] {
+                            if let (Some(want), Some(default)) = (e.rules.get(name), defaults.get(name)) {
+                                if want != default {
+                                    rules.insert(name, toml_edit::value(format!("{want:?}").to_lowercase()));
+                                }
+                            }
+                        }
+                        t.insert("rules", Item::Table(rules));
+                    }
                 }
                 envs.push(t);
             }
@@ -186,8 +221,27 @@ pub fn apply(text: &str, s: &Settings) -> Result<String, String> {
                 t.insert("name", Item::Value(c.name.as_str().into()));
                 t
             });
-            if now.checks.iter().find(|o| o.name == c.name).map(|o| &o.run) != Some(&c.run) {
+            let was = now.checks.iter().find(|o| o.name == c.name);
+            if was.map(|o| &o.run) != Some(&c.run) {
                 set(&mut t, "run", strings(&c.run));
+            }
+            // A new check brings its own environment, paths and folder (D97); a kept one only what changed.
+            for (key, want, have) in [("env", &c.env, was.map(|o| &o.env)), ("paths", &c.paths, was.map(|o| &o.paths))] {
+                if have != Some(want) {
+                    if want.is_empty() {
+                        t.remove(key);
+                    } else {
+                        set(&mut t, key, strings(want));
+                    }
+                }
+            }
+            if was.map(|o| &o.dir) != Some(&c.dir) {
+                match &c.dir {
+                    Some(dir) => set(&mut t, "dir", dir.as_str().into()),
+                    None => {
+                        t.remove("dir");
+                    }
+                }
             }
             checks.push(t);
         }
@@ -204,7 +258,11 @@ pub fn apply(text: &str, s: &Settings) -> Result<String, String> {
     }
     // Environments need 0.0.4 to be read. Raise the minimum so an older use05 is told to
     // upgrade instead of failing on a section it does not know.
-    let needs = if s.fresh_base != Severity::Allow || !s.require.is_empty() {
+    let needs = if s.checks.iter().any(|c| !c.paths.is_empty() || c.dir.is_some()) {
+        // A build older than that release (a development one) cannot write a minimum it fails to read itself.
+        let running = env!("CARGO_PKG_VERSION");
+        Some(if use05_core::policy::version_below(running, CHECK_SCOPE_SINCE) { running } else { CHECK_SCOPE_SINCE })
+    } else if s.fresh_base != Severity::Allow || !s.require.is_empty() {
         Some(RULES_SINCE)
     } else if s.environments.iter().any(|e| e.level.is_some()) {
         Some(LEVELS_SINCE)
@@ -222,6 +280,21 @@ pub fn apply(text: &str, s: &Settings) -> Result<String, String> {
     let out = doc.to_string();
     Policy::parse(&out).map_err(|e| e.message)?;
     Ok(out)
+}
+
+/// Set `key` in a table, keeping its place and the comment after it when it is there already.
+fn set_value(t: &mut Table, key: &str, value: toml_edit::Value) {
+    match t.get_mut(key).and_then(Item::as_value_mut) {
+        Some(v) if v.as_str() == value.as_str() => {}
+        Some(v) => {
+            let decor = v.decor().clone();
+            *v = value;
+            *v.decor_mut() = decor;
+        }
+        None => {
+            t.insert(key, Item::Value(value));
+        }
+    }
 }
 
 #[cfg(test)]
@@ -247,7 +320,7 @@ mod tests {
         s.approvals_min = 2;
         s.target = Some("main".into());
         s.land = LandMode::Auto;
-        s.environments = vec![Environment { name: "dev".into(), branch: "main".into(), level: None }, Environment { name: "prod".into(), branch: "production".into(), level: None }];
+        s.environments = vec![Environment::new("dev", "main", None), Environment::new("prod", "production", None)];
         s.checks.push(check("lint", &["npm", "run", "lint"]));
         s.locked = vec!["LICENSE".into()];
         s.append_only = vec!["migrations/**".into()];
@@ -261,6 +334,31 @@ mod tests {
         assert!(out.contains("# files outside the declared scope"), "a setting's comment survives:\n{out}");
         assert!(out.contains("# 05 policy."), "{out}");
         assert!(out.find("name = \"lint\"").unwrap() < out.find("[protect]").unwrap(), "checks stay where they were:\n{out}");
+    }
+
+    #[test]
+    fn a_rule_replaces_its_commented_example_in_the_template() {
+        let text = template();
+        let mut s = Settings::from_policy(&Policy::parse(&text).unwrap());
+        s.locked = vec!["LICENSE".into()];
+        let out = apply(&text, &s).unwrap();
+        assert!(out.contains("locked = [\"LICENSE\"]  "), "{out}");
+        assert!(!out.contains("# locked = []") && out.contains("# append_only = []"), "{out}");
+        assert!(out.contains("never changed; no approval clears it"), "the example's own comment stays:\n{out}");
+    }
+
+    #[test]
+    fn a_new_check_is_written_with_its_paths_folder_and_environment() {
+        let text = template();
+        let mut s = Settings::from_policy(&Policy::parse(&text).unwrap());
+        s.checks.push(CheckDef { paths: vec!["svc/**".into(), "go.work.sum".into()], dir: Some("svc".into()), env: vec!["HOME".into()], ..check("test-svc", &["go", "test", "./..."]) });
+        let out = apply(&text, &s).unwrap();
+        let written = Policy::parse(&out).unwrap();
+        assert_eq!(written.check[1], s.checks[1], "{out}");
+        assert!(out.contains("paths = [\"svc/**\", \"go.work.sum\"]") && out.contains("dir = \"svc\""), "{out}");
+        // Its first check is as it was, and the policy says which version reads these settings.
+        assert_eq!(written.check[0], s.checks[0]);
+        assert!(written.use05.min_version.is_some(), "an older use05 is told to upgrade rather than failing on `paths`:\n{out}");
     }
 
     #[test]
@@ -278,7 +376,8 @@ mod tests {
     fn a_result_that_would_not_parse_is_refused() {
         let text = template();
         let mut s = Settings::from_policy(&Policy::parse(&text).unwrap());
-        s.environments = vec![Environment { name: "dev".into(), branch: "main".into(), level: None }, Environment { name: "dev".into(), branch: "uat".into(), level: None }];
+        s.environments = vec![Environment::new("dev", "main", None), Environment::new("dev", "uat", None)];
         assert!(apply(&text, &s).is_err());
     }
 }
+

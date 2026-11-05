@@ -99,6 +99,9 @@ pub fn org_sign(floor_path: &Path, org_name: &str, key_path: &Path, out: &Path) 
         Ok(f) => f,
         Err(e) => return fail("FLOOR_INVALID", format!("the floor is not valid: {e}")),
     };
+    if let Err(e) = floor.validate() {
+        return Report::error("policy", e.code, e.message, e.next, 6);
+    }
     let key = match use05_core::keys::read_secret_file(key_path) {
         Ok(k) => k,
         Err(e) => return Report::from_core("policy", e),
@@ -140,6 +143,7 @@ pub fn edit(repo: &Path, interactive: bool, flags: &crate::cmd::setup::Flags) ->
     match run_on(&text, &top, true, interactive, flags) {
         Err(e) => Report::error("policy", "POLICY_INVALID", format!("{POLICY_PATH}: {e}"), None, 3),
         Ok((Outcome::Stopped, _)) => Report::error("policy", "SETUP_STOPPED", "Stopped; nothing was changed.".into(), None, 1),
+        Ok((Outcome::NoAnswer, _)) => Report::error("policy", "POLICY_NO_ANSWER", crate::prompt::no_answer_message(), Some("use05 policy set <setting> <value>   changes one setting and asks nothing".into()), 1),
         Ok((Outcome::Unchanged, notes)) => Report { command: "policy", outcome: "unchanged", code: "POLICY_UNCHANGED", tone: Tone::Plain, headline: format!("No change to {POLICY_PATH}"), rows: vec![], notes, next: None, excerpt: vec![], details: json!({ "changed": false }), exit: 0 },
         Ok((Outcome::Written(new), notes)) => match std::fs::write(&path, &new) {
             Err(e) => Report::error("policy", "IO_ERROR", format!("cannot write {POLICY_PATH}: {e}"), None, 4),

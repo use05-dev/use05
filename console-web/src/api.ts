@@ -48,6 +48,52 @@ export function ago(when?: string | null): string {
   return new Date(t).toLocaleDateString(undefined, { day: "numeric", month: "short", ...(s > 300 * 86400 ? { year: "numeric" } : {}) });
 }
 
+/// The line under a task's verdict saying how much it rests on (D101): the machine's own words from
+/// the task's sealed record, or nothing when the record has none. Never worked out here.
+export function checksLine(detail?: { assurance?: { summary?: unknown } } | null): string | null {
+  const summary = detail?.assurance?.summary;
+  return typeof summary === "string" && summary ? `Checks: ${summary}` : null;
+}
+
+/// The task's story (D102) as the machine sent it, in rows labelled by where each comes from. The
+/// person's request and the agent's own words stay on its machine, so the agent's row only counts
+/// its claims. Nothing here is worked out by the browser.
+export function storyRows(detail?: { story?: any } | null): { label: string; text: string; attention?: boolean }[] {
+  const s = detail?.story;
+  if (!s || typeof s !== "object") return [];
+  const words = (v: unknown) => (Array.isArray(v) ? v.filter((x) => typeof x === "string") : []);
+  const rows: { label: string; text: string; attention?: boolean }[] = [];
+  const c = s.claim_counts ?? {};
+  const n = (k: string) => (typeof c[k] === "number" ? c[k] : 0);
+  const parts = [n("contradicted") && `${n("contradicted")} contradicted by a check`, n("supported") && `${n("supported")} backed by a check`, n("unsupported") && `${n("unsupported")} with no check of its kind`].filter(Boolean);
+  rows.push({ label: "Agent says", text: parts.length ? `its claims: ${parts.join(", ")} (its words stay on its machine)` : "its words stay on its machine", attention: n("contradicted") > 0 });
+  for (const o of words(s.observed)) rows.push({ label: "05 saw", text: o });
+  if (typeof s.checked === "string" && s.checked) rows.push({ label: "Checked", text: s.checked });
+  for (const x of words(s.needs_you)) rows.push({ label: "Needs you", text: x, attention: true });
+  const unknown = words(s.not_known);
+  if (unknown.length) rows.push({ label: "Not known", text: unknown.join("; ") });
+  return rows;
+}
+
+/// What an environment's newest deployment record says (D93), in the machine's terms: never more
+/// than the record. No record, or one with no probes, says 05 cannot tell what runs there.
+export function deployWords(env?: { deployed?: { confirmed?: unknown; probes?: unknown; action?: unknown } | null } | null): string {
+  const d = env?.deployed;
+  if (!d) return "no deploy record";
+  if (d.probes === 0) return "no probes: 05 cannot tell what it runs";
+  if (d.confirmed === true) return "deploy confirmed";
+  if (d.action === "reverted") return "not confirmed, reverted";
+  if (d.action === "rollback-command") return "not confirmed, rollback command run";
+  return "deploy not confirmed";
+}
+
+/// How many commits wait to come up from the environment below, or nothing.
+export function waitingWords(env?: { waiting?: unknown; from?: unknown } | null): string | null {
+  const n = env?.waiting;
+  if (typeof n !== "number" || n <= 0 || typeof env?.from !== "string") return null;
+  return `${n} commit${n === 1 ? "" : "s"} from ${env.from} can come up`;
+}
+
 /// The exact moment, in the person's own time zone: what a tooltip shows beside "3 h ago".
 export function stamp(when?: string | null): string {
   if (!when) return "";

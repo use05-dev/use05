@@ -1,0 +1,7 @@
+✓ prod runs <TREE12>: confirmed
+  commit         <TREE12> (origin/prod)
+  deploy         confirmed: prod runs <TREE12>
+  probe version  showed it on the first try
+  record         on 05-receipts/<ID>
+  Here this is advisory: a deployment record this machine signs is its own word. With [evidence]
+  accept = ["runner"] only CI's count; CI can run use05 promote prod --confirm.

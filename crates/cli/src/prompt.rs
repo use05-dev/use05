@@ -1,9 +1,107 @@
 //! Questions on the terminal, with a default for each: Enter accepts it. Reads and writes plain
 //! streams, so the guided setup can be driven by a script or a test as well as a person.
 
-use std::io::{BufRead, Write};
+use std::io::{BufRead, Read, Write};
+use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, channel};
+use std::time::Duration;
 
 use crate::ui::{Glyph, Tone, Ui};
+
+/// How long a guided question waits for a person before the setup gives up (D98).
+const NO_ANSWER_SECS: u64 = 600;
+
+/// The wait, in seconds. `USE05_PROMPT_TIMEOUT_SECS` is internal, for tests to shorten it: it is
+/// not documented and not a setting.
+pub fn answer_limit_secs() -> u64 {
+    std::env::var("USE05_PROMPT_TIMEOUT_SECS").ok().and_then(|v| v.parse().ok()).filter(|n| *n > 0).unwrap_or(NO_ANSWER_SECS)
+}
+
+/// What is said when nobody answered: `No answer in 10 minutes; nothing was written.`
+pub fn no_answer_message() -> String {
+    let secs = answer_limit_secs();
+    let span = match secs {
+        s if s % 60 == 0 => format!("{} minute{}", s / 60, if s == 60 { "" } else { "s" }),
+        1 => "1 second".to_string(),
+        s => format!("{s} seconds"),
+    };
+    format!("No answer in {span}; nothing was written.")
+}
+
+/// Questions on stdin, written to stderr, that stop waiting after the answer limit (D98).
+pub fn on_stdin(ui: Ui) -> Asker<TimedReader, std::io::Stderr> {
+    Asker::styled(TimedReader::new(std::io::stdin(), Duration::from_secs(answer_limit_secs())), std::io::stderr(), ui)
+}
+
+/// A source that gives up waiting: a thread reads `source` one request at a time, and `fill_buf`
+/// fails with `TimedOut` when nothing arrives within `limit`. The end of the input still ends it
+/// at once, as for any reader. Nothing is read ahead of a question, so other readers of the same
+/// input lose nothing.
+pub struct TimedReader {
+    ask: Sender<()>,
+    got: Receiver<std::io::Result<Vec<u8>>>,
+    limit: Duration,
+    buf: Vec<u8>,
+    pos: usize,
+}
+
+impl TimedReader {
+    pub fn new<S: Read + Send + 'static>(mut source: S, limit: Duration) -> TimedReader {
+        let (ask, wanted) = channel::<()>();
+        let (send, got) = channel();
+        std::thread::spawn(move || {
+            while wanted.recv().is_ok() {
+                let mut chunk = vec![0u8; 4096];
+                let read = source.read(&mut chunk).map(|n| {
+                    chunk.truncate(n);
+                    chunk
+                });
+                let end = matches!(&read, Ok(c) if c.is_empty());
+                if send.send(read).is_err() || end {
+                    break;
+                }
+            }
+        });
+        TimedReader { ask, got, limit, buf: Vec::new(), pos: 0 }
+    }
+}
+
+impl Read for TimedReader {
+    fn read(&mut self, out: &mut [u8]) -> std::io::Result<usize> {
+        let n = {
+            let have = self.fill_buf()?;
+            let n = have.len().min(out.len());
+            out[..n].copy_from_slice(&have[..n]);
+            n
+        };
+        self.consume(n);
+        Ok(n)
+    }
+}
+
+impl BufRead for TimedReader {
+    fn fill_buf(&mut self) -> std::io::Result<&[u8]> {
+        if self.pos >= self.buf.len() {
+            let _ = self.ask.send(());
+            match self.got.recv_timeout(self.limit) {
+                Ok(read) => {
+                    self.buf = read?;
+                    self.pos = 0;
+                }
+                Err(RecvTimeoutError::Timeout) => return Err(std::io::ErrorKind::TimedOut.into()),
+                // The reading thread ended after the end of the input.
+                Err(RecvTimeoutError::Disconnected) => {
+                    self.buf.clear();
+                    self.pos = 0;
+                }
+            }
+        }
+        Ok(&self.buf[self.pos..])
+    }
+
+    fn consume(&mut self, n: usize) {
+        self.pos = (self.pos + n).min(self.buf.len());
+    }
+}
 
 /// Asks questions on `output` and reads answers from `input`. Every answer is optional: `None`
 /// means the input ended, and the caller stops without changing anything.
@@ -14,6 +112,8 @@ pub struct Asker<R: BufRead, W: Write> {
     /// The answers do not come from a person typing (a pipe, a file): end each answer's line
     /// ourselves, as their Enter would have.
     echo_newline: bool,
+    /// The last read gave up waiting for a person (as opposed to the input ending).
+    timed_out: bool,
 }
 
 /// A bad answer is asked again this many times; then the default stands.
@@ -23,13 +123,18 @@ impl<R: BufRead, W: Write> Asker<R, W> {
     /// Plain output, as for a test.
     #[cfg(test)]
     pub fn new(input: R, output: W) -> Self {
-        Asker { input, output, ui: Ui::fixed(80, true), echo_newline: false }
+        Asker { input, output, ui: Ui::fixed(80, true), echo_newline: false, timed_out: false }
     }
 
     /// Styled for the terminal `ui` describes: colour, Unicode and width when it has them.
     pub fn styled(input: R, output: W, ui: Ui) -> Self {
         use std::io::IsTerminal;
-        Asker { input, output, ui, echo_newline: !std::io::stdin().is_terminal() }
+        Asker { input, output, ui, echo_newline: !std::io::stdin().is_terminal(), timed_out: false }
+    }
+
+    /// The questions stopped because nobody answered in time, not because the input ended.
+    pub fn timed_out(&self) -> bool {
+        self.timed_out
     }
 
     #[cfg(test)]
@@ -142,6 +247,10 @@ impl<R: BufRead, W: Write> Asker<R, W> {
         let _ = self.output.flush();
         let mut line = String::new();
         let read = match self.input.read_line(&mut line) {
+            Err(e) if e.kind() == std::io::ErrorKind::TimedOut => {
+                self.timed_out = true;
+                None
+            }
             Ok(0) | Err(_) => None,
             Ok(_) => Some(line.trim().to_string()),
         };
@@ -282,6 +391,32 @@ mod tests {
         let shown = String::from_utf8(a.output().clone()).unwrap();
         assert!(shown.contains("2/7  Where changes land"), "{shown}");
         assert!(shown.contains("Changes land on   main") && shown.contains("Approvals         1"), "aligned: {shown}");
+    }
+
+    #[test]
+    fn a_question_nobody_answers_times_out_but_the_end_of_input_does_not() {
+        struct Waits(Receiver<Vec<u8>>);
+        impl Read for Waits {
+            fn read(&mut self, out: &mut [u8]) -> std::io::Result<usize> {
+                let bytes = self.0.recv().unwrap_or_default();
+                out[..bytes.len()].copy_from_slice(&bytes);
+                Ok(bytes.len())
+            }
+        }
+        let (typed, source) = channel();
+        let mut a = Asker::new(TimedReader::new(Waits(source), Duration::from_millis(200)), Vec::new());
+        typed.send(b"2\n".to_vec()).unwrap();
+        assert_eq!(a.choice("Pick", &["a", "b"], 0), Some(1));
+        assert!(!a.timed_out());
+        assert_eq!(a.choice("Pick", &["a", "b"], 0), None, "nothing typed within the limit");
+        assert!(a.timed_out());
+        // Closing the input is the end of the input, at once, and is not a time out.
+        let (typed, source) = channel();
+        drop(typed);
+        let mut a = Asker::new(TimedReader::new(Waits(source), Duration::from_secs(30)), Vec::new());
+        let started = std::time::Instant::now();
+        assert_eq!(a.choice("Pick", &["a", "b"], 0), None);
+        assert!(!a.timed_out() && started.elapsed() < Duration::from_secs(5));
     }
 
     #[test]

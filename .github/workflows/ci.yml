@@ -23,7 +23,17 @@ jobs:
       - name: Toolchain
         run: rustup update stable && rustc --version && git --version
 
+      # The CI gate's checks run as this user; the runner crate's isolation test runs them as it,
+      # made the same way 05-gate.yml makes it (this job has passwordless sudo).
+      - name: The check user
+        if: runner.os == 'Linux'
+        run: |
+          sudo useradd --create-home --shell /bin/bash use05-check
+          echo use05-check | sudo tee -a /etc/cron.deny /etc/at.deny >/dev/null
+
       - name: Tests
+        env:
+          USE05_TEST_SUDO: ${{ runner.os == 'Linux' && '1' || '' }}
         run: cargo test --workspace --release
 
       - name: Prove and verify on the CI runner (a different launcher)

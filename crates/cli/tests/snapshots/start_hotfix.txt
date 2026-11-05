@@ -1,0 +1,13 @@
+✓ Started: Fix it again
+  task    <TASK> by unverified (made at this machine)
+  from    <PROD10>
+  intent  inferred (no card); scope drift cannot be checked
+  hotfix  prod: from origin/prod at <TREE12>, lands on prod
+  branch  05/hotfix-prod-<TASK>
+  A hotfix always needs a person's approval of its outcome before it lands on prod; no setting or
+  bypass removes that.
+  Once it lands, promoting into prod is refused until the fix is merged down, one rung at a time:
+  use05 promote uat --back.
+
+Next: do the work, then: use05 finish; a person approves it (use05 approve --outcome); then: use05
+      land --push

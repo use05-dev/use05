@@ -1,0 +1,12 @@
+✓ Rolled prod back to <TREE12>: <TREE12> holds its files
+  reverted  <TREE12> → <TREE12>: the files of <TREE12>
+  pushed    prod → origin, now at <TREE12>, a new commit
+  by        this machine
+  record    on 05-receipts/<ID>
+  deploy    no probes: 05 cannot tell what prod runs
+  prod now has a commit uat lacks (the revert), so promoting into prod is refused until uat has it
+  too.
+  Not confirmed: give prod a probe ([[environment.probe]] in .05/policy.toml), a command that
+  prints the commit prod runs; then run use05 promote prod --confirm.
+  Here this is advisory: it is what CI checks, but nothing stops a person or an agent who pushes
+  prod's branch by hand. The CI gate on prod's branch is the strong control.

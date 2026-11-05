@@ -80,15 +80,19 @@ export function Online({ on }: { on: boolean }) {
   return <span className={`dot${on ? " on" : ""}`} role="img" aria-label={on ? "online" : "offline"} />;
 }
 
-/// The 05 ring with its gap. Unsealed, the dot waits outside; sealed, it closes the gap.
+/// The zero from the 05 logo, striped. Unsealed, the red dot waits outside; sealed, it sits in the counter.
+const ZERO = "M60 0H108A60 60 0 0 1 168 60V140A60 60 0 0 1 108 200H60A60 60 0 0 1 0 140V60A60 60 0 0 1 60 0Z" +
+  "M62 37H106A14 14 0 0 1 120 51V149A14 14 0 0 1 106 163H62A14 14 0 0 1 48 149V51A14 14 0 0 1 62 37Z";
+const BARS = [0, 42, 84, 126, 168];
 export function Seal({ sealed, children }: { sealed: boolean; children: ReactNode }) {
-  const rings = [40, 46, 52, 58];
   return (
     <div className={`seal${sealed ? " sealed" : ""}`}>
       <svg viewBox="0 0 128 128" aria-hidden="true">
-        {rings.map((r) => <circle key={r} className="engraving" cx="64" cy="64" r={r} />)}
-        <path className="ring" d="M 98.3 41.7 A 41 41 0 1 1 86.3 29.6" />
-        <circle className="dot-mark" cx="94" cy="34" r="9" />
+        <defs><clipPath id="seal-bars">{BARS.map((y) => <rect key={y} x="-1" y={y} width="170" height="32" />)}</clipPath></defs>
+        <g transform="translate(22 14) scale(0.5)">
+          <path className="zero" fillRule="evenodd" clipPath="url(#seal-bars)" d={ZERO} />
+          <circle className="dot-mark" cx="84" cy="100" r="21" />
+        </g>
       </svg>
       <div className="stack">{children}</div>
     </div>

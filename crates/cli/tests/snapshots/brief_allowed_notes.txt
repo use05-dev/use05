@@ -1,5 +1,13 @@
 Brief  Docs only                                                                       task <TASK>
 ────────────────────────────────────────────────────────────────────────────────────────────────────
+Story      asked: not recorded
+           agent says: nothing yet
+           05 saw: 1 file changed in the top folder · +1 −1
+           05 saw: 1 file outside the plan
+           checked: 1 passed on the machine that ran it (advisory: an agent can run as its user)
+           not known: behaviour beyond these checks; what the checks test: no file in the tree is
+           named like a test
+
 Intent     no goal written
            owner no owner yet (no approver key when this task started, and nobody has signed)
            scope docs/**
@@ -25,3 +33,6 @@ Undo       git stash push (keeps your work; nothing is deleted)
 ────────────────────────────────────────────────────────────────────────────────────────────────────
 ✓ ALLOW  read the notes: 1
   1. 1 file(s) changed outside the declared scope
+
+  Checks: 1 passed on the machine that ran it (advisory: an agent can run as its user)
+  Behaviour beyond these checks: not assessed

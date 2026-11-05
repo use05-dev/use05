@@ -49,6 +49,33 @@ pub fn fetch(top: &Path, remote: &str, branch: &str, timeout: Duration) -> Resul
 /// Run git against a remote (a fetch, a push): never asking for a password or passphrase, and
 /// giving up after `timeout`, leaving nothing running.
 pub fn quiet_git(top: &Path, args: &[&str], timeout: Duration) -> Result<(), String> {
+    run_quiet(top, args, timeout, Stdio::null(), Stdio::null())
+}
+
+/// As [`quiet_git`], keeping what git printed: its output on success, else its error output's
+/// first lines (or how it failed). Kept in files, not pipes, so a helper git leaves running
+/// (ssh) cannot hold the wait open.
+pub fn quiet_git_output(top: &Path, args: &[&str], timeout: Duration) -> Result<String, String> {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let file = |kind: &str| std::env::temp_dir().join(format!("use05-git-{}-{n}.{kind}", std::process::id()));
+    let (out_path, err_path) = (file("out"), file("err"));
+    let made = |path: &Path| std::fs::OpenOptions::new().write(true).create_new(true).open(path).map_err(|e| format!("a temporary file could not be made ({e})"));
+    let ran = match (made(&out_path), made(&err_path)) {
+        (Ok(out), Ok(err)) => run_quiet(top, args, timeout, Stdio::from(out), Stdio::from(err)),
+        (Err(e), _) | (_, Err(e)) => Err(e),
+    };
+    let read = |path: &Path| std::fs::read(path).map(|b| String::from_utf8_lossy(&b).into_owned()).unwrap_or_default();
+    let (said, errors) = (read(&out_path), read(&err_path));
+    let _ = std::fs::remove_file(&out_path);
+    let _ = std::fs::remove_file(&err_path);
+    match ran {
+        Ok(()) => Ok(said),
+        Err(how) => Err(if errors.trim().is_empty() { how } else { errors.trim().to_string() }),
+    }
+}
+
+fn run_quiet(top: &Path, args: &[&str], timeout: Duration, stdout: Stdio, stderr: Stdio) -> Result<(), String> {
     let mut cmd = Command::new("git");
     cmd.arg("-C")
         .arg(top)
@@ -58,8 +85,8 @@ pub fn quiet_git(top: &Path, args: &[&str], timeout: Duration) -> Result<(), Str
         .env("LC_ALL", "C")
         // No pipes: nothing here waits on what a helper keeps open.
         .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null());
+        .stdout(stdout)
+        .stderr(stderr);
     // Its own process group, so a helper git starts (ssh) goes when git is given up on.
     #[cfg(unix)]
     std::os::unix::process::CommandExt::process_group(&mut cmd, 0);

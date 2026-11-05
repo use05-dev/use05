@@ -1,0 +1,24 @@
+✗ Promoted uat → prod: <TREE12> (fast-forward), but the deploy was not confirmed; 05 reverted
+  prod to <TREE12>
+  moved          1 commit · 1 file · +1 −0 · fast-forward <TREE12> (origin/uat)
+  pushed         prod → origin, now at <TREE12>
+  rules          source_checks pass · source_confirmed fail · soak skipped · migrations pass ·
+                 untasked fail · sign_off skipped
+  rollback       <TREE12>
+  by             this machine
+  record         on 05-receipts/<ID>
+  deploy         not confirmed: prod did not show it runs <TREE12>
+  probe version  did not show <TREE12> (1 try)
+  reverted       prod → origin, now at <TREE12>: the files of <TREE12>, as a new commit
+  its deploy     not confirmed: prod did not show it runs <TREE12>
+  prod now has a commit uat lacks (the revert), so promoting into prod is refused until uat has it
+  too.
+  A fast-forward makes no commit of its own, so the promotion's trailers are only in its record.
+  warn SOURCE_NOT_CONFIRMED: nothing confirms uat runs <TREE12>: there is no deployment record
+  of it
+  warn UNTASKED_COMMITS: 1 commit that would move belongs to no 05 task: <TREE12>
+  Here this is advisory: it is the judgement CI makes, but nothing stops a person or an agent who
+  pushes prod's branch by hand. The CI gate on prod's branch is the strong control.
+
+Next: look at prod: it was reverted to <TREE12>'s files, and 05 could not confirm it runs
+      <TREE12>

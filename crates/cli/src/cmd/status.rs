@@ -179,11 +179,15 @@ fn gather(ui: &Ui, repo: &Path) -> Status {
                 Decision::Deny => (Glyph::Bad, Tone::Bad, "DENY"),
             };
             let notes = g.findings.iter().filter(|f| f.effect == Effect::Warn).count();
-            let summary = match (blockers.len(), use05_core::brief::label_of(&g)) {
+            let mut summary = match (blockers.len(), use05_core::brief::label_of(&g)) {
                 (0, use05_core::brief::Label::Allow) => "nothing to read".to_string(),
                 (0, _) => format!("read the notes: {notes}"),
                 (n, _) => format!("{n} thing{} hold{} it back", if n == 1 { "" } else { "s" }, if n == 1 { "s" } else { "" }),
             };
+            // Let through with no check run: said beside the verdict (D101).
+            if let Some(q) = use05_core::brief::assurance(&g, false).qualifier().filter(|_| g.decision == Decision::Allow) {
+                summary.push_str(&format!(" ({q})"));
+            }
             let v = vec![Item::plain(format!("{n} staged file{}", if n == 1 { "" } else { "s" })), Item { glyph: Some((glyph, tone)), text: format!("{word}  {summary}"), dim: false, columns: false }];
             next = blockers.iter().find_map(|f| f.next.clone());
             menu.push(("See the full brief".into(), Action::Run(vec!["brief".into()])));

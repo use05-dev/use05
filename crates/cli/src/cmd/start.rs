@@ -16,6 +16,8 @@ pub struct Args {
     pub check: Vec<String>,
     pub no_new_deps: bool,
     pub card: Option<PathBuf>,
+    /// A hotfix of this environment (D93): start from its branch on origin, land there.
+    pub hotfix: Option<String>,
     pub session: Option<String>,
     pub repo: PathBuf,
 }
@@ -54,7 +56,7 @@ fn agent_kind(task: &use05_core::task::Task) -> Option<&str> {
 /// Sign what the author said they did, for the tree they finished on.
 pub fn publish_completion(ctx: &Ctx, task: &use05_core::task::Task) {
     let Ok(target) = ctx.target(None) else { return };
-    let predicate = use05_receipt::Completion { task: task.id.clone(), outcome: task.outcome.clone().unwrap_or_default(), finished: task.finished.clone().unwrap_or_else(use05_core::time::now_rfc3339) };
+    let predicate = use05_receipt::Completion { task: task.id.clone(), outcome: task.outcome.clone().unwrap_or_default(), finished: task.finished.clone().unwrap_or_else(use05_core::time::now_rfc3339), base: use05_core::promote::finish_base(ctx.top(), &use05_core::branches::task_target(&ctx.policy, task, ctx.top())) };
     let statement = use05_receipt::Statement::new(vec![use05_receipt::tree_subject(&target.oid, &target.digest)], predicate);
     sign_and_store(ctx, task, &target.oid, &statement);
     crate::extend::announce_finished(ctx, task, agent_kind(task), &target.oid);
@@ -203,8 +205,31 @@ pub fn run(args: Args) -> Report {
         );
     }
 
+    // A hotfix starts from its environment's branch on origin, on a working branch of its own,
+    // made only once nothing else refuses the start, and taken away again if the start fails.
+    let begin = || match args.hotfix.as_deref() {
+        Some(env) => crate::cmd::hotfix::begin(&ctx, env).map(Some),
+        None => Ok(None),
+    };
+
     if let Some((agent, session)) = hooked_session(ctx.top()) {
-        return leave_in_inbox("start", ctx.top(), agent, session, inbox::Entry::Start { title: args.title.clone(), card }, args.title.trim());
+        let begun = match begin() {
+            Ok(b) => b,
+            Err(r) => return r,
+        };
+        let mut report = leave_in_inbox("start", ctx.top(), agent, session, inbox::Entry::Start { title: args.title.clone(), card, hotfix: begun.as_ref().map(|b| b.env.name.clone()) }, args.title.trim());
+        if let Some(b) = &begun {
+            if report.exit != 0 {
+                b.undo(ctx.top());
+                return report;
+            }
+            report.rows.extend(hotfix_rows(b));
+            report.notes.extend(hotfix_notes(&ctx, b));
+            report.details["hotfix"] = json!(b.env.name);
+            report.details["target"] = json!(b.env.branch);
+            report.details["branch"] = json!(b.branch);
+        }
+        return report;
     }
 
     // Another task already holds part of this scope (D64).
@@ -221,13 +246,23 @@ pub fn run(args: Args) -> Report {
         }
     }
 
+    let begun = match begin() {
+        Ok(b) => b,
+        Err(r) => return r,
+    };
     let task = match ctx.store.create(&args.title, UNVERIFIED, card.clone(), args.session.as_deref()) {
         Ok(t) => t,
-        Err(e) => return Report::from_core("start", e),
+        Err(e) => {
+            if let Some(b) = &begun {
+                b.undo(ctx.top());
+            }
+            return Report::from_core("start", e);
+        }
     };
     let _ = use05_core::log::append(&ctx.store.state_dir(), &task.id, json!({ "event": "start", "title": task.title, "author": task.author }));
     let mut task = task;
     task.owner = use05_core::task::local_owner(ctx.top());
+    task.hotfix = begun.as_ref().map(|b| b.env.name.clone());
     let _ = ctx.store.save(&task);
     if task.intent.is_some() {
         task.sealed = Some(task.created.clone());
@@ -256,8 +291,15 @@ pub fn run(args: Args) -> Report {
         }
         None => rows.push(("intent".into(), "inferred (no card); scope drift cannot be checked".into())),
     }
+    let mut notes: Vec<String> = overlap_note.into_iter().collect();
+    if let Some(b) = &begun {
+        rows.extend(hotfix_rows(b));
+        notes.extend(hotfix_notes(&ctx, b));
+    }
 
-    let next = if risk == Risk::High && card.is_some() {
+    let next = if begun.is_some() {
+        "do the work, then: use05 finish; a person approves it (use05 approve --outcome); then: use05 land --push"
+    } else if risk == Risk::High && card.is_some() {
         "this reaches a protected area. Ask a person to approve the intent first: use05 approve --intent"
     } else {
         "do the work, then: use05 prove   and   use05 brief"
@@ -269,12 +311,30 @@ pub fn run(args: Args) -> Report {
         tone: Tone::Good,
         headline: format!("Started: {}", task.title),
         rows,
-        notes: overlap_note.into_iter().collect(),
+        notes,
         next: Some(next.into()),
         excerpt: vec![],
-        details: json!({ "task": task.id, "author": task.author, "base_commit": task.base_commit, "risk": risk, "intent_sha256": task.intent_sha256, "card": card }),
+        details: json!({
+            "task": task.id, "author": task.author, "base_commit": task.base_commit, "risk": risk, "intent_sha256": task.intent_sha256, "card": card,
+            "hotfix": begun.as_ref().map(|b| &b.env.name), "target": begun.as_ref().map(|b| &b.env.branch), "branch": task.branch,
+        }),
         exit: 0,
     }
+}
+
+/// What a hotfix's start says about where it lands.
+fn hotfix_rows(b: &crate::cmd::hotfix::Begun) -> Vec<(String, String)> {
+    vec![("hotfix".into(), format!("{}: from {} at {}, lands on {}", b.env.name, b.from, use05_core::promote::short(&b.base), b.env.branch)), ("branch".into(), b.branch.clone())]
+}
+
+/// What a hotfix asks, and what it means for promoting afterwards.
+fn hotfix_notes(ctx: &Ctx, b: &crate::cmd::hotfix::Begun) -> Vec<String> {
+    let mut notes = b.notes.clone();
+    notes.push(format!("A hotfix always needs a person's approval of its outcome before it lands on {}; no setting or bypass removes that.", b.env.branch));
+    if let Some(below) = ctx.policy.source_of(&b.env) {
+        notes.push(format!("Once it lands, promoting into {} is refused until the fix is merged down, one rung at a time: use05 promote {} --back.", b.env.name, below.name));
+    }
+    notes
 }
 
 /// `use05 finish`: record what the author says they did. An assertion until evidence supports it.

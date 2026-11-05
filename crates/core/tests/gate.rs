@@ -10,7 +10,7 @@ use tempfile::TempDir;
 use use05_core::evidence::{Holder, Trust, TrustedKey};
 use use05_core::gate::{Decision, Effect, GateInput, GateResult, StaleBase, evaluate};
 use use05_core::intent::{IntentCard, Scope};
-use use05_core::policy::{CheckDef, IntentMode, LocalTesting, Policy, Require, Role, Severity, TestingPolicy};
+use use05_core::policy::{CheckDef, IntentMode, LocalTesting, OwnerRule, Policy, Require, Role, Severity, SignerGroup, TestingPolicy};
 use use05_core::task::Task;
 use use05_core::time::{now_rfc3339, now_secs, rfc3339};
 use use05_core::{git, store};
@@ -81,6 +81,9 @@ fn prove_and_store(repo: &Repo, argv: &[&str], name: &str, signer: &SigningKey) 
         timeout: Duration::from_secs(30),
         pass_env: vec![],
         check: Some(name.to_string()),
+        check_user: None,
+        dir: None,
+        lfs: false,
     })
     .unwrap();
     let envelope = seal(&statement, signer).to_json_bytes();
@@ -151,6 +154,7 @@ fn approval(scope: ApprovalScope, vote: Vote, policy: &Policy, who: &str, expire
         approver: who.into(),
         created: now_rfc3339(),
         expires: rfc3339((now_secs() as i64 + expires_in) as u64),
+        hotfix: None,
     }
 }
 
@@ -187,6 +191,7 @@ fn task_with(card: Option<IntentCard>, outcome: Option<&str>) -> Task {
         owner: None,
         sandbox: None,
         fresh: None,
+        hotfix: None,
     }
 }
 
@@ -250,6 +255,100 @@ fn evidence_from_a_role_policy_does_not_accept_does_not_count() {
 
     prove_and_store(&repo, &["./ok.sh"], "test", &ci);
     assert_eq!(c.gate().decision, Decision::Allow);
+}
+
+// ---------------------------------------------------------------------------- monorepo checks (D97)
+
+/// A policy whose one check, `api`, is required only when `api/**` or the lockfile changes.
+fn scoped_policy() -> Policy {
+    let mut policy = policy_with(&[("api", &["./ok.sh"])]);
+    policy.check[0].paths = vec!["api/**".into(), "Cargo.lock".into()];
+    policy
+}
+
+fn state_of<'a>(r: &'a GateResult, name: &str) -> &'a use05_core::gate::CheckState {
+    &r.checks.iter().find(|c| c.name == name).unwrap_or_else(|| panic!("no check {name}")).state
+}
+
+#[test]
+fn a_check_scoped_to_other_paths_is_not_required() {
+    let repo = Repo::new();
+    let c = ctx(&repo, scoped_policy(), vec![]);
+    repo.write("src/lib.rs", "pub fn f() { /* not the api */ }\n");
+    let r = c.gate();
+    assert!(matches!(state_of(&r, "api"), use05_core::gate::CheckState::NotRequired { reason: "no change in its paths", result: None }), "{:?}", state_of(&r, "api"));
+    assert_eq!(r.decision, Decision::Allow, "{:?}", codes(&r));
+    assert!(!r.checks[0].required && !codes(&r).contains(&"CHECK_MISSING"), "it never counts as missing");
+    let json = serde_json::to_value(&r.checks[0]).unwrap();
+    assert_eq!((json["state"].as_str(), json["reason"].as_str(), json["required"].as_bool()), (Some("not_required"), Some("no change in its paths"), Some(false)));
+}
+
+#[test]
+fn a_check_scoped_to_touched_paths_is_required() {
+    let repo = Repo::new();
+    let me = key(1);
+    let c = ctx(&repo, scoped_policy(), vec![trusted("me", Role::Local, &me)]);
+    repo.write("api/handler.rs", "pub fn h() {}\n");
+    let r = c.gate();
+    assert!(matches!(state_of(&r, "api"), use05_core::gate::CheckState::Missing), "{:?}", state_of(&r, "api"));
+    assert_eq!(r.decision, Decision::Wait);
+    assert!(r.checks[0].required);
+    prove_and_store(&repo, &["./ok.sh"], "api", &me);
+    assert_eq!(c.gate().decision, Decision::Allow);
+
+    // The root lockfile, named in the check's paths, calls for it too.
+    let other = Repo::new();
+    let c = ctx(&other, scoped_policy(), vec![]);
+    other.write("Cargo.lock", "# changed\n");
+    assert!(matches!(state_of(&c.gate(), "api"), use05_core::gate::CheckState::Missing));
+}
+
+#[test]
+fn a_check_without_paths_is_required_for_every_change() {
+    let repo = Repo::new();
+    let c = ctx(&repo, policy_with(&[("api", &["./ok.sh"])]), vec![]);
+    repo.write("src/lib.rs", "pub fn f() { /* anything */ }\n");
+    assert!(matches!(state_of(&c.gate(), "api"), use05_core::gate::CheckState::Missing));
+}
+
+#[test]
+fn a_receipt_for_a_check_that_was_not_required_is_shown_but_does_not_decide() {
+    let repo = Repo::new();
+    let me = key(1);
+    let c = ctx(&repo, scoped_policy(), vec![trusted("me", Role::Local, &me)]);
+    repo.write("src/lib.rs", "pub fn f() { /* not the api */ }\n");
+    prove_and_store(&repo, &["./bad.sh"], "api", &me);
+    let r = c.gate();
+    assert_eq!(r.decision, Decision::Allow, "a failure of a check that was not required blocks nothing: {:?}", codes(&r));
+    // The receipt is for a different command than the policy's, so it is not shown; the policy's own is.
+    assert!(matches!(state_of(&r, "api"), use05_core::gate::CheckState::NotRequired { result: None, .. }));
+    prove_and_store(&repo, &["./ok.sh"], "api", &me);
+    match state_of(&c.gate(), "api") {
+        use05_core::gate::CheckState::NotRequired { result: Some(seen), .. } => assert_eq!((seen.status, seen.by.name.as_str()), (Status::Passed, "me")),
+        other => panic!("{other:?}"),
+    }
+}
+
+#[test]
+fn a_check_the_card_asks_for_is_required_whatever_its_paths() {
+    let repo = Repo::new();
+    let mut c = ctx(&repo, scoped_policy(), vec![]);
+    c.task = Some(task_with(Some(IntentCard { acceptance: vec!["api".into()], ..Default::default() }), None));
+    repo.write("src/lib.rs", "pub fn f() { /* not the api */ }\n");
+    assert!(matches!(state_of(&c.gate(), "api"), use05_core::gate::CheckState::Missing));
+}
+
+#[test]
+fn the_same_command_in_another_folder_is_another_check() {
+    let repo = Repo::new();
+    let me = key(1);
+    let mut policy = policy_with(&[("api", &["./ok.sh"])]);
+    policy.check[0].dir = Some("src".into());
+    let c = ctx(&repo, policy, vec![trusted("me", Role::Local, &me)]);
+    repo.write("src/lib.rs", "pub fn f() { /* edit */ }\n");
+    // Proved at the root, not in src: the policy's check has not been proved.
+    prove_and_store(&repo, &["./ok.sh"], "api", &me);
+    assert!(matches!(state_of(&c.gate(), "api"), use05_core::gate::CheckState::Missing), "a receipt of the command run elsewhere is not the check");
 }
 
 #[test]
@@ -427,7 +526,7 @@ fn break_glass_lets_exactly_one_tree_through_and_says_what_it_overrode() {
     let bypass = |expires_in: i64, signer: &SigningKey, tree: &str, digest: &str| {
         let s = Statement::new(
             vec![tree_subject(tree, digest)],
-            Bypass { reason: "prod is down".into(), by: "alice".into(), findings: vec![], created: now_rfc3339(), expires: rfc3339((now_secs() as i64 + expires_in) as u64) },
+            Bypass { env: None, from: None, rule: None, policy_sha256: None, reason: "prod is down".into(), by: "alice".into(), findings: vec![], created: now_rfc3339(), expires: rfc3339((now_secs() as i64 + expires_in) as u64) },
         );
         store::put(repo.path(), tree, &seal(&s, signer).to_json_bytes(), &key_id(&signer.verifying_key())).unwrap();
     };
@@ -1084,7 +1183,7 @@ fn a_bypass_signed_by_a_passkey_does_not_count() {
     let (_, tree, digest) = repo.stage();
     let statement = Statement::new(
         vec![tree_subject(&tree, &digest)],
-        Bypass { reason: "prod is down".into(), by: "owner".into(), findings: vec![], created: now_rfc3339(), expires: rfc3339(now_secs() + 3600) },
+        Bypass { env: None, from: None, rule: None, policy_sha256: None, reason: "prod is down".into(), by: "owner".into(), findings: vec![], created: now_rfc3339(), expires: rfc3339(now_secs() + 3600) },
     );
     store::put(repo.path(), &tree, &passkey_seal(&serde_json::to_vec(&statement).unwrap(), &sk), &key.id()).unwrap();
     let found = use05_core::evidence::classify(&trust, &store::find_all(repo.path()));
@@ -1114,7 +1213,7 @@ fn a_passkey_signs_approvals_and_nothing_else_counts() {
             Declaration { task: "task1".into(), title: "t".into(), author: "agent:x".into(), card: serde_json::json!({}), sealed: now_rfc3339(), policy_sha256: "p".into(), agent: None, owner: None, sandbox: None },
         ))
         .unwrap(),
-        serde_json::to_vec(&Statement::new(vec![tree_subject(&tree, &digest)], Completion { task: "task1".into(), outcome: "o".into(), finished: now_rfc3339() })).unwrap(),
+        serde_json::to_vec(&Statement::new(vec![tree_subject(&tree, &digest)], Completion { task: "task1".into(), outcome: "o".into(), finished: now_rfc3339(), base: None })).unwrap(),
         serde_json::to_vec(&Statement::new(vec![log_subject("task1", "ab")], LogSeal { task: "task1".into(), seq: 1, head: "ab".into(), created: now_rfc3339() })).unwrap(),
     ];
     let raws: Vec<store::Raw> = bodies.iter().enumerate().map(|(i, b)| store::Raw { source: "test".into(), path: format!("r{i}"), bytes: passkey_seal(b, &sk) }).collect();
@@ -1280,3 +1379,429 @@ fn a_passkey_approval_prepared_and_co_signed_by_the_ci_runner_counts() {
     let r = c.gate();
     assert_eq!(r.decision, Decision::Allow, "{:?} {:?}", codes(&r), r.approvals);
 }
+
+// ---------------------------------------------------------------------------- path owners (D92)
+
+/// `billing/**` owned by eng-managers (Dana, Lee), `min` of them, and protected, so the approval
+/// the driver gives today is still asked for.
+fn owners_policy(min: u32) -> Policy {
+    let mut p = Policy::default();
+    p.protect.paths = vec!["billing/**".into()];
+    p.signer = vec![SignerGroup { name: "eng-managers".into(), people: vec!["Dana".into(), "Lee".into()] }];
+    p.protect.owner = vec![OwnerRule { paths: vec!["billing/**".into()], signers: vec!["eng-managers".into()], min }];
+    p
+}
+
+/// An approver key the policy names as `person`'s.
+fn persons_key(person: &str, k: &SigningKey) -> TrustedKey {
+    TrustedKey { holder: Holder::Person(person.into()), ..trusted(person, Role::Approver, k) }
+}
+
+fn persons_passkey(person: &str, key: &PublicKey) -> TrustedKey {
+    TrustedKey { holder: Holder::Person(person.into()), ..trusted_passkey(person, key) }
+}
+
+fn driven_by(person: &str) -> Option<Task> {
+    let mut t = task_with(None, None);
+    t.owner = Some(use05_core::task::Owner { name: person.into(), key_id: format!("key-of-{person}") });
+    Some(t)
+}
+
+/// `approver`'s passkey approves the outcome, prepared and co-signed by `machine` (if any).
+fn passkey_approves(repo: &Repo, policy: &Policy, approver: &str, sk: &p256::ecdsa::SigningKey, pk: &PublicKey, machine: Option<&SigningKey>) {
+    let (_, tree, digest) = repo.stage();
+    let body = serde_json::to_vec(&Statement::new(vec![tree_subject(&tree, &digest)], approval(ApprovalScope::Outcome, Vote::Approve, policy, approver, 3600))).unwrap();
+    let bytes = match machine {
+        Some(m) => cosigned(&body, sk, m, false),
+        None => passkey_seal(&body, sk),
+    };
+    store::put(repo.path(), &tree, &bytes, &pk.id()).unwrap();
+}
+
+fn key_approves(repo: &Repo, policy: &Policy, approver: &str, k: &SigningKey) {
+    let (_, tree, digest) = repo.stage();
+    file_outcome_approval(repo, &tree, &digest, approval(ApprovalScope::Outcome, Vote::Approve, policy, approver, 3600), k);
+}
+
+fn finding<'a>(r: &'a GateResult, code: &str) -> &'a use05_core::gate::Finding {
+    r.findings.iter().find(|f| f.code == code).unwrap_or_else(|| panic!("no {code} in {:?}", codes(r)))
+}
+
+fn owner_holds(r: &GateResult) -> Vec<&str> {
+    r.findings.iter().filter(|f| f.code == "OWNER_APPROVAL_REQUIRED" && f.effect == Effect::Approval).map(|f| f.message.as_str()).collect()
+}
+
+#[test]
+fn an_owned_path_needs_the_driver_and_an_owner() {
+    let repo = Repo::new();
+    repo.write("billing/pay.rs", "fn pay() {}\n");
+    let policy = owners_policy(1);
+    let machine = key(130);
+    let (alex_sk, alex_pk) = passkey(50);
+    let (dana_sk, dana_pk) = passkey(51);
+    let trust = Trust { keys: vec![persons_passkey("Alex Rivera", &alex_pk), persons_passkey("Dana", &dana_pk), trusted("this machine", Role::Local, &machine)], ..Default::default() };
+    let c = Ctx { repo: &repo, policy: policy.clone(), trust, task: driven_by("Alex Rivera"), late: Vec::new(), stale: None };
+
+    let r = c.gate();
+    assert_eq!(r.decision, Decision::ApprovalRequired);
+    let f = finding(&r, "OWNER_APPROVAL_REQUIRED");
+    assert_eq!(f.message, "billing/** needs an approval from eng-managers (Dana, Lee): 0 of 1");
+    assert_eq!((f.effect, f.approvable), (Effect::Approval, false), "only an owner's approval clears it");
+    assert_eq!(f.paths, ["billing/pay.rs"]);
+    assert_eq!(f.next.as_deref(), Some("ask Dana or Lee to run: use05 approve --outcome --rev <commit>"));
+    assert_eq!(r.owners.len(), 1);
+    assert!(!r.owners[0].met && r.owners[0].approved_by.is_empty());
+
+    // The driver approves: the approval they give today counts, and the owners' is still missing.
+    passkey_approves(&repo, &policy, "Alex Rivera", &alex_sk, &alex_pk, Some(&machine));
+    let r = c.gate();
+    assert_eq!(r.decision, Decision::ApprovalRequired, "{:?}", codes(&r));
+    assert!(finding(&r, "PROTECTED_PATH").message.ends_with("(approved)"));
+    assert_eq!(owner_holds(&r), ["billing/** needs an approval from eng-managers (Dana, Lee): 0 of 1"], "the generic approval does not stand in for an owner's");
+    assert!(r.findings.iter().any(|f| f.code == "OWNER_APPROVAL_NOT_COUNTED" && !f.approvable && f.message == "Alex Rivera approved, but is not an owner of billing/**"), "{:?}", r.findings);
+
+    // An owner approves someone else's work: both are met.
+    passkey_approves(&repo, &policy, "Dana", &dana_sk, &dana_pk, Some(&machine));
+    let ok = c.gate();
+    assert_eq!(ok.decision, Decision::Allow, "{:?} {:?}", codes(&ok), ok.approvals);
+    assert_eq!(ok.owners[0].approved_by, ["Dana"]);
+    assert!(ok.owners[0].met);
+    assert_eq!(finding(&ok, "OWNER_APPROVAL_REQUIRED").effect, Effect::Info);
+}
+
+#[test]
+fn a_driver_in_the_group_covers_both() {
+    let repo = Repo::new();
+    repo.write("billing/pay.rs", "fn pay() {}\n");
+    let policy = owners_policy(1);
+    let machine = key(131);
+    let (sk, pk) = passkey(52);
+    let trust = Trust { keys: vec![persons_passkey("Dana", &pk), trusted("this machine", Role::Local, &machine)], ..Default::default() };
+    let c = Ctx { repo: &repo, policy: policy.clone(), trust, task: driven_by("dana"), late: Vec::new(), stale: None };
+    assert_eq!(c.gate().decision, Decision::ApprovalRequired);
+    passkey_approves(&repo, &policy, "Dana", &sk, &pk, Some(&machine));
+    let r = c.gate();
+    assert_eq!(r.decision, Decision::Allow, "one approval by a driver who is an owner covers both: {:?}", codes(&r));
+    assert_eq!(r.owners[0].approved_by, ["Dana"]);
+}
+
+#[test]
+fn an_approval_from_outside_the_group_does_not_count_for_the_owned_path() {
+    let repo = Repo::new();
+    repo.write("billing/pay.rs", "fn pay() {}\n");
+    let policy = owners_policy(1);
+    let (bob, nobody) = (key(140), key(141));
+    let c = ctx(&repo, policy.clone(), vec![persons_key("Bob", &bob), trusted("shared key", Role::Approver, &nobody)]);
+    key_approves(&repo, &policy, "Bob", &bob);
+    key_approves(&repo, &policy, "someone", &nobody);
+    let r = c.gate();
+    assert_eq!(r.decision, Decision::ApprovalRequired, "{:?}", codes(&r));
+    assert!(finding(&r, "PROTECTED_PATH").message.ends_with("(approved)"), "Bob's approval still counts as the approval it is today");
+    assert_eq!(owner_holds(&r).len(), 1);
+    let said: Vec<&str> = r.findings.iter().filter(|f| f.code == "OWNER_APPROVAL_NOT_COUNTED").map(|f| f.message.as_str()).collect();
+    assert!(said.contains(&"Bob approved, but is not an owner of billing/**"), "{said:?}");
+    assert!(said.contains(&"an approval by shared key does not count for billing/**: its key names no person"), "{said:?}");
+    assert!(r.owners[0].approved_by.is_empty());
+}
+
+#[test]
+fn an_owners_passkey_counts_for_someone_elses_work_only_on_owned_paths() {
+    let repo = Repo::new();
+    repo.write("billing/pay.rs", "fn pay() {}\n");
+    repo.write("infra/main.tf", "x\n");
+    repo.write("migrations/001.sql", "create table t();\n");
+    let mut policy = Policy::default();
+    policy.protect.paths = vec!["migrations/**".into()];
+    policy.protect.owner = vec![
+        OwnerRule { paths: vec!["billing/**".into()], signers: vec!["Dana".into()], min: 1 },
+        OwnerRule { paths: vec!["infra/**".into()], signers: vec!["Lee".into()], min: 1 },
+    ];
+    let machine = key(132);
+    let (alex_sk, alex_pk) = passkey(53);
+    let (dana_sk, dana_pk) = passkey(54);
+    let (lee_sk, lee_pk) = passkey(55);
+    let trust = Trust { keys: vec![persons_passkey("Alex Rivera", &alex_pk), persons_passkey("Dana", &dana_pk), persons_passkey("Lee", &lee_pk), trusted("this machine", Role::Local, &machine)], ..Default::default() };
+    let c = Ctx { repo: &repo, policy: policy.clone(), trust, task: driven_by("Alex Rivera"), late: Vec::new(), stale: None };
+
+    // Dana's passkey, for Alex's work: it counts for what Dana owns, and for nothing else.
+    passkey_approves(&repo, &policy, "Dana", &dana_sk, &dana_pk, Some(&machine));
+    let r = c.gate();
+    assert_eq!(owner_holds(&r), ["infra/** needs an approval from Lee: 0 of 1"], "{:?}", r.findings);
+    assert_eq!(finding(&r, "PROTECTED_PATH").effect, Effect::Approval, "an owner's passkey does not stand in for the driver's approval");
+    assert_eq!(r.approvals[0].void, Some("it was signed by someone other than the person driving the work"));
+
+    // Lee's passkey without the co-signature of what prepared it counts for nothing.
+    passkey_approves(&repo, &policy, "Lee", &lee_sk, &lee_pk, None);
+    let r = c.gate();
+    assert_eq!(owner_holds(&r).len(), 1);
+    assert!(r.findings.iter().any(|f| f.message == "Lee's approval does not count for infra/**: no machine that prepared it co-signed it"), "{:?}", r.findings);
+
+    passkey_approves(&repo, &policy, "Lee", &lee_sk, &lee_pk, Some(&machine));
+    let r = c.gate();
+    assert!(owner_holds(&r).is_empty(), "{:?}", r.findings);
+    assert_eq!(r.decision, Decision::ApprovalRequired, "the driver's approval is still needed: {:?}", codes(&r));
+
+    passkey_approves(&repo, &policy, "Alex Rivera", &alex_sk, &alex_pk, Some(&machine));
+    assert_eq!(c.gate().decision, Decision::Allow);
+}
+
+#[test]
+fn min_two_needs_two_distinct_owners() {
+    let repo = Repo::new();
+    repo.write("billing/pay.rs", "fn pay() {}\n");
+    let policy = owners_policy(2);
+    let (dana_laptop, dana_desktop, lee) = (key(150), key(151), key(152));
+    let c = ctx(&repo, policy.clone(), vec![persons_key("Dana", &dana_laptop), persons_key("Dana", &dana_desktop), persons_key("Lee", &lee)]);
+    key_approves(&repo, &policy, "Dana", &dana_laptop);
+    key_approves(&repo, &policy, "Dana", &dana_desktop);
+    let r = c.gate();
+    assert_eq!(owner_holds(&r), ["billing/** needs approvals from eng-managers (Dana, Lee): 1 of 2"], "two keys of one person are one owner");
+    assert_eq!(r.decision, Decision::ApprovalRequired);
+    key_approves(&repo, &policy, "Lee", &lee);
+    let ok = c.gate();
+    assert_eq!(ok.decision, Decision::Allow, "{:?}", codes(&ok));
+    assert_eq!(ok.owners[0].approved_by, ["Dana", "Lee"]);
+}
+
+#[test]
+fn this_machines_own_key_counts_as_an_owner_only_where_the_policy_names_its_person() {
+    // Whatever this machine calls its person (git config, which an agent can set), a key is an
+    // owner's only through `person` in the policy.
+    let repo = Repo::new();
+    repo.write("billing/pay.rs", "fn pay() {}\n");
+    let policy = owners_policy(1);
+    let mine = key(160);
+    key_approves(&repo, &policy, "Dana", &mine);
+    let mut here = trusted("you (approver)", Role::Approver, &mine);
+    here.holder = Holder::ThisMachine;
+    let c = Ctx { repo: &repo, policy: policy.clone(), trust: Trust { this_person: vec![here.id.clone()], keys: vec![here.clone()] }, task: driven_by("Dana"), late: Vec::new(), stale: None };
+    let r = c.gate();
+    assert_eq!(owner_holds(&r).len(), 1, "{:?}", r.findings);
+    assert!(r.findings.iter().any(|f| f.message == "an approval by you (approver) does not count for billing/**: its key names no person"), "{:?}", r.findings);
+    let listed = persons_key("Dana", &mine);
+    let c = Ctx { repo: &repo, policy, trust: Trust { this_person: vec![here.id.clone()], keys: vec![listed, here] }, task: None, late: Vec::new(), stale: None };
+    assert_eq!(c.gate().decision, Decision::Allow);
+}
+
+#[test]
+fn an_approval_of_the_intent_does_not_count_for_an_owner_rule() {
+    let repo = Repo::new();
+    repo.write("billing/pay.rs", "fn pay() {}\n");
+    let policy = owners_policy(1);
+    let dana = key(161);
+    let mut c = ctx(&repo, policy.clone(), vec![persons_key("Dana", &dana)]);
+    let card = scoped("billing/**");
+    let digest = card.digest();
+    c.task = Some(task_with(Some(card), None));
+    let mut a = approval(ApprovalScope::Intent, Vote::Approve, &policy, "Dana", 3600);
+    a.intent_sha256 = Some(digest.clone());
+    store::put(repo.path(), &digest, &seal(&Statement::new(vec![intent_subject(&digest)], a), &dana).to_json_bytes(), &key_id(&dana.verifying_key())).unwrap();
+    let r = c.gate();
+    assert!(finding(&r, "PROTECTED_PATH").message.ends_with("(approved)"), "the intent approval counts as it does today: {:?}", r.findings);
+    assert_eq!(owner_holds(&r).len(), 1, "but owners approve the outcome: {:?}", r.findings);
+    key_approves(&repo, &policy, "Dana", &dana);
+    assert!(owner_holds(&c.gate()).is_empty());
+}
+
+#[test]
+fn a_rule_nobody_can_approve_says_so() {
+    let repo = Repo::new();
+    repo.write("billing/pay.rs", "fn pay() {}\n");
+    let mut policy = owners_policy(1);
+    policy.signer[0].people.clear(); // as an organisation floor's intersection can leave it
+    let c = ctx(&repo, policy, vec![]);
+    let r = c.gate();
+    assert_eq!(owner_holds(&r), ["nobody in eng-managers can approve changes to billing/**"]);
+    assert_eq!(r.decision, Decision::ApprovalRequired);
+}
+
+#[test]
+fn a_floor_owner_rule_counts_its_own_people() {
+    let repo = Repo::new();
+    repo.write("infra/main.tf", "x\n");
+    let (lee, sam) = (key(162), key(163));
+    let mut policy = Policy::default();
+    // The repository's own group of the same name would have meant Sam.
+    policy.signer = vec![SignerGroup { name: "security".into(), people: vec!["Sam".into()] }];
+    policy.tighten(&use05_core::policy::Floor {
+        trust_key: vec![use05_core::policy::TrustKey { name: "lee".into(), role: Role::Approver, public: public_key_text(&lee.verifying_key()), expires: None, person: Some("Lee".into()) }],
+        signer: vec![SignerGroup { name: "security".into(), people: vec!["Lee".into()] }],
+        protect_owner: vec![OwnerRule { paths: vec!["infra/**".into()], signers: vec!["security".into()], min: 1 }],
+        ..Default::default()
+    });
+    let c = ctx(&repo, policy.clone(), vec![persons_key("Lee", &lee), persons_key("Sam", &sam)]);
+    key_approves(&repo, &policy, "Sam", &sam);
+    assert_eq!(owner_holds(&c.gate()), ["infra/** needs an approval from security (Lee): 0 of 1"]);
+    key_approves(&repo, &policy, "Lee", &lee);
+    assert_eq!(c.gate().decision, Decision::Allow);
+}
+
+#[test]
+fn an_owners_passkey_approval_is_shown_as_counting_for_their_paths() {
+    let repo = Repo::new();
+    repo.write("billing/pay.rs", "fn pay() {}\n");
+    let policy = owners_policy(1);
+    let machine = key(133);
+    let (sk, pk) = passkey(56);
+    let trust = Trust { keys: vec![persons_passkey("Dana", &pk), trusted("this machine", Role::Local, &machine)], ..Default::default() };
+    let c = Ctx { repo: &repo, policy: policy.clone(), trust, task: driven_by("Alex Rivera"), late: Vec::new(), stale: None };
+    passkey_approves(&repo, &policy, "Dana", &sk, &pk, Some(&machine));
+    let r = c.gate();
+    assert_eq!(r.approvals[0].void, Some("it was signed by someone other than the person driving the work"));
+    assert_eq!(r.approvals[0].owner_of, ["billing/**"]);
+}
+
+fn bypass_by(repo: &Repo, who: &SigningKey) {
+    let (_, tree, digest) = repo.stage();
+    let s = Statement::new(vec![tree_subject(&tree, &digest)], Bypass { env: None, from: None, rule: None, policy_sha256: None, reason: "prod is down".into(), by: "someone".into(), findings: vec![], created: now_rfc3339(), expires: rfc3339(now_secs() + 3600) });
+    store::put(repo.path(), &tree, &seal(&s, who).to_json_bytes(), &key_id(&who.verifying_key())).unwrap();
+}
+
+#[test]
+fn a_hotfix_needs_an_outcome_approval_that_no_bypass_or_intent_approval_replaces() {
+    let repo = Repo::new();
+    let person = key(10);
+    repo.write("src/lib.rs", "pub fn f() { /* fix */ }\n");
+    let policy = Policy::default();
+    let mut c = ctx(&repo, policy.clone(), vec![trusted("alice", Role::Approver, &person)]);
+    c.task = Some(task_with(None, None));
+    assert_eq!(c.gate().decision, Decision::Allow, "an ordinary task with nothing to hold it");
+    c.task.as_mut().unwrap().hotfix = Some("prod".into());
+    let r = c.gate();
+    assert_eq!(r.decision, Decision::ApprovalRequired);
+    let f = r.findings.iter().find(|f| f.code == "HOTFIX_NEEDS_APPROVAL").unwrap();
+    assert_eq!((f.message.as_str(), f.next.as_deref()), ("a hotfix lands straight on prod, so it needs a person's approval of its outcome, given for this hotfix: 0 of 1", Some("ask a person to approve it: use05 approve --outcome")));
+    // A person's bypass of the tree does not clear it.
+    bypass_by(&repo, &person);
+    let r = c.gate();
+    assert_eq!(r.decision, Decision::ApprovalRequired, "{:?}", r.findings);
+    assert!(r.bypass.is_none() && codes(&r).contains(&"BYPASS_NOT_ALLOWED"));
+    // An ordinary approval of the same tree, or one for another hotfix task or environment, is not this hotfix's.
+    let (_, tree, digest) = repo.stage();
+    file_outcome_approval(&repo, &tree, &digest, approval(ApprovalScope::Outcome, Vote::Approve, &policy, "alice", 3600), &person);
+    let other_task = Approval { task: "task2".into(), hotfix: Some("prod".into()), ..approval(ApprovalScope::Outcome, Vote::Approve, &policy, "alice", 3600) };
+    file_outcome_approval(&repo, &tree, &digest, other_task, &person);
+    let other_env = Approval { hotfix: Some("uat".into()), ..approval(ApprovalScope::Outcome, Vote::Approve, &policy, "alice", 3600) };
+    file_outcome_approval(&repo, &tree, &digest, other_env, &person);
+    let r = c.gate();
+    assert_eq!(r.decision, Decision::ApprovalRequired, "{:?}", r.findings);
+    assert!(r.findings.iter().any(|f| f.code == "HOTFIX_NEEDS_APPROVAL" && f.message.ends_with("an approval of this tree given for something else does not count for it")), "{:?}", r.findings);
+    // An approval of this hotfix's outcome does.
+    file_outcome_approval(&repo, &tree, &digest, Approval { hotfix: Some("prod".into()), ..approval(ApprovalScope::Outcome, Vote::Approve, &policy, "alice", 3600) }, &person);
+    let r = c.gate();
+    assert_eq!(r.decision, Decision::Allow, "{:?}", r.findings);
+    assert!(r.findings.iter().any(|f| f.code == "HOTFIX_NEEDS_APPROVAL" && f.effect == Effect::Info && f.message.ends_with("1 of 1 (approved)")), "{:?}", r.findings);
+}
+
+#[test]
+fn only_an_owner_can_bypass_an_owner_rule() {
+    let repo = Repo::new();
+    repo.write("billing/pay.rs", "fn pay() {}\n");
+    repo.write("LICENSE", "MIT\n");
+    let mut policy = owners_policy(1);
+    policy.protect.locked = vec!["LICENSE".into()];
+    let (bob, dana) = (key(170), key(171));
+    let c = ctx(&repo, policy.clone(), vec![persons_key("Bob", &bob), persons_key("Dana", &dana)]);
+
+    // Bob is not an owner: his bypass clears the lock, never the owner rule.
+    bypass_by(&repo, &bob);
+    let r = c.gate();
+    assert_eq!(r.decision, Decision::ApprovalRequired, "{:?}", codes(&r));
+    assert!(r.bypass.is_none());
+    assert_eq!(finding(&r, "LOCKED_PATH").effect, Effect::Deny, "still listed, but not as all that is left");
+    assert!(finding(&r, "LOCKED_PATH").message.ends_with("(a bypass covers this once an owner of billing/** approves or bypasses it)"), "{:?}", r.findings);
+    assert_eq!(owner_holds(&r), ["billing/** needs an approval from eng-managers (Dana, Lee): 0 of 1; a bypass of an owned path must come from one of its owners (Dana, Lee)"]);
+    // Once an owner approves, Bob's bypass lets the rest through.
+    key_approves(&repo, &policy, "Dana", &dana);
+    let r = c.gate();
+    assert_eq!(r.decision, Decision::Allow, "{:?}", codes(&r));
+    assert!(r.bypass.is_some());
+
+    // An owner's bypass clears the owner rule too.
+    repo.write("billing/pay.rs", "fn pay() { /* 2 */ }\n");
+    bypass_by(&repo, &dana);
+    assert_eq!(c.gate().decision, Decision::Allow);
+
+    // With bypass off, nobody's bypass clears it.
+    policy.protect.bypass = false;
+    let c = ctx(&repo, policy, vec![persons_key("Dana", &dana)]);
+    let r = c.gate();
+    assert!(codes(&r).contains(&"BYPASS_NOT_ALLOWED"), "{:?}", codes(&r));
+    assert_ne!(r.decision, Decision::Allow);
+}
+
+/// The organisation owns `infra/**` and names Lee by its own key. The repository lists Bob's key
+/// and claims it is Lee's.
+fn bob_claims_lee() -> (Repo, Policy, SigningKey, SigningKey) {
+    let repo = Repo::new();
+    repo.write("infra/main.tf", "x\n");
+    let (lee, bob) = (key(180), key(181));
+    let entry = |name: &str, k: &SigningKey, person: &str| use05_core::policy::TrustKey { name: name.into(), role: Role::Approver, public: public_key_text(&k.verifying_key()), expires: None, person: Some(person.into()) };
+    let mut policy = Policy::default();
+    policy.trust.key.push(entry("bob", &bob, "Lee"));
+    policy.tighten(&use05_core::policy::Floor {
+        trust_key: vec![entry("lee", &lee, "Lee")],
+        protect_owner: vec![OwnerRule { paths: vec!["infra/**".into()], signers: vec!["Lee".into()], min: 1 }],
+        ..Default::default()
+    });
+    assert!(policy.check_effective().is_ok(), "the repository's claim passes its own checks");
+    (repo, policy, lee, bob)
+}
+
+#[test]
+fn a_repository_key_cannot_approve_for_a_person_the_floor_names() {
+    let (repo, policy, lee, bob) = bob_claims_lee();
+    let c = Ctx { repo: &repo, policy: policy.clone(), trust: Trust::new(&policy, false), task: None, late: Vec::new(), stale: None };
+    key_approves(&repo, &policy, "Lee", &bob);
+    let r = c.gate();
+    assert_eq!(owner_holds(&r), ["infra/** needs an approval from Lee: 0 of 1"], "{:?}", r.findings);
+    key_approves(&repo, &policy, "Lee", &lee);
+    assert_eq!(c.gate().decision, Decision::Allow, "the floor's own key for Lee counts");
+}
+
+#[test]
+fn a_repository_key_cannot_bypass_for_a_person_the_floor_names() {
+    let (repo, policy, lee, bob) = bob_claims_lee();
+    let c = Ctx { repo: &repo, policy: policy.clone(), trust: Trust::new(&policy, false), task: None, late: Vec::new(), stale: None };
+    bypass_by(&repo, &bob);
+    let r = c.gate();
+    assert_eq!(r.decision, Decision::ApprovalRequired, "{:?}", codes(&r));
+    assert!(r.bypass.is_none());
+    bypass_by(&repo, &lee);
+    assert_eq!(c.gate().decision, Decision::Allow);
+}
+
+fn trust_entry(name: &str, role: Role, k: &SigningKey, person: Option<&str>) -> use05_core::policy::TrustKey {
+    use05_core::policy::TrustKey { name: name.into(), role, public: public_key_text(&k.verifying_key()), expires: None, person: person.map(str::to_string) }
+}
+
+/// Lee's machine key, named Lee's as a preparer (`role = "local"`), listed again by the repository
+/// as an approver key: what it signs is read as an approval or a bypass, and must not be Lee's.
+#[test]
+fn a_machine_key_named_for_a_person_never_counts_as_their_owner_approval_or_bypass() {
+    let repo = Repo::new();
+    repo.write("infra/main.tf", "x\n");
+    let machine = key(190);
+    // The organisation's rule: Lee owns infra/**, and the floor names Lee's machine as Lee's.
+    let mut floor_policy = Policy::default();
+    floor_policy.trust.key.push(trust_entry("machine as approver", Role::Approver, &machine, None));
+    floor_policy.tighten(&use05_core::policy::Floor {
+        trust_key: vec![trust_entry("lee's mac", Role::Local, &machine, Some("Lee"))],
+        protect_owner: vec![OwnerRule { paths: vec!["infra/**".into()], signers: vec!["Lee".into()], min: 1 }],
+        ..Default::default()
+    });
+    // The repository's rule: the same, with both entries in the repository's own list.
+    let mut repo_policy = Policy::default();
+    repo_policy.trust.key = vec![trust_entry("machine as approver", Role::Approver, &machine, None), trust_entry("lee's mac", Role::Local, &machine, Some("Lee"))];
+    repo_policy.protect.owner = vec![OwnerRule { paths: vec!["infra/**".into()], signers: vec!["Lee".into()], min: 1 }];
+    for (what, policy) in [("floor", &floor_policy), ("repository", &repo_policy)] {
+        let c = Ctx { repo: &repo, policy: policy.clone(), trust: Trust::new(policy, false), task: None, late: Vec::new(), stale: None };
+        key_approves(&repo, policy, "Lee", &machine);
+        assert_eq!(owner_holds(&c.gate()).len(), 1, "{what}: an approval by a machine key is nobody's");
+        bypass_by(&repo, &machine);
+        let r = c.gate();
+        assert_eq!(r.decision, Decision::ApprovalRequired, "{what}: a bypass by a machine key is nobody's: {:?}", codes(&r));
+        assert!(r.bypass.is_none(), "{what}");
+    }
+}
+

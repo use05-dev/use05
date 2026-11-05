@@ -48,7 +48,8 @@ pub fn run(repo: &Path, task: Option<&str>, unsigned: bool, signed: Option<&Path
             "NEEDS_A_PERSON",
             "discarding work needs a person: run it at a terminal, or from your console with your passkey".into(),
             None,
-            6,
+            // As for every act only a person may do: exit 3, a person is needed.
+            3,
         );
     }
     let mut screen = format!("Discard \"{}\" (task {})?\n", task.title, task.id);

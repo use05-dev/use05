@@ -13,6 +13,9 @@
 //! being exported the SHA-256 of each blob is remembered by its git object id in the repository's
 //! own state (`05/blob-digests`). A blob id fixes the blob's bytes inside one repository, which is
 //! what git itself relies on. The digest's definition is unchanged, so receipts are unaffected.
+//!
+//! Git LFS files are the one thing an export can change (D96): when asked, a pointer is replaced by
+//! the real file it names. The digest stays over the committed pointer.
 
 use std::ffi::OsStr;
 use std::fs;
@@ -23,6 +26,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use sha2::{Digest, Sha256};
+use use05_receipt::{LfsFile, attributes_use_lfs, lfs_pointer};
 
 use crate::error::RunnerError;
 use crate::git::{self, BlobReader};
@@ -114,16 +118,57 @@ impl DigestCache {
     }
 }
 
+/// Whether the tree sends files through the Git LFS filter: some `.gitattributes` in it says so.
+fn uses_lfs(entries: &[Entry], blobs: &mut Option<BlobReader>, repo: &Path) -> Result<bool, RunnerError> {
+    for entry in entries.iter().filter(|e| e.kind == "blob" && e.path.rsplit(|b| *b == b'/').next() == Some(b".gitattributes")) {
+        if blobs.is_none() {
+            *blobs = Some(BlobReader::start(repo)?);
+        }
+        if attributes_use_lfs(&blobs.as_mut().expect("started").read(&entry.oid)?) {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+/// Replace the pointer `file` stands for with the real file at `target` (D96), and check it is the
+/// file the pointer names: a pointer left in place by a failed download must not pass for it.
+fn fetch_lfs(repo: &Path, pointer: &[u8], file: &LfsFile, target: &Path, checked: &mut bool) -> Result<(), RunnerError> {
+    let fail = |reason: String| RunnerError::LfsFailed { path: file.path.clone(), reason };
+    if !*checked {
+        git::lfs_available(repo).map_err(RunnerError::LfsUnavailable)?;
+        *checked = true;
+    }
+    // Five minutes a file unless USE05_LFS_TIMEOUT_SECS says otherwise (it is also how a test
+    // makes the wait short).
+    let secs = std::env::var("USE05_LFS_TIMEOUT_SECS").ok().and_then(|s| s.trim().parse::<u64>().ok()).filter(|s| *s > 0).unwrap_or(300);
+    let (size, sha) = git::lfs_smudge(repo, pointer, target, std::time::Duration::from_secs(secs)).map_err(fail)?;
+    if sha != file.oid || size != file.size {
+        return Err(RunnerError::LfsFailed {
+            path: file.path.clone(),
+            reason: format!("what came back ({size} bytes, sha256 {sha}) is not what its pointer names ({} bytes, sha256 {}); is the object on the LFS server?", file.size, file.oid),
+        });
+    }
+    Ok(())
+}
+
 /// Digest the tree's contents and, if `dest` is given, write it there.
 ///
 /// Regular files keep their executable bit, symlinks stay symlinks, and submodule entries become
 /// empty directories. No smudge filters or attribute conversions are applied.
-pub(crate) fn materialize(repo: &Path, tree_oid: &str, dest: Option<&Path>) -> Result<String, RunnerError> {
+///
+/// The one exception is `lfs` (D96): with it, a file that the tree's `.gitattributes` sends through
+/// Git LFS and whose committed bytes are an LFS pointer is exported as the real file, fetched by
+/// `git lfs smudge` and checked against the pointer. The digest is still over the committed bytes,
+/// the pointers, so it names the same tree either way; the files fetched are returned.
+pub(crate) fn materialize(repo: &Path, tree_oid: &str, dest: Option<&Path>, lfs: bool) -> Result<(String, Vec<LfsFile>), RunnerError> {
     let entries = list(repo, tree_oid)?;
     // Reading blobs is only needed to export them or to learn a digest we have not seen.
     let mut blobs: Option<BlobReader> = None;
     let mut cache = if dest.is_none() { Some(DigestCache::load(repo)) } else { None };
     let mut manifest = Sha256::new();
+    let lfs_on = lfs && dest.is_some() && uses_lfs(&entries, &mut blobs, repo)?;
+    let (mut fetched, mut lfs_ready) = (Vec::new(), false);
 
     for entry in &entries {
         let relative = safe_relative(&entry.path)?;
@@ -171,7 +216,14 @@ pub(crate) fn materialize(repo: &Path, tree_oid: &str, dest: Option<&Path>) -> R
         if entry.mode == "120000" {
             symlink(OsStr::from_bytes(&data), &target).map_err(RunnerError::io("writing a symlink"))?;
         } else {
-            fs::write(&target, &data).map_err(RunnerError::io("writing a file"))?;
+            let pointer = if lfs_on { lfs_pointer(&String::from_utf8_lossy(&entry.path), &data) } else { None };
+            match pointer {
+                Some(file) => {
+                    fetch_lfs(repo, &data, &file, &target, &mut lfs_ready)?;
+                    fetched.push(file);
+                }
+                None => fs::write(&target, &data).map_err(RunnerError::io("writing a file"))?,
+            }
             let executable = entry.mode == "100755";
             fs::set_permissions(&target, fs::Permissions::from_mode(if executable { 0o755 } else { 0o644 }))
                 .map_err(RunnerError::io("setting file permissions"))?;
@@ -180,5 +232,5 @@ pub(crate) fn materialize(repo: &Path, tree_oid: &str, dest: Option<&Path>) -> R
     if let Some(cache) = cache {
         cache.save();
     }
-    Ok(hex::encode(manifest.finalize()))
+    Ok((hex::encode(manifest.finalize()), fetched))
 }

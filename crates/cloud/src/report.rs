@@ -63,6 +63,12 @@ pub fn summary(brief: &Value) -> Value {
         "outside_scope": strings(&b["outside_scope"], 200),
         "outside_scope_areas": each(&b["outside_scope_areas"], &["name", "files", "added", "removed"], 12),
         "session": pick(&b["session"], &["minutes", "turns", "tool_calls", "edits", "files_touched", "first", "last", "approvals", "bypasses", "refused", "subagents"]),
+        // How much the decision rests on (D101): counts and 05's own words, no paths. Empty from a
+        // 05 that does not print it.
+        "assurance": pick(&b["assurance"], &["checks_required", "passed", "failed", "missing", "stale", "not_accepted", "not_required", "evidence", "local_only", "tests_changed", "behaviour", "enforcement", "summary", "test_origin"]),
+        // The story (D102), without the person's words or the agent's: what 05 saw, what the checks
+        // found, what holds it and what is not known, and only how many claims stand where.
+        "story": pick(&b["story"], &["observed", "checked", "needs_you", "not_known", "claim_counts"]),
         "gate": {
             "decision": gate["decision"], "risk": gate["risk"], "policy_sha256": gate["policy_sha256"],
             "findings": each(&gate["findings"], &["code", "effect", "message", "paths", "next", "approvable"], 60),
@@ -226,6 +232,33 @@ mod tests {
         for never in ["my secret prompt", "fn main", "secret_field", "git revert"] {
             assert!(!text.contains(never), "{never} leaked: {text}");
         }
+    }
+
+    #[test]
+    fn the_story_travels_without_the_persons_words_or_the_agents() {
+        let brief = json!({ "brief": { "story": {
+            "asked": "my secret prompt", "agent_says": "I capped the retries", "claims": [{ "text": "all tests pass", "status": "contradicted" }],
+            "claim_counts": { "supported": 0, "unsupported": 0, "contradicted": 1 },
+            "observed": ["2 files changed in src/billing/ · +40 −10"], "checked": "1 failed", "needs_you": ["the test failed"], "not_known": ["behaviour beyond these checks"],
+        }}});
+        let s = &summary(&brief)["story"];
+        assert_eq!(s["observed"][0], "2 files changed in src/billing/ · +40 −10");
+        assert_eq!((s["checked"].as_str(), s["claim_counts"]["contradicted"].as_u64()), (Some("1 failed"), Some(1)));
+        let text = s.to_string();
+        for never in ["my secret prompt", "I capped", "all tests pass"] {
+            assert!(!text.contains(never), "{never} left the machine: {text}");
+        }
+    }
+
+    #[test]
+    fn the_assurance_travels_as_counts_and_its_one_line() {
+        let brief = json!({ "brief": { "assurance": { "checks_required": 0, "passed": 0, "evidence": "none", "behaviour": "not_assessed", "enforcement": "unknown", "summary": "none required; behaviour not verified", "limitations": ["x"], "later_field": "secret" } } });
+        let a = &summary(&brief)["assurance"];
+        assert_eq!(a["summary"], "none required; behaviour not verified");
+        assert_eq!((a["checks_required"].as_u64(), a["evidence"].as_str()), (Some(0), Some("none")), "{a}");
+        assert!(a.get("later_field").is_none() && a.get("limitations").is_none(), "picked by name: {a}");
+        // A brief from a 05 without it sends an empty object, and the console shows nothing.
+        assert_eq!(summary(&json!({ "brief": {} }))["assurance"], json!({}));
     }
 
     #[test]

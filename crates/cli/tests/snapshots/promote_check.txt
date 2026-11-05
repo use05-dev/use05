@@ -1,0 +1,20 @@
+✓ uat → prod: allowed
+  moves             1 commit · 1 file · +1 −0 · fast-forward <TREE12> (origin/uat) onto
+                    <TREE12> (origin/prod)
+  source_checks     pass (deny): test passed on <TREE12>
+  source_confirmed  fail (warn): nothing confirms uat runs <TREE12>
+  soak              skipped (warn): no soak time is set
+  migrations        pass (approval): no migrations move
+  untasked          fail (warn): 1 of 1 commit belongs to no task: <TREE12>
+  sign_off          skipped (allow): not asked for
+  rules             from prod's policy (origin/prod)
+  rollback          <TREE12>
+  warn SOURCE_NOT_CONFIRMED: nothing confirms uat runs <TREE12>: there is no deployment record
+  of it
+  warn UNTASKED_COMMITS: 1 commit that would move belongs to no 05 task: <TREE12>
+  Checked only: nothing was moved or pushed. Here this is advisory; the CI gate on prod's branch
+  is the strong control. Deployment, finish and promotion records this machine signs count, so
+  source_confirmed, soak and untasked rest on its own word; with [evidence] accept = ["runner"]
+  only CI's records count.
+
+Next: use05 promote prod

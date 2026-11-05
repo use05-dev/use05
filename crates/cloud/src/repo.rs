@@ -125,7 +125,63 @@ impl Repo {
             None => (None, None),
         };
         let detected: Vec<Value> = use05_core::policy::detect_checks(Path::new(&self.top)).iter().map(|c| json!({ "name": c.name, "run": c.run, "timeout_secs": c.timeout_secs, "required": c.required, "env": c.env })).collect();
-        json!({ "id": self.id, "name": self.name, "remote": self.remote.as_deref().map(normalise), "landing": self.landing, "policy_toml": text, "policy_rev": commit, "detected_checks": detected })
+        json!({ "id": self.id, "name": self.name, "remote": self.remote.as_deref().map(normalise), "landing": self.landing, "policy_toml": text, "policy_rev": commit, "detected_checks": detected, "environments": self.environments() })
+    }
+
+    /// Each environment the landing branch's policy names (D93): its branch's head, the newest
+    /// counted promotion and deployment records, and how many commits wait to come up from the one
+    /// below. Metadata only: names, commit ids, times and counts, sealed like the rest.
+    pub fn environments(&self) -> Value {
+        let Some(rev) = self.policy_ref() else { return json!([]) };
+        let Ok((_, policy)) = self.policy_at(&rev) else { return json!([]) };
+        let top = Path::new(&self.top);
+        let trust = use05_core::evidence::Trust::new(&policy, true);
+        let found = use05_core::evidence::classify(&trust, &use05_core::store::find_all(top));
+        let accept = &policy.evidence.accept;
+        let head_of = |branch: &str| {
+            [format!("refs/remotes/origin/{branch}"), format!("refs/heads/{branch}")].into_iter().find_map(|r| git(&self.top, &["rev-parse", "--verify", "--quiet", &format!("{r}^{{commit}}")]).ok())
+        };
+        let envs: Vec<Value> = policy
+            .environment
+            .iter()
+            .map(|e| {
+                let head = head_of(&e.branch);
+                let promoted = found
+                    .promotions
+                    .iter()
+                    .filter(|p| accept.contains(&p.signer.role) && p.statement.predicate.env == e.name)
+                    .max_by(|a, b| a.statement.predicate.created.cmp(&b.statement.predicate.created))
+                    .map(|p| {
+                        let p = &p.statement.predicate;
+                        json!({ "from": p.from, "source_commit": p.source_commit, "result_commit": p.result_commit, "created": p.created, "by": p.by, "how": p.how, "direction": p.direction })
+                    });
+                let deployed = found
+                    .deployments
+                    .iter()
+                    .filter(|d| accept.contains(&d.signer.role) && d.statement.predicate.env == e.name)
+                    .max_by(|a, b| a.statement.predicate.created.cmp(&b.statement.predicate.created))
+                    .map(|d| {
+                        let d = &d.statement.predicate;
+                        json!({ "commit": d.commit, "confirmed": d.confirmed, "created": d.created, "action": d.action, "probes": d.probes.len() })
+                    });
+                let source = policy.source_of(e);
+                // Commits the source has that this environment lacks: what a promotion would move.
+                let waiting = match (source.and_then(|s| head_of(&s.branch)), &head) {
+                    (Some(s), Some(h)) => git(&self.top, &["rev-list", "--count", &format!("{h}..{s}")]).ok().and_then(|n| n.parse::<u64>().ok()).unwrap_or(0),
+                    (Some(s), None) => git(&self.top, &["rev-list", "--count", &s]).ok().and_then(|n| n.parse::<u64>().ok()).unwrap_or(0),
+                    _ => 0,
+                };
+                let sign_off = e.sign_off.as_ref().map(|s| json!({ "min_length": s.min_length, "questions": s.questions })).unwrap_or_else(|| json!({ "min_length": 0, "questions": [] }));
+                json!({
+                    "name": e.name, "branch": e.branch, "level": e.level(), "head": head,
+                    "from": source.map(|s| s.name.clone()), "waiting": waiting,
+                    "agent": policy.agent_may_promote(e), "sign_off_rule": e.rules.sign_off,
+                    "sign_off": sign_off, "confirm": e.confirm.iter().map(|c| c.text.clone()).collect::<Vec<_>>(),
+                    "promoted": promoted, "deployed": deployed,
+                })
+            })
+            .collect();
+        Value::Array(envs)
     }
 
     /// File and folder names only, from the landing branch.
@@ -174,6 +230,11 @@ impl Repo {
     /// The driver typed a testing note on their phone (D87): prepare the statement for their
     /// passkey, co-signed here, as the terminal command would print it unsigned.
     fn prepare_testing(&self, api: &Api, payload: &Value) -> Result<Value> {
+        // The console carries a phone's sign-off on a promotion (D93) the same way: the request names
+        // the environment instead of a tree.
+        if payload["promote"].is_string() {
+            return self.prepare_signoff(api, payload);
+        }
         let tree = payload["tree"].as_str().filter(|t| hex_id(t)).ok_or_else(|| anyhow!("no tree to sign off"))?;
         let note = payload["note"].as_str().map(str::trim).filter(|n| !n.is_empty()).ok_or_else(|| anyhow!("no note"))?;
         let skipped = payload["outcome"] == "skipped";
@@ -187,6 +248,21 @@ impl Repo {
         }
         let d = &v["details"];
         crate::prepared()?.remember(&self.id, Purpose::Testing, d["payload"].as_str().unwrap_or_default())?;
+        Ok(json!({ "unsigned": d }))
+    }
+
+    /// A person signs off on promoting into an environment from their phone (D93): this machine
+    /// prepares the statement with their words, answers and confirmations, co-signs it, and
+    /// remembers it for their passkey. 05 judges here what is promoted, never the console.
+    fn prepare_signoff(&self, api: &Api, payload: &Value) -> Result<Value> {
+        let args = signoff_args(payload)?;
+        let args: Vec<&str> = args.iter().map(String::as_str).collect();
+        let (code, v) = self.use05(api, &self.top, &args)?;
+        if code != 0 {
+            bail!("{}", v["message"].as_str().unwrap_or("05 could not prepare the sign-off"));
+        }
+        let d = &v["details"];
+        crate::prepared()?.remember(&self.id, Purpose::SignOff, d["payload"].as_str().unwrap_or_default())?;
         Ok(json!({ "unsigned": d }))
     }
 
@@ -323,7 +399,9 @@ impl Repo {
         if !bad.is_empty() {
             return Err(self.refuse(api, "a policy edit", &format!("it changes what only a terminal may change: {}", bad.join(", "))));
         }
-        let looser = cloud::guard::loosens(&old, &new);
+        // Weighed under the organisation floor too (D92); a pinned floor that cannot be read stops it.
+        let floor = use05_core::org::load().map_err(|e| self.refuse(api, "a policy edit", &e.message))?.map(|(_, floor)| floor);
+        let looser = cloud::guard::loosens_under(&old, &new, floor.as_ref());
         if !looser.is_empty() {
             return Err(self.refuse(api, "a policy edit", &format!("it loosens what only a terminal may loosen: {}", looser.join(", "))));
         }
@@ -380,7 +458,9 @@ impl Repo {
         if !bad.is_empty() {
             return Err(self.refuse(api, "a policy edit", &format!("it changes what only a terminal may change: {}", bad.join(", "))));
         }
-        let looser = cloud::guard::loosens(&old, &new);
+        // Weighed under the organisation floor too (D92); a pinned floor that cannot be read stops it.
+        let floor = use05_core::org::load().map_err(|e| self.refuse(api, "a policy edit", &e.message))?.map(|(_, floor)| floor);
+        let looser = cloud::guard::loosens_under(&old, &new, floor.as_ref());
         if !looser.is_empty() {
             return Err(self.refuse(api, "a policy edit", &format!("it loosens what only a terminal may loosen: {}", looser.join(", "))));
         }
@@ -436,6 +516,45 @@ fn find(api: &Api, id: &str) -> Result<Repo> {
 }
 
 /// The only things the console can ask for. Anything else is refused.
+/// The `use05 approve --promote` a phone's sign-off asks for, from its sealed request: the
+/// environment by name, the person's words, each answer and each statement they confirmed, or
+/// their no with a reason. Anything that could be taken for a flag is refused.
+pub fn signoff_args(payload: &Value) -> Result<Vec<String>> {
+    let env = payload["promote"].as_str().filter(|e| !e.is_empty() && !e.starts_with('-') && e.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))).ok_or_else(|| anyhow!("no environment to sign off on"))?;
+    let words = |v: &Value| v.as_str().map(str::trim).map(str::to_string);
+    let not_a_flag = |s: &str| -> Result<()> {
+        if s.starts_with('-') {
+            bail!("an answer cannot start with -");
+        }
+        Ok(())
+    };
+    let mut args: Vec<String> = vec!["approve".into(), "--promote".into(), env.to_string()];
+    if payload["back"].as_bool() == Some(true) {
+        args.push("--back".into());
+    }
+    if payload["reject"].as_bool() == Some(true) {
+        let reason = words(&payload["reason"]).filter(|r| !r.is_empty()).ok_or_else(|| anyhow!("say why you are rejecting it"))?;
+        not_a_flag(&reason)?;
+        args.extend(["--reject".into(), "--reason".into(), reason]);
+    } else {
+        let note = words(&payload["note"]).filter(|n| !n.is_empty()).ok_or_else(|| anyhow!("say in your own words what you checked"))?;
+        not_a_flag(&note)?;
+        args.extend(["--note".into(), note]);
+        for a in payload["answers"].as_array().into_iter().flatten() {
+            let a = words(a).filter(|a| !a.is_empty()).ok_or_else(|| anyhow!("an answer is empty"))?;
+            not_a_flag(&a)?;
+            args.extend(["--answer".into(), a]);
+        }
+        for c in payload["confirmations"].as_array().into_iter().flatten() {
+            let c = words(c).filter(|c| !c.is_empty()).ok_or_else(|| anyhow!("a statement to confirm is empty"))?;
+            not_a_flag(&c)?;
+            args.extend(["--confirm".into(), c]);
+        }
+    }
+    args.extend(["--unsigned".into(), "--json".into()]);
+    Ok(args)
+}
+
 pub fn handle(api: &Api, kind: &str, payload: &Value) -> Result<Value> {
     let repo = find(api, payload["repo"].as_str().unwrap_or(""))?;
     match kind {
@@ -450,7 +569,12 @@ pub fn handle(api: &Api, kind: &str, payload: &Value) -> Result<Value> {
         }
         "prepare_policy_edit" => repo.prepare(api, payload["toml"].as_str().ok_or_else(|| anyhow!("no policy"))?),
         "prepare_testing" => repo.prepare_testing(api, payload),
-        "file_testing" => repo.file(api, &payload["envelope"], Purpose::Testing, false),
+        "file_testing" => {
+            // A sign-off on a promotion travels the same way; what this machine prepared says which.
+            let signed = payload["envelope"]["payload"].as_str().unwrap_or_default();
+            let purpose = if crate::prepared()?.knows(&repo.id, Purpose::SignOff, signed) { Purpose::SignOff } else { Purpose::Testing };
+            repo.file(api, &payload["envelope"], purpose, purpose == Purpose::SignOff)
+        }
         "ask_approval" => {
             let task = payload["task"].as_str().filter(|t| !t.is_empty() && t.chars().all(|c| c.is_ascii_alphanumeric())).ok_or_else(|| anyhow!("no task to ask about"))?;
             let scope = if payload["scope"] == "intent" { "intent" } else { "outcome" };
@@ -521,5 +645,49 @@ mod tests {
         assert!(!repo.landed(&open), "an open task with uncommitted work is not done");
         assert!(repo.landed(&task(&a, "finished", Some(&b))), "a finished task is its last commit");
         assert!(!repo.landed(&task(&a, "finished", Some(&a))), "finished with nothing new");
+    }
+
+    #[test]
+    fn a_phones_sign_off_becomes_exactly_one_approve_promote_and_nothing_can_be_a_flag() {
+        let args = signoff_args(&json!({ "promote": "prod", "note": " Checked the invoices in uat ", "answers": ["Yes, all green"], "confirmations": ["The release notes are published"] })).unwrap();
+        assert_eq!(args, ["approve", "--promote", "prod", "--note", "Checked the invoices in uat", "--answer", "Yes, all green", "--confirm", "The release notes are published", "--unsigned", "--json"]);
+        let no = signoff_args(&json!({ "promote": "uat", "back": true, "reject": true, "reason": "the merge drops a fix" })).unwrap();
+        assert_eq!(no, ["approve", "--promote", "uat", "--back", "--reject", "--reason", "the merge drops a fix", "--unsigned", "--json"]);
+        for bad in [
+            json!({ "promote": "--push", "note": "x" }),
+            json!({ "promote": "prod; rm -rf /", "note": "x" }),
+            json!({ "promote": "prod" }),
+            json!({ "promote": "prod", "note": "--signed=/etc/passwd" }),
+            json!({ "promote": "prod", "note": "ok", "answers": ["--land"] }),
+            json!({ "promote": "prod", "reject": true }),
+        ] {
+            assert!(signoff_args(&bad).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn environments_report_heads_and_what_waits_without_any_file_contents() {
+        let dir = tempfile::tempdir().unwrap();
+        let top = std::fs::canonicalize(dir.path()).unwrap().to_string_lossy().to_string();
+        run(&top, &["init", "-q", "-b", "main"]);
+        run(&top, &["config", "user.name", "t"]);
+        run(&top, &["config", "user.email", "t@t"]);
+        std::fs::create_dir_all(dir.path().join(".05")).unwrap();
+        std::fs::write(dir.path().join(".05/policy.toml"), "[[environment]]\nname = \"dev\"\nbranch = \"main\"\n\n[[environment]]\nname = \"prod\"\nbranch = \"prod\"\n\n[environment.sign_off]\nmin_length = 20\nquestions = [\"What did you check?\"]\n").unwrap();
+        run(&top, &["add", "-A"]);
+        run(&top, &["commit", "-q", "-m", "base"]);
+        run(&top, &["branch", "prod"]);
+        std::fs::write(dir.path().join("secret_name.rs"), "fn hidden() {}").unwrap();
+        run(&top, &["add", "-A"]);
+        run(&top, &["commit", "-q", "-m", "feature"]);
+        let repo = Repo { top: top.clone(), id: "r".into(), name: "r".into(), remote: None, landing: "main".into(), common: std::path::PathBuf::from(&top) };
+        let envs = repo.environments();
+        let prod = envs.as_array().unwrap().iter().find(|e| e["name"] == "prod").unwrap();
+        assert_eq!((prod["from"].as_str(), prod["waiting"].as_u64(), prod["agent"].as_bool()), (Some("dev"), Some(1), Some(false)), "{prod:#}");
+        assert_eq!(prod["sign_off"]["min_length"], 20);
+        assert_eq!(prod["head"], run(&top, &["rev-parse", "prod"]));
+        assert!(prod["promoted"].is_null() && prod["deployed"].is_null());
+        let text = envs.to_string();
+        assert!(!text.contains("secret_name") && !text.contains("hidden"), "names and contents of files never travel: {text}");
     }
 }

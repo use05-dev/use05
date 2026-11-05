@@ -1,0 +1,31 @@
+Promote  uat → prod                                                              uat at <TREE12>
+────────────────────────────────────────────────────────────────────────────────────────────────────
+Moves      1 commit · 1 file · +12 −0
+           <TREE12> (uat) onto prod at <TREE12> (prod), by fast-forward
+           .05/ · 1 file · +12 −0
+           .05/policy.toml · +12 −0
+           <TREE12> Name the environments
+           ! This repository has no origin; judged on its own branches.
+
+Rules      from uat's policy (uat)
+           ✗ source_checks: test not proved on <TREE12> (deny)
+           ! source_confirmed: nothing confirms uat runs <TREE12> (warn)
+           · soak: no soak time is set (warn)
+           ✓ migrations: no migrations move (approval)
+           ! untasked: 1 of 1 commit belongs to no task: <TREE12> (warn)
+           · sign_off: not asked for (allow)
+           ! RULES_FROM_SOURCE prod's branch has no policy that names prod, so the rules come from
+             uat's policy (uat)
+
+Sign-off   not needed; a person with an approver key may sign off
+
+Rollback   back to <TREE12> if the deploy fails
+
+Checked only: nothing was moved or pushed. Here this is advisory; the CI gate on prod's branch is
+the strong control. Deployment, finish and promotion records this machine signs count, so
+source_confirmed, soak and untasked rest on its own word; with [evidence] accept = ["runner"] only
+CI's records count.
+────────────────────────────────────────────────────────────────────────────────────────────────────
+✗ DENIED
+  1. the required checks have not all passed on uat's head (<TREE12>): test not proved
+     → prove them on uat's head: use05 prove test --tree <TREE12>

@@ -21,7 +21,7 @@ fn evidence(status: Status, exit_code: Option<i32>) -> Evidence {
         sha256: "00".repeat(32),
     };
     Evidence {
-        command: Command { argv: vec!["cargo".into(), "test".into()], cwd: ".".into() },
+        command: Command { argv: vec!["cargo".into(), "test".into()], cwd: ".".into(), dir: None },
         environment: Environment { fingerprint: "ab".repeat(32), names: vec!["PATH".into()] },
         result: Outcome {
             status,
@@ -31,9 +31,10 @@ fn evidence(status: Status, exit_code: Option<i32>) -> Evidence {
             stdout: stream("ok"),
             stderr: stream(""),
         },
-        runner: Runner { name: "use05".into(), version: "0.0.1".into(), platform: "linux-x86_64".into() },
+        runner: Runner { name: "use05".into(), version: "0.0.1".into(), platform: "linux-x86_64".into(), check_user: None },
         created: "2026-10-30T12:00:00Z".into(),
         check: None,
+        lfs: vec![],
     }
 }
 
@@ -348,7 +349,7 @@ fn intent_and_outcome_statements_verify_and_tampering_is_caught() {
         AnyStatement::Declaration(s) => assert_eq!(s, declaration),
         other => panic!("{other:?}"),
     }
-    let completion = Statement::new(vec![tree_subject(&"a1".repeat(20), &"b2".repeat(32))], Completion { task: "9ce9a1e4".into(), outcome: "capped at 3; tests pass".into(), finished: "2026-10-30T12:30:00Z".into() });
+    let completion = Statement::new(vec![tree_subject(&"a1".repeat(20), &"b2".repeat(32))], Completion { task: "9ce9a1e4".into(), outcome: "capped at 3; tests pass".into(), finished: "2026-10-30T12:30:00Z".into(), base: None });
     let bytes = seal(&completion, &k).to_json_bytes();
     assert!(matches!(verify_any(&bytes, &k.verifying_key()).unwrap().statement, AnyStatement::Completion(_)));
     let mut e = as_envelope(&bytes);

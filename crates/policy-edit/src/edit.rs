@@ -51,7 +51,86 @@ fn table(map: &serde_json::Map<String, Value>) -> Result<Table, String> {
     Ok(t)
 }
 
+/// A commented example of a setting, such as `# locked = []   # never changed`, written in the
+/// table the setting belongs to (up to the next table). Setting the key turns that line into the
+/// real assignment, so the example does not sit above the rule that replaces it. Nothing changes
+/// when the key is already set, there is no such line, or the line would not read as a setting.
+pub fn uncomment_example(doc: &mut DocumentMut, section: &str, key: &str) {
+    if doc.get(section).and_then(Item::as_table).is_none_or(|t| t.contains_key(key)) {
+        return;
+    }
+    let text = doc.to_string();
+    let header = |l: &str| l.trim_start().strip_prefix('[').is_some_and(|r| r.strip_prefix(section).is_some_and(|r| r.trim_start().starts_with(']')));
+    let mut inside = false;
+    let mut out = Vec::new();
+    let mut done = false;
+    for line in text.split_inclusive('\n') {
+        let bare = line.trim_start();
+        if !bare.starts_with('#') && bare.starts_with('[') {
+            inside = header(line);
+        } else if inside && !done {
+            if let Some(rest) = bare.strip_prefix('#') {
+                let rest = rest.trim_start();
+                if rest.strip_prefix(key).is_some_and(|after| after.trim_start().starts_with('=')) {
+                    out.push(format!("{}{rest}", &line[..line.len() - bare.len()]));
+                    done = true;
+                    continue;
+                }
+            }
+        }
+        out.push(line.to_string());
+    }
+    if let Ok(changed) = out.concat().parse::<DocumentMut>() {
+        if changed.get(section).and_then(Item::as_table).is_some_and(|t| t.contains_key(key)) {
+            *doc = changed;
+        }
+    }
+}
+
+/// `environment.<name>.<key>` or `environment.<name>.<table>.<key>` (D88, D93): one setting of
+/// one environment, found by its name. `None` for any other path.
+fn env_path(path: &str) -> Option<(&str, Vec<&str>)> {
+    let mut parts = path.split('.');
+    (parts.next() == Some("environment")).then_some(())?;
+    let name = parts.next().filter(|n| !n.is_empty())?;
+    let rest: Vec<&str> = parts.collect();
+    (!rest.is_empty()).then_some((name, rest))
+}
+
+/// Set one environment's setting in its own `[[environment]]` table, keeping the rest of it.
+fn set_env(doc: &mut DocumentMut, name: &str, rest: &[&str], value: &Value) -> Result<(), String> {
+    let ok_name = |s: &str| !s.is_empty() && s.chars().all(|c| c.is_ascii_lowercase() || c == '_');
+    if !rest.iter().all(|p| ok_name(p)) {
+        return Err(format!("\"environment.{name}.{}\" is not a policy setting", rest.join(".")));
+    }
+    let envs = doc.get_mut("environment").and_then(Item::as_array_of_tables_mut).ok_or(format!("there is no environment {name}: this policy names none"))?;
+    let t = envs.iter_mut().find(|t| t.get("name").and_then(Item::as_str) == Some(name)).ok_or(format!("there is no environment {name}"))?;
+    let (table, key) = match rest {
+        [key] => (t, *key),
+        [sub, key] => {
+            if !t.contains_key(sub) {
+                t.insert(sub, Item::Table(Table::new()));
+            }
+            (t[*sub].as_table_mut().ok_or(format!("environment {name}'s {sub} is not a table in this file"))?, *key)
+        }
+        _ => return Err(format!("\"environment.{name}.{}\" is too deep", rest.join("."))),
+    };
+    if value.is_null() {
+        table.remove(key);
+    } else {
+        let mut v = scalar(value)?;
+        if let Some(old) = table.get(key).and_then(Item::as_value) {
+            *v.decor_mut() = old.decor().clone();
+        }
+        table.insert(key, Item::Value(v));
+    }
+    Ok(())
+}
+
 fn set(doc: &mut DocumentMut, change: &Change) -> Result<(), String> {
+    if let Some((name, rest)) = env_path(&change.path) {
+        return set_env(doc, name, &rest, &change.value);
+    }
     let parts: Vec<&str> = change.path.split('.').collect();
     let ok_name = |s: &str| !s.is_empty() && s.chars().all(|c| c.is_ascii_lowercase() || c == '_');
     if !parts.iter().all(|p| ok_name(p)) {
@@ -79,11 +158,19 @@ fn set(doc: &mut DocumentMut, change: &Change) -> Result<(), String> {
             if !doc.contains_key(section) {
                 doc.insert(section, Item::Table(Table::new()));
             }
+            if !change.value.is_null() {
+                uncomment_example(doc, section, key);
+            }
             let t = doc[*section].as_table_mut().ok_or(format!("[{section}] is not a table in this file"))?;
             if change.value.is_null() {
                 t.remove(key);
             } else {
-                t.insert(key, Item::Value(scalar(&change.value)?));
+                let mut value = scalar(&change.value)?;
+                // The comment after the old value (or after the example) says what it is for.
+                if let Some(old) = t.get(key).and_then(Item::as_value) {
+                    *value.decor_mut() = old.decor().clone();
+                }
+                t.insert(key, Item::Value(value));
             }
         }
         _ => return Err(format!("\"{}\" is too deep", change.path)),
@@ -164,6 +251,14 @@ fn typed(text: &str) -> Value {
 }
 
 fn at<'a>(policy: &'a Value, path: &str) -> &'a Value {
+    // An environment's setting: the environment by its name, then the rest of the path.
+    if let Some((name, rest)) = env_path(path) {
+        let env = policy["environment"].as_array().and_then(|envs| envs.iter().find(|e| e["name"] == name));
+        return match env {
+            Some(e) => rest.iter().fold(e, |v, k| &v[*k]),
+            None => &Value::Null,
+        };
+    }
     path.split('.').fold(policy, |v, k| &v[k])
 }
 
@@ -265,6 +360,41 @@ mod tests {
         assert!(p.toml.contains("# our rules") && p.toml.contains("# careful") && p.toml.contains("locked = [\"vendor/**\"]"), "{}", p.toml);
         assert_eq!(p.changed, vec!["protect.locked".to_string()]);
         assert!(p.terminal_only.is_empty());
+    }
+
+    #[test]
+    fn policy_set_changes_one_environments_setting_by_its_name() {
+        let file = "[[environment]]\nname = \"dev\"\nbranch = \"main\"\n\n[[environment]]\nname = \"prod\"\nbranch = \"production\"\nsoak_minutes = 30   # a day's traffic\n";
+        let r = one_rule(file, Op::Set, "environment.prod.rules.sign_off", "approval").unwrap();
+        assert_eq!(r.after, json!("approval"));
+        let prod = r.preview.policy.environment_named("prod").unwrap();
+        assert_eq!(prod.rules.sign_off, use05_core::policy::Severity::Approval);
+        assert!(r.preview.toml.contains("soak_minutes = 30   # a day's traffic"), "the rest of prod's table stays: {}", r.preview.toml);
+        assert_eq!(r.preview.policy.environment_named("dev").unwrap().rules, use05_core::policy::PromoteRules::default(), "only prod changed");
+        let r = one_rule(file, Op::Set, "environment.prod.agent", "true").unwrap();
+        assert_eq!((r.before.clone(), r.after.clone()), (Value::Null, json!(true)));
+        assert_eq!(r.preview.policy.environment_named("prod").unwrap().agent, Some(true));
+        assert!(!r.preview.loosens.is_empty(), "letting an agent promote into prod loosens the rules");
+        let r = one_rule(file, Op::Set, "environment.prod.soak_minutes", "60").unwrap();
+        assert_eq!((r.before, r.after), (json!(30), json!(60)));
+        assert!(one_rule(file, Op::Set, "environment.staging.agent", "true").err().unwrap_or_default().contains("there is no environment staging"));
+        assert!(one_rule(file, Op::Set, "environment.prod.rules.sign_off.deep", "x").is_err());
+    }
+
+    #[test]
+    fn policy_set_replaces_the_commented_example() {
+        let file = "[protect]\npaths = []\n# locked = []   # never changed\n# no_delete = []\n\n[branches]\nland = \"manual\"\n# locked = [\"not-here\"]\n";
+        let p = preview(file, &[Change { path: "protect.locked".into(), value: json!(["vendor/**"]) }], &[]).unwrap();
+        assert!(p.toml.contains("locked = [\"vendor/**\"]   # never changed\n"), "{}", p.toml);
+        assert!(!p.toml.contains("# locked = []"), "the example is gone: {}", p.toml);
+        assert!(p.toml.contains("# no_delete = []") && p.toml.contains("# locked = [\"not-here\"]"), "other comments stay: {}", p.toml);
+        assert_eq!(p.policy.protect.locked, vec!["vendor/**".to_string()]);
+        // Only the example in the key's own table counts; none there, the key is added.
+        let other = preview("[protect]\npaths = []\n\n[branches]\n# locked = []\n", &[Change { path: "protect.locked".into(), value: json!(["a/**"]) }], &[]).unwrap();
+        assert!(other.toml.contains("# locked = []") && other.toml.contains("locked = [\"a/**\"]"), "{}", other.toml);
+        // A key that is already set keeps its comment after a new value.
+        let again = preview(&p.toml, &[Change { path: "protect.locked".into(), value: json!(["x/**"]) }], &[]).unwrap();
+        assert!(again.toml.contains("locked = [\"x/**\"]   # never changed"), "{}", again.toml);
     }
 
     #[test]

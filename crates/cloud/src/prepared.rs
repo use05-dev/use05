@@ -30,6 +30,8 @@ pub enum Purpose {
     Testing,
     /// A person's word to throw a task's work away (D89), acted on here and never filed.
     Discard,
+    /// A person's sign-off on promoting into an environment (D93), filed as it is.
+    SignOff,
 }
 
 #[derive(Serialize, Deserialize)]

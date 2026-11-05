@@ -56,7 +56,7 @@ function Shell({ path }: { path: string }) {
   return (
     <div className="shell">
       <nav className="rail" aria-label="Main">
-        <Link to="/" className="brand"><img src="/logo.svg" alt="" /> 05 console</Link>
+        <Link to="/" className="brand"><img src="/logo-reversed.svg" alt="05" /> console</Link>
         <div className="nav">
           {NAV.map((n) => (
             <Link key={n.to} to={n.to} aria-current={current(n.to) ? "page" : undefined}>

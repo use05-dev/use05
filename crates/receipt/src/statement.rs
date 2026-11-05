@@ -2,7 +2,9 @@
 //!
 //! Predicate types: `Evidence` (a check ran on a tree), `Approval` (a person decided), `Bypass` (a
 //! person overrode a block, with a reason), `Testing` (a person tried a tree themselves, or skipped
-//! it), `Discard` (a person threw a task's work away), `OrgLayer` (a signed policy floor), and the task's declaration, outcome and log seals.
+//! it), `Discard` (a person threw a task's work away), `OrgLayer` (a signed policy floor), the task's declaration, outcome and log seals,
+//! and an environment's records (D93): `Promotion` (a commit moved into an environment), `Deployment` (what an environment was seen
+//! running) and `SignOff` (a person's word on a promotion).
 
 use std::collections::BTreeMap;
 
@@ -21,6 +23,13 @@ pub const OUTCOME_TYPE: &str = "https://use05.dev/outcome/v0";
 pub const LOG_TYPE: &str = "https://use05.dev/log/v0";
 pub const TESTING_TYPE: &str = "https://use05.dev/testing/v0";
 pub const DISCARD_TYPE: &str = "https://use05.dev/discard/v0";
+pub const PROMOTION_TYPE: &str = "https://use05.dev/promotion/v0";
+pub const DEPLOYMENT_TYPE: &str = "https://use05.dev/deployment/v0";
+pub const SIGNOFF_TYPE: &str = "https://use05.dev/signoff/v0";
+
+/// Every record type this version reads. Each has a JSON Schema in docs/receipts (D95), checked
+/// against the code by a test. A type is only ever added to this list, never removed.
+pub const RECORD_TYPES: &[&str] = &[PREDICATE_TYPE, APPROVAL_TYPE, BYPASS_TYPE, ORG_TYPE, INTENT_TYPE, OUTCOME_TYPE, LOG_TYPE, TESTING_TYPE, DISCARD_TYPE, PROMOTION_TYPE, DEPLOYMENT_TYPE, SIGNOFF_TYPE];
 
 /// A predicate has a fixed type URI.
 pub trait Predicate: Serialize + DeserializeOwned {
@@ -38,6 +47,10 @@ fn has_tree(subject: &[Subject]) -> bool {
 
 fn has_intent(subject: &[Subject]) -> bool {
     subject.iter().any(|s| s.name == "intent" && s.digest.contains_key("sha256"))
+}
+
+fn has_commit(subject: &[Subject]) -> bool {
+    subject.iter().any(|s| s.name == "commit" && s.digest.contains_key("gitCommit"))
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
@@ -69,6 +82,19 @@ pub struct Evidence {
     /// The policy check this ran, when it was run by name.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub check: Option<String>,
+    /// The Git LFS files that were fetched into the exported tree in place of their pointers (D96).
+    /// The tree digest still covers the committed pointers; these say which real files the check saw.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub lfs: Vec<LfsFile>,
+}
+
+/// One Git LFS file the check ran on: where it is, and the object that stands for its bytes.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct LfsFile {
+    pub path: String,
+    /// The SHA-256 of the file's real bytes, as its pointer names it (hex).
+    pub oid: String,
+    pub size: u64,
 }
 
 impl Predicate for Evidence {
@@ -81,8 +107,12 @@ impl Predicate for Evidence {
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 pub struct Command {
     pub argv: Vec<String>,
-    /// Always relative to the exported tree.
+    /// Always relative to the exported tree: its root. The folder the command ran in is `dir`.
     pub cwd: String,
+    /// The folder of the exported tree the command ran in, when the check named one (D97).
+    /// Not written when the command ran at the root, so older receipts keep their bytes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dir: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
@@ -123,6 +153,10 @@ pub struct Runner {
     pub name: String,
     pub version: String,
     pub platform: String,
+    /// The OS user the command ran as, when it ran as a user other than the one holding the
+    /// signing key (D94).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub check_user: Option<String>,
 }
 
 // ----------------------------------------------------------------------------- approval
@@ -158,6 +192,10 @@ pub struct Approval {
     pub approver: String,
     pub created: String,
     pub expires: String,
+    /// Set only on an approval of a hotfix's outcome (D93): the environment it lands on. Only such
+    /// an approval, for that environment and that `task`, counts for landing a hotfix.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hotfix: Option<String>,
 }
 
 impl Predicate for Approval {
@@ -169,8 +207,10 @@ impl Predicate for Approval {
 
 // ----------------------------------------------------------------------------- bypass
 
-/// Break-glass: a person overrode a block for one exact tree, for a stated reason.
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+/// Break-glass: a person overrode a block for one exact tree, for a stated reason. Or, for a
+/// promotion (D93), one rule of promoting one exact commit into an environment: then `env`,
+/// `from` and `rule` say which, and the subject is the source commit.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, Default)]
 pub struct Bypass {
     pub reason: String,
     pub by: String,
@@ -178,12 +218,24 @@ pub struct Bypass {
     pub findings: Vec<String>,
     pub created: String,
     pub expires: String,
+    /// For a promotion's bypass: the environment promoted into.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub env: Option<String>,
+    /// For a promotion's bypass: the environment promoted from.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub from: Option<String>,
+    /// For a promotion's bypass: the promotion rule it clears.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rule: Option<String>,
+    /// For a promotion's bypass: the policy it was given under; a policy change voids it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub policy_sha256: Option<String>,
 }
 
 impl Predicate for Bypass {
     const TYPE: &'static str = BYPASS_TYPE;
     fn check(subject: &[Subject]) -> Result<(), &'static str> {
-        if has_tree(subject) { Ok(()) } else { Err("a bypass needs a tree subject") }
+        if has_tree(subject) || has_commit(subject) { Ok(()) } else { Err("a bypass needs a tree subject, or a commit subject for a promotion") }
     }
 }
 
@@ -244,6 +296,191 @@ impl Predicate for Discard {
     }
 }
 
+// ----------------------------------------------------------------------------- environments (D93)
+
+/// Which way a promotion went: up the ladder, a fix merged back down one rung, or a hotfix landed
+/// straight on an environment's branch.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum Direction {
+    Up,
+    Back,
+    Hotfix,
+    /// A value a newer 05 wrote that this one does not know (D95: a v0 list of words may grow).
+    #[serde(other)]
+    Unknown,
+}
+
+/// How strongly a promotion rule holds a promotion back, as the policy set it. Not ordered: a
+/// value a newer 05 wrote (`Unknown`) has no place among the others, so nothing takes a maximum
+/// of these; the policy's own severity is what is compared.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum RuleSeverity {
+    Allow,
+    Warn,
+    Approval,
+    Deny,
+    /// A value a newer 05 wrote that this one does not know (D95: a v0 list of words may grow).
+    #[serde(other)]
+    Unknown,
+}
+
+/// What one rule found.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum RuleOutcome {
+    /// The rule holds.
+    Pass,
+    /// The rule does not hold.
+    Fail,
+    /// It did not hold, and a person bypassed it for this promotion.
+    Bypassed,
+    /// Nothing to judge: not asked for, or nothing it looks at moved.
+    Skipped,
+    /// A value a newer 05 wrote that this one does not know (D95: a v0 list of words may grow).
+    #[serde(other)]
+    Unknown,
+}
+
+/// One promotion rule's result, in words a person reads.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct RuleResult {
+    /// `source_checks`, `source_confirmed`, `soak`, `migrations`, `untasked` or `sign_off`.
+    pub rule: String,
+    pub severity: RuleSeverity,
+    pub outcome: RuleOutcome,
+    pub detail: String,
+}
+
+/// A commit moved into an environment (D93): what moved, from where to where, the rollback point,
+/// each rule's result, and the bypasses and sign-offs it went with. Subject: the source commit.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct Promotion {
+    /// The environment or destination promoted into.
+    pub env: String,
+    /// The environment promoted from; for a destination, the environment its source branch is, else that branch.
+    pub from: String,
+    pub direction: Direction,
+    /// The exact commit that was evaluated and moved.
+    pub source_commit: String,
+    /// The target branch's head before; absent when the promotion created the branch.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_before: Option<String>,
+    /// The target branch's head after.
+    pub result_commit: String,
+    /// `fast-forward`, `merge`, `revert`, or for a destination `push` or `export`. A word, not a fixed list.
+    pub how: String,
+    /// The commit to go back to if the deploy fails; absent when there was none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rollback_point: Option<String>,
+    pub rules: Vec<RuleResult>,
+    /// The receipts of the bypasses it went with, by path.
+    pub bypasses: Vec<String>,
+    /// The receipts of the sign-offs it went with, by path.
+    pub signoffs: Vec<String>,
+    pub policy_sha256: String,
+    pub created: String,
+    /// Who promoted: a person's name, or the agent or CI that did.
+    pub by: String,
+    /// Set only on a revert 05 made (D93), because a deploy was not confirmed or a person rolled
+    /// back with `use05 promote <env> --rollback`: the commit it reverts, which was the branch's head. The revert's own commit is `source_commit` and
+    /// `result_commit`, its `how` is `revert`, and it keeps the direction of the promotion it undoes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reverts: Option<String>,
+    /// Set only on a hotfix (`direction = "hotfix"`): the 05 task whose work landed straight on
+    /// the environment's branch.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task: Option<String>,
+}
+
+impl Predicate for Promotion {
+    const TYPE: &'static str = PROMOTION_TYPE;
+    fn check(subject: &[Subject]) -> Result<(), &'static str> {
+        if has_commit(subject) { Ok(()) } else { Err("a promotion needs a commit subject") }
+    }
+}
+
+/// One probe's result: did the environment say it runs the commit.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct ProbeResult {
+    pub name: String,
+    pub matched: bool,
+    /// The SHA-256 of what the probe printed last, never the text.
+    pub output_sha256: String,
+    pub attempts: u32,
+    pub seconds: u64,
+}
+
+/// One smoke check's result.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct SmokeResult {
+    pub name: String,
+    pub passed: bool,
+}
+
+/// What 05 did about a deploy it could not confirm.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum DeployAction {
+    None,
+    Reverted,
+    RollbackCommand,
+    /// A value a newer 05 wrote that this one does not know (D95: a v0 list of words may grow).
+    #[serde(other)]
+    Unknown,
+}
+
+/// What an environment was seen running (D93): its probes and smoke checks, and whether they
+/// confirm the commit. Subject: the deployed commit.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct Deployment {
+    pub env: String,
+    pub commit: String,
+    pub probes: Vec<ProbeResult>,
+    pub smoke: Vec<SmokeResult>,
+    /// Every probe showed the commit and every smoke check passed. Never true without a probe.
+    pub confirmed: bool,
+    pub created: String,
+    pub action: DeployAction,
+}
+
+impl Predicate for Deployment {
+    const TYPE: &'static str = DEPLOYMENT_TYPE;
+    fn check(subject: &[Subject]) -> Result<(), &'static str> {
+        if has_commit(subject) { Ok(()) } else { Err("a deployment needs a commit subject") }
+    }
+}
+
+/// A person's sign-off on promoting one exact commit into an environment, or their rejection of
+/// it (D93): their own words, their answers to the policy's questions, and the statements they
+/// confirm. Bound to the environment, the source commit and the policy. Subject: the source commit.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct SignOff {
+    pub env: String,
+    pub from: String,
+    pub source_commit: String,
+    pub decision: Decision,
+    /// The person, as the policy names them on their key.
+    pub signer_person: String,
+    /// What they say, in their words.
+    pub text: String,
+    /// Their answers to the policy's questions, in order.
+    pub answers: Vec<String>,
+    /// The policy's `confirm` statements they confirm, word for word.
+    pub confirmations: Vec<String>,
+    pub policy_sha256: String,
+    pub created: String,
+    pub expires: String,
+}
+
+impl Predicate for SignOff {
+    const TYPE: &'static str = SIGNOFF_TYPE;
+    fn check(subject: &[Subject]) -> Result<(), &'static str> {
+        if has_commit(subject) { Ok(()) } else { Err("a sign-off needs a commit subject") }
+    }
+}
+
 // ----------------------------------------------------------------------------- declarations
 
 /// An agent's sealed declaration of what it will do (D65). Subject: the intent card digest.
@@ -295,6 +532,10 @@ pub struct Completion {
     pub task: String,
     pub outcome: String,
     pub finished: String,
+    /// Where the finished work met the landing branch when the task finished, when known: with it, the commits from there to
+    /// the finished tree are the task's (D93). Not written when unknown, so older records keep their bytes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base: Option<String>,
 }
 
 impl Predicate for Completion {
@@ -377,6 +618,18 @@ impl<P: Predicate> Statement<P> {
     pub fn intent_subject(&self) -> Option<&str> {
         self.digest_of("intent")?.get("sha256").map(String::as_str)
     }
+
+    /// The commit this statement is about: a promotion's, a deployment's or a sign-off's.
+    pub fn commit_subject(&self) -> Option<&str> {
+        self.digest_of("commit")?.get("gitCommit").map(String::as_str)
+    }
+}
+
+/// The subject of an environment's records: one commit.
+pub fn commit_subject(commit: &str) -> Subject {
+    let mut digest = BTreeMap::new();
+    digest.insert("gitCommit".to_string(), commit.to_string());
+    Subject { name: "commit".to_string(), digest }
 }
 
 pub fn tree_subject(oid: &str, content_sha256: &str) -> Subject {
@@ -445,7 +698,7 @@ fn check_types(value: &Value, want: Option<&str>) -> Result<(), Fault> {
         ));
     }
     let predicate_type = value.get("predicateType").and_then(Value::as_str).unwrap_or("");
-    let known = [PREDICATE_TYPE, APPROVAL_TYPE, BYPASS_TYPE, ORG_TYPE, INTENT_TYPE, OUTCOME_TYPE, LOG_TYPE, TESTING_TYPE, DISCARD_TYPE].contains(&predicate_type);
+    let known = RECORD_TYPES.contains(&predicate_type);
     if !known || want.is_some_and(|w| w != predicate_type) {
         return Err(Fault::invalid(
             "PREDICATE_TYPE_UNSUPPORTED",
@@ -467,6 +720,9 @@ pub enum AnyStatement {
     LogSeal(Statement<LogSeal>),
     Testing(Statement<Testing>),
     Discard(Statement<Discard>),
+    Promotion(Statement<Promotion>),
+    Deployment(Statement<Deployment>),
+    SignOff(Statement<SignOff>),
 }
 
 pub(crate) fn parse_any(payload: &[u8]) -> Result<AnyStatement, Fault> {
@@ -486,6 +742,9 @@ pub(crate) fn parse_any(payload: &[u8]) -> Result<AnyStatement, Fault> {
         LOG_TYPE => parse_as::<LogSeal>(payload).map(AnyStatement::LogSeal),
         TESTING_TYPE => parse_as::<Testing>(payload).map(AnyStatement::Testing),
         DISCARD_TYPE => parse_as::<Discard>(payload).map(AnyStatement::Discard),
+        PROMOTION_TYPE => parse_as::<Promotion>(payload).map(AnyStatement::Promotion),
+        DEPLOYMENT_TYPE => parse_as::<Deployment>(payload).map(AnyStatement::Deployment),
+        SIGNOFF_TYPE => parse_as::<SignOff>(payload).map(AnyStatement::SignOff),
         _ => parse_as::<OrgLayer>(payload).map(AnyStatement::OrgLayer),
     }
 }

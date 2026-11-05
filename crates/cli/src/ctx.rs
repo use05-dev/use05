@@ -50,23 +50,31 @@ impl Ctx {
     /// `prove` may follow a policy file not committed yet; an approval must not, or the push it
     /// was given for never counts it.
     pub fn open_judging(repo: &Path, task_id: Option<&str>) -> Result<Ctx> {
-        Ctx::open_rules(repo, task_id, None, true)
+        Ctx::open_rules(repo, task_id, None, true, true)
+    }
+
+    /// For a commit that is not a task here (someone else's branch, fetched): no task of this
+    /// machine's is read, and the rules come from `policy_rev` as a push of it would read them, or
+    /// as [`Ctx::open_judging`] does without one.
+    pub fn open_for_commit(repo: &Path, policy_rev: Option<&str>) -> Result<Ctx> {
+        Ctx::open_rules(repo, None, policy_rev, true, false)
     }
 
     /// Like [`Ctx::open`], but read the rules from `policy_rev` (a commit). Gating a push or a
     /// pull request passes the change's base here, so a change cannot loosen its own rules. In
     /// that case a base with no policy means defaults, never the change's own file.
     pub fn open_with(repo: &Path, task_id: Option<&str>, policy_rev: Option<&str>) -> Result<Ctx> {
-        Ctx::open_rules(repo, task_id, policy_rev, policy_rev.is_some())
+        Ctx::open_rules(repo, task_id, policy_rev, policy_rev.is_some(), true)
     }
 
-    fn open_rules(repo: &Path, task_id: Option<&str>, policy_rev: Option<&str>, strict: bool) -> Result<Ctx> {
+    fn open_rules(repo: &Path, task_id: Option<&str>, policy_rev: Option<&str>, strict: bool, current: bool) -> Result<Ctx> {
         let store = Store::open(repo)?;
         // Best effort, and one small read when it was done in the last few minutes.
         use05_core::repos::touch(&store.dirs);
         let mut task = match task_id {
             Some(id) => Some(store.load(id)?),
-            None => store.current(),
+            None if current => store.current(),
+            None => None,
         };
         let top = store.dirs.top.clone();
         // Fresh base: work updated since its session started has its base moved, so the commits
@@ -103,8 +111,30 @@ impl Ctx {
             }
             None => None,
         };
+        // A floor adds trusted keys: groups and people must still be told apart once it has.
+        policy.check_effective()?;
         let trust = Trust::new(&policy, true);
         Ok(Ctx { store, task, repo_policy, policy, org, trust, policy_uncommitted, task_found: std::cell::OnceCell::new() })
+    }
+
+    /// Someone else's work, named by a revision (D92), measured and judged as a push of it would
+    /// be: from where it forks from the remote (else its parent), under the rules there. No task
+    /// of this machine's is read; whose work it is comes from its signed records, as CI reads them.
+    /// `brief --rev` and `approve --rev` both use this, so what a person reads is what they sign.
+    pub fn open_rev(repo: &Path, rev: &str) -> Result<(Ctx, Target)> {
+        let top = git::dirs(repo)?.top;
+        let commit = git::resolve_commit(&top, rev).ok_or_else(|| {
+            Error::new("REV_NOT_FOUND", format!("there is no commit {rev:?} here")).with_next("fetch it first: git fetch origin, then name it, as in --rev origin/<branch>")
+        })?;
+        let base = git::fork_from_remote(&top, &commit).filter(|b| *b != commit).or_else(|| git::resolve_commit(&top, &format!("{commit}^")));
+        let mut ctx = Ctx::open_for_commit(repo, base.as_deref())?;
+        let mut target = ctx.target_from(&commit, base.as_deref())?;
+        let short = &commit[..12.min(commit.len())];
+        target.label = if commit.starts_with(rev.trim()) { format!("commit {short}") } else { format!("{rev} at commit {short}") };
+        target.head_commit = Some(commit);
+        let found = use05_core::evidence::classify(&ctx.trust, &use05_core::store::find_all(ctx.top()));
+        ctx.task = use05_core::gate::task_from_receipts(&found, &target.oid).map(|(task, _)| task);
+        Ok((ctx, target))
     }
 
     /// Resolve what to look at: `index` (staged files) or any commit or tree.
@@ -250,7 +280,7 @@ impl Ctx {
 /// The SHA-256 of a tree's content. A tree id fixes its content inside one repository (git itself
 /// relies on that), so the digest is computed once per tree and kept in the repository's 05 state,
 /// which makes `brief`, `status` and the gate cost the same on a huge repository as on a small one.
-fn tree_digest(top: &Path, oid: &str) -> Result<String> {
+pub(crate) fn tree_digest(top: &Path, oid: &str) -> Result<String> {
     let dir = git::dirs(top)?.common.join("05").join("digests");
     let cached = dir.join(oid);
     if let Ok(text) = std::fs::read_to_string(&cached) {
